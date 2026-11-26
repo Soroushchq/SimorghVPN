@@ -81,6 +81,42 @@ class ProfileRepo(private val context: Context) {
         return sub
     }
 
+    /**
+     * Create the subscription with the given fixed id if missing, or update its
+     * name/url in place. Used for the built-in free-config source switcher.
+     */
+    suspend fun ensureSubscription(id: String, name: String, url: String): Subscription {
+        var result: Subscription? = null
+        persist { st ->
+            val existing = st.subscriptions.firstOrNull { it.id == id }
+            val sub = if (existing == null) {
+                Subscription(
+                    id = id,
+                    name = name,
+                    url = url.trim(),
+                    addedAt = System.currentTimeMillis()
+                )
+            } else if (existing.name != name || existing.url != url.trim()) {
+                existing.copy(name = name, url = url.trim())
+            } else {
+                existing
+            }
+            result = sub
+            if (existing == null) st.copy(subscriptions = st.subscriptions + sub) else st
+        }
+        return result!!
+    }
+
+    suspend fun getSubscription(id: String): Subscription? =
+        subscriptions.value.firstOrNull { it.id == id }
+
+    /** Stamp the last successful refresh time on a subscription. */
+    suspend fun touchSubscription(id: String, at: Long = System.currentTimeMillis()) = persist { st ->
+        st.copy(
+            subscriptions = st.subscriptions.map { if (it.id == id) it.copy(lastUpdateAt = at) else it }
+        )
+    }
+
     suspend fun removeSubscription(id: String) = persist { st ->
         st.copy(
             subscriptions = st.subscriptions.filter { it.id != id },

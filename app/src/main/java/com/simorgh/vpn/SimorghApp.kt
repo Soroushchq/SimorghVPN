@@ -2,6 +2,7 @@ package com.simorgh.vpn
 
 import android.app.Application
 import com.simorgh.vpn.core.CoreBootstrap
+import com.simorgh.vpn.data.BuiltinConfigManager
 import com.simorgh.vpn.data.SettingsStore
 import com.simorgh.vpn.util.LogBuffer
 import kotlinx.coroutines.CoroutineScope
@@ -20,6 +21,9 @@ class SimorghApp : Application() {
         appScope.launch {
             runCatching { ServiceLocator.profileRepo.load() }
                 .onFailure { LogBuffer.e("App", "profile load failed", it) }
+            // built-in free configs: ensure + seed + auto-refresh (best-effort)
+            runCatching { BuiltinConfigManager.onAppStart(this@SimorghApp) }
+                .onFailure { LogBuffer.e("App", "builtin config seed failed", it) }
         }
         appScope.launch {
             runCatching {

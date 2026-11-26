@@ -17,8 +17,8 @@ android {
         applicationId = "com.simorgh.vpn"
         minSdk = 26
         targetSdk = 35
-        versionCode = 3
-        versionName = "0.1.2"
+        versionCode = 4
+        versionName = "0.1.3"
     }
 
     splits {
@@ -108,4 +108,30 @@ tasks.register("downloadXrayCore") {
     }
 }
 
-tasks.named("preBuild") { dependsOn("downloadXrayCore") }
+// ---------------------------------------------------------------------------
+// Built-in free-config seed auto-download — snapshot of the default public
+// pool (0xRadikal top100, health-checked hourly upstream). Fetched at build
+// time so every release ships fresh configs. Mirrors BuiltInSources index 0.
+// ---------------------------------------------------------------------------
+val builtinSeed = File(projectDir, "src/main/assets/builtin_seed.txt")
+val builtinSeedUrl = "https://raw.githubusercontent.com/0xRadikal/Free-v2ray-Configs/main/top100.txt"
+
+tasks.register("downloadBuiltinSeed") {
+    group = "build setup"
+    description = "Downloads the built-in free-config seed snapshot if missing."
+    onlyIf { !builtinSeed.exists() }
+    doLast {
+        logger.lifecycle("[simorgh] downloading built-in seed from $builtinSeedUrl")
+        builtinSeed.parentFile.mkdirs()
+        val tmp = File(builtinSeed.parentFile, "builtin_seed.txt.part")
+        URI(builtinSeedUrl).toURL().openStream().use { input -> tmp.outputStream().use { input.copyTo(it) } }
+        val links = tmp.readText().lineSequence().count { it.matches(Regex("^(vless|vmess|trojan|ss)://.*")) }
+        check(links >= 50) { "seed snapshot too small: only $links links" }
+        check(tmp.renameTo(builtinSeed)) { "cannot move downloaded seed" }
+        logger.lifecycle("[simorgh] built-in seed ready: $links configs")
+    }
+}
+
+tasks.named("preBuild") {
+    dependsOn("downloadXrayCore", "downloadBuiltinSeed")
+}

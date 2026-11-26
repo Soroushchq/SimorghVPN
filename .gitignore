@@ -20,3 +20,6 @@ Thumbs.db
 # Logs
 *.log
 !dev.log
+
+# Built-in seed snapshot — fetched at build time by downloadBuiltinSeed, not committed
+app/src/main/assets/builtin_seed.txt

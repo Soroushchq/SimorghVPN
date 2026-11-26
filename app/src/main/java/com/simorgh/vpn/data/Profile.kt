@@ -44,5 +44,7 @@ data class Subscription(
     val id: String,
     val name: String,
     val url: String,
-    val addedAt: Long = 0L
+    val addedAt: Long = 0L,
+    /** Epoch ms of the last successful refresh (0 = never). */
+    val lastUpdateAt: Long = 0L
 )

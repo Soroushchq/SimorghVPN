@@ -23,6 +23,47 @@ class SubscriptionRepo(private val context: Context, private val repo: ProfileRe
         }
         if (list.isNotEmpty()) {
             repo.replaceSubscriptionProfiles(sub.id, list)
+            repo.touchSubscription(sub.id)
+        }
+        list.size
+    }
+
+    /**
+     * Refresh the built-in free-config subscription ([BuiltInSources.BUILTIN_SUB_ID])
+     * from the given source URL. Stamps [Subscription.lastUpdateAt] on success.
+     */
+    suspend fun refreshBuiltin(sourceUrl: String): Int = withContext(Dispatchers.IO) {
+        val sub = repo.ensureSubscription(
+            BuiltInSources.BUILTIN_SUB_ID,
+            "", // name is localised by the UI; stored name kept in sync there
+            sourceUrl
+        )
+        refresh(sub)
+    }
+
+    /**
+     * First-launch offline seed: import the snapshot bundled in the APK so the
+     * app has servers even without network access. Only runs when the built-in
+     * subscription has no profiles yet.
+     */
+    suspend fun seedBuiltinFromAssetIfEmpty(sourceUrl: String): Int = withContext(Dispatchers.IO) {
+        val sub = repo.ensureSubscription(BuiltInSources.BUILTIN_SUB_ID, "", sourceUrl)
+        val hasProfiles = repo.profiles.value.any { it.subscriptionId == sub.id }
+        if (hasProfiles) return@withContext 0
+        val body = runCatching {
+            context.applicationContext.assets.open(BuiltInSources.SEED_ASSET)
+                .bufferedReader().use { it.readText() }
+        }.getOrDefault("")
+        val list = ShareLinkParser.parseSubscriptionBody(body).map {
+            it.copy(
+                id = ShareLinkParser.newId(),
+                subscriptionId = sub.id,
+                addedAt = System.currentTimeMillis()
+            )
+        }
+        if (list.isNotEmpty()) {
+            repo.replaceSubscriptionProfiles(sub.id, list)
+            repo.touchSubscription(sub.id)
         }
         list.size
     }

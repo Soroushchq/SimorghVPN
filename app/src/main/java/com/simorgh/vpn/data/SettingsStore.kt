@@ -24,7 +24,9 @@ data class SimorghSettings(
     val mtu: Int = 1500,
     val remoteDns: String = "1.1.1.1",
     val domesticDns: String = "1.1.1.1",
-    val activeProfileId: String = ""
+    val activeProfileId: String = "",
+    /** Active index in [BuiltInSources.SOURCE_URLS]. */
+    val builtinSourceIndex: Int = 0
 )
 
 object SettingsStore {
@@ -39,6 +41,7 @@ object SettingsStore {
         val REMOTE_DNS = stringPreferencesKey("remote_dns")
         val DOMESTIC_DNS = stringPreferencesKey("domestic_dns")
         val ACTIVE = stringPreferencesKey("active_profile_id")
+        val BUILTIN_SOURCE = intPreferencesKey("builtin_source_index")
     }
 
     fun flow(context: Context): Flow<SimorghSettings> {
@@ -53,7 +56,8 @@ object SettingsStore {
                 mtu = (p[Keys.MTU] ?: 1500).coerceIn(576, 65535),
                 remoteDns = p[Keys.REMOTE_DNS]?.trim().takeUnless { it.isNullOrBlank() } ?: "1.1.1.1",
                 domesticDns = p[Keys.DOMESTIC_DNS]?.trim().takeUnless { it.isNullOrBlank() } ?: "1.1.1.1",
-                activeProfileId = p[Keys.ACTIVE] ?: ""
+                activeProfileId = p[Keys.ACTIVE] ?: "",
+                builtinSourceIndex = (p[Keys.BUILTIN_SOURCE] ?: 0).coerceIn(0, BuiltInSources.count() - 1)
             )
         }
     }
@@ -76,4 +80,6 @@ object SettingsStore {
     suspend fun setRemoteDns(context: Context, v: String) = edit(context) { it[Keys.REMOTE_DNS] = v }
     suspend fun setDomesticDns(context: Context, v: String) = edit(context) { it[Keys.DOMESTIC_DNS] = v }
     suspend fun setActiveProfile(context: Context, id: String) = edit(context) { it[Keys.ACTIVE] = id }
+    suspend fun setBuiltinSourceIndex(context: Context, index: Int) =
+        edit(context) { it[Keys.BUILTIN_SOURCE] = index.coerceIn(0, BuiltInSources.count() - 1) }
 }

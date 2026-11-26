@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="vpn_notification_channel">OpenRung VPN</string>
+    <string name="vpn_notification_title">OpenRung VPN</string>
+    <string name="vpn_notification_preparing">جار تجهيز OpenRung VPN</string>
+    <string name="vpn_notification_connected">تم الاتصال عبر %1$s</string>
+    <string name="relay_location_unknown">موقع غير معروف</string>
+    <string name="status_disconnected">غير متصل</string>
+    <string name="status_preparing">جار تجهيز VPN</string>
+    <string name="status_connecting">جار الاتصال</string>
+    <string name="status_connected">متصل</string>
+    <string name="status_disconnecting">جار قطع الاتصال</string>
+    <string name="status_failed">فشل</string>
+    <string name="log_split_ruleset_missing">مجموعة قواعد تقسيم النفق لـ %1$s غير موجودة؛ تبقى حركة المرور تلك داخل النفق</string>
+    <string name="log_error_prefix">خطأ: %1$s</string>
+</resources>

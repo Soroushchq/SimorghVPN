@@ -1,0 +1,2343 @@
+'use strict';
+
+/*
+ * EngineManager — drives the native shroudly-core binary.
+ *
+ * Responsibilities:
+ *   - resolve & spawn the right binary for this OS/arch
+ *   - translate UI settings into engine CLI args
+ *   - set the system proxy while active, restore it on stop/crash/exit
+ *   - parse the engine's JSON stdout into live stats + logs
+ *   - restart the engine with backoff if it dies unexpectedly, unless an
+ *     antivirus took or keeps ending it (security-block.js): restarting a
+ *     program it just stopped only gives it more reason to act, so that is
+ *     told instead (hooks.onSecurityBlock)
+ *
+ * No elevation, no drivers, no third-party tools.
+ */
+
+const { spawn } = require('child_process');
+const path = require('path');
+const fs = require('fs');
+const TorApps = require('./tor-apps');
+const SystemProxy = require('./system-proxy');
+const DohForwarder = require('./doh-forwarder');
+const CustomDnsLib = require('./custom-dns');
+const Families = require('./families');
+const diagnostics = require('./diagnostics');
+const procnet = require('./procnet');
+const { DISCORD_DOMAINS } = require('./discord-relay');
+const fingerprints = require('./censor-fingerprints');
+const { isMainName } = require('./service-check');
+const sharedWake = require('./wake');
+const LogGate = require('./log-gate');
+const { cleanAllow } = require('./adblock');
+const SecurityBlock = require('./security-block');
+const OwnServer = require('./own-server');
+const net = require('net');
+const crypto = require('crypto');
+
+/* Can we listen on 127.0.0.1:port right now? */
+function portFree(port) {
+  return new Promise((resolve) => {
+    const s = net.createServer();
+    s.once('error', () => resolve(false));
+    s.listen(port, '127.0.0.1', () => s.close(() => resolve(true)));
+  });
+}
+
+/* The configured port if it is free, else the next free one close by, else
+ * any. Other proxies (v2rayN, Clash and more) also default to 10808, and one
+ * of them running must not stop protection from starting at all. */
+async function pickPort(want) {
+  if (await portFree(want)) return want;
+  for (let p = want + 1; p <= want + 20 && p < 65536; p++) if (await portFree(p)) return p;
+  return new Promise((resolve) => {
+    const s = net.createServer();
+    s.listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => resolve(port)); });
+  });
+}
+
+/* Countries whose filters follow whole connections rather than just the first
+ * packet. There the normal mode is often not enough, and Advanced mode is the
+ * thing to offer before the user has to discover it. (Research notes in
+ * README, "Where it works".) */
+/* How many cuts on one host, within CUT_WINDOW_MS, before we believe it. A
+ * stall or reset is strong evidence; "no reply" is weak (a long-poll looks
+ * the same), so it needs more. */
+const CUT_WINDOW_MS = 3 * 60 * 1000;
+const CUT_NEED = { stall: 2, reset: 2, noreply: 4 };
+/* A cut by silence (a stall, no reply: nothing came for seconds) is a filter
+ * stopping that connection only while the network carried other traffic. A
+ * link that goes quiet as a whole (weak Wi-Fi, a train between cells, a
+ * satellite dish blocked for a moment, a laptop moving between Wi-Fi, a
+ * cable and a phone's hotspot) stalls every connection that was halfway
+ * through a response, and two of them on one site were enough to call it
+ * filtered: the log said so, a Mac was told a VPN was the remaining option,
+ * and Windows and Linux brought up Advanced mode's permission prompt. Such a
+ * cut counts only when something came back through the engine in the
+ * QUIET_PROOF_MS before it was told (the connection itself had been silent
+ * longer, 8 s at least: the engine's CUT_STALL_MS). Several sites stalling
+ * at once is no sign of the link by itself: a filter that freezes every
+ * connection to a CDN does that too, while the rest of the web flows. No cut
+ * counts within NET_SETTLE_MS of a move to another network, and one believed
+ * in the NET_SETTLE_MS before it is taken back. What the autopilot does about
+ * a cut waits CUT_SETTLE_MS, for a move to show (cutHolds). */
+const SILENT_CUTS = new Set(['stall', 'noreply']);
+const QUIET_PROOF_MS = 6000;
+// No internet at all (a provider down, a router without its uplink, a hotel
+// Wi-Fi not logged in yet): this many failed connections within the window,
+// nothing back through the engine in it, and no control address answering
+// directly. Looked at again this often while it lasts.
+const OFFLINE_FAILS = 4;
+const OFFLINE_WINDOW_MS = 20000;
+const OFFLINE_RECHECK_MS = 15000;
+// The address sites see through the user's own server (_watchExit): first
+// looked at this long after a start, then this often, sooner after a miss.
+const EXIT_FIRST_MS = 3000;
+const EXIT_EVERY_MS = 10 * 60 * 1000;
+const EXIT_RETRY_MS = 60 * 1000;
+const NET_SETTLE_MS = 60000;
+const CUT_SETTLE_MS = 10000;
+
+/* What worked where, kept across restarts: the engine forgets everything when
+ * it stops, so without this every Start, reboot and update made it search
+ * again, and the first connections to a blocked site (Discord's, at login)
+ * failed while it did. Host -> { s: technique, t: when learned }. Sent to
+ * the engine at each start with its age (see engine_restore), so one that
+ * no longer works is checked and replaced, never trusted blindly. */
+/* Kinds of technique a name's server cannot take (the engine's "refused":
+ * it answered a ClientHello in two records with another certificate, #68),
+ * kept across restarts and given back before the techniques (AVOID), for as
+ * long as the engine keeps them (six hours). */
+/* "2": the ones kept before 2.6.67 were mostly the engine mistaking an app
+ * closing a connection for a refusal; they are not given back. */
+const AVOID_KEY = 'avoidTechniques2';
+const AVOID_MAX = 200;
+const AVOID_TTL_MS = 6 * 60 * 60 * 1000;
+const LEARNED_KEY = 'learnedTechniques';
+const LEARNED_MAX = 300;
+// Techniques for streams that are not TLS or HTTP (raw-*), per address: a
+// store of their own, so an app's many addresses never push out what was
+// learned for sites.
+const LEARNED_RAW_KEY = 'learnedRawTechniques';
+const LEARNED_RAW_MAX = 100;
+const LEARNED_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+/* A host that could not be reached at all is logged at once, then again at
+ * most every half hour (log-gate.js): a browser or a game retries a dead
+ * host over and over, and the log should say so once, not once per retry. */
+
+/* A list that names any Discord domain gets all of them: Discord loads its
+ * pieces from a dozen domains, and a list edited before one was added would
+ * otherwise leave that piece blocked (activities, gift links, dis.gd). */
+function withDiscord(list) {
+  const lower = list.map((d) => String(d).toLowerCase());
+  if (!lower.some((d) => DISCORD_DOMAINS.includes(d))) return list;
+  return [...list, ...DISCORD_DOMAINS.filter((d) => !lower.includes(d))];
+}
+
+const DEFAULT_PORT = 10808;
+// A site no technique opened is told after this long where Tor is ready to
+// carry it (the engine tries Tor right after; see _tellBlocked).
+const BLOCKED_HOLD_MS = 8000;
+// The engine's events about one site kept for a report (_noteSiteEvent): the
+// troubles, not each technique that worked (the Connections list has those).
+const SITE_EVENT_TYPES = new Set(['blocked', 'cut', 'unreachable', 'send_failed', 'fallback', 'refused', 'dns_around', 'upstream']);
+const SITE_EVENTS_MAX = 80;
+
+// Domains routed through the proxy in "listed" mode: the list built by
+// scripts/site-list/update.js from OONI measurements and curated service
+// families (each service with every domain it needs, CDN and captcha
+// included), shipped in data/sites.json and kept current by site-list.js.
+// The default routing mode sends everything through Shroudly instead, so this
+// list only matters to people who narrow it down; they can edit it in Settings.
+// FALLBACK_SITE_LIST is only used if the shipped file cannot be read.
+function bundledSiteList() {
+  try {
+    const d = JSON.parse(fs.readFileSync(path.join(__dirname, 'data', 'sites.json'), 'utf8')).domains;
+    if (Array.isArray(d) && d.length) return d;
+  } catch {}
+  return FALLBACK_SITE_LIST;
+}
+const FALLBACK_SITE_LIST = [
+  // Discord: every domain the company serves the app, media and activities from
+  ...DISCORD_DOMAINS,
+  // Roblox
+  'roblox.com', 'rbxcdn.com', 'robloxlabs.com',
+  // Reading / writing / sharing
+  'wattpad.com', 'pastebin.com', 'medium.com', 'imgur.com', 'linktr.ee',
+  'archiveofourown.org', 'tumblr.com', 'wordpress.com', 'blogspot.com',
+  'quora.com', 'deviantart.com', 'flickr.com', 'pinterest.com',
+  // Audio / video
+  'soundcloud.com', 'sndcdn.com', 'spotify.com', 'scdn.co',
+  'youtube.com', 'youtu.be', 'ytimg.com', 'googlevideo.com',
+  'twitch.tv', 'ttvnw.net', 'jtvnw.net', 'vimeo.com', 'vimeocdn.com',
+  'dailymotion.com', 'dmcdn.net',
+  // Social
+  'x.com', 'twitter.com', 'twimg.com', 't.co',
+  'facebook.com', 'fbcdn.net', 'instagram.com', 'cdninstagram.com',
+  'whatsapp.com', 'whatsapp.net',
+  'tiktok.com', 'tiktokcdn.com', 'tiktokv.com',
+  'reddit.com', 'redd.it', 'redditstatic.com', 'redditmedia.com',
+  'telegram.org', 'telegram.me', 't.me', 'signal.org',
+  // Reference and news
+  'wikipedia.org', 'wikimedia.org', 'archive.org',
+  'bbc.com', 'bbc.co.uk', 'dw.com', 'voanews.com', 'rferl.org',
+  'reuters.com', 'theguardian.com', 'nytimes.com',
+  'eksisozluk.com',
+  // Tools developers and students lose first
+  'github.com', 'githubusercontent.com', 'githubassets.com', 'gitlab.com',
+  'stackoverflow.com', 'stackexchange.com', 'sstatic.net',
+  'duckduckgo.com', 'proton.me', 'protonmail.com', 'tutanota.com', 'torproject.org',
+];
+const DEFAULT_SITE_LIST = bundledSiteList();
+const MAX_RESTARTS = 5;
+// No output at all for this long, although STATS is asked every second, means
+// the engine hangs: the system proxy then points at a dead endpoint, so treat
+// it like a crash. Generous, because a site test (PROBE) blocks the engine's
+// command loop while it runs.
+// Measured only while the computer is awake: a poll that runs much later
+// than asked (the computer slept, the main process was frozen) or across a
+// clock change gives the engine a fresh window instead (see _pollGap).
+const HANG_TIMEOUT_MS = 60000;
+const POLL_MS = 1000;
+// Cuts reported this soon after a wake are about connections the sleep
+// stalled, not about the network (see _onLine 'cut').
+const WAKE_QUIET_MS = 30000;
+// A site a technique opened this long ago or less is up: silence from it
+// then is the network's (see _onLine 'blocked').
+const OPENED_RECENTLY_MS = 30 * 60 * 1000;
+
+const { coreBinaryPath } = require('./core-path');
+
+/* The same "the network's own DNS" line (netdns) at most once in this long. */
+const NETDNS_AGAIN_MS = 10 * 60 * 1000;
+
+class EngineManager {
+  constructor(store, hooks = {}) {
+    this.store = store;
+    this.log = hooks.addLog || (() => {});
+    this.onStatusChange = hooks.onStatusChange || (() => {});
+    this.onProbe = hooks.onProbe || (() => {});
+    this.onSiteBlocked = hooks.onSiteBlocked || (() => {});
+    // Is Advanced mode on? A site still blocked is then not one for which to
+    // suggest it (main.js; false without it).
+    this.advancedOn = hooks.advancedOn || (() => false);
+    // Whether the internet answers straight from this computer (tests stand
+    // in for it).
+    this.internetAnswers = hooks.internetAnswers || (() => require('./blockcheck').internetAnswers());
+    // Sites inside the country, for a shutdown of the rest (national-net.js).
+    this.domesticAnswers = hooks.domesticAnswers || (() => require('./national-net').domesticAnswers());
+    this._fails = [];
+    this._offlineCheck = false;
+    this._offlineTimer = null;
+    // The same line about the same host, at most every half hour; shared
+    // with Games and apps and the Discord relay (main.js).
+    this.logGate = hooks.logGate || new LogGate();
+    // Every site-level finding, as (kind, host, detail): 'bypass', 'blocked',
+    // 'cut', 'unreachable', and 'seen' for a connection to one of the watched
+    // domains. The app uses it to recognise which services this network
+    // filters, sites that turn the user away themselves, and a call starting.
+    this.onHostEvent = hooks.onHostEvent || (() => {});
+    // A connection that is not TLS or HTTP (an app's own protocol) that no
+    // technique got through, or whose address does not answer at all, as
+    // (kind, line): 'blocked' or 'unreachable', with the address, the port
+    // and the app's own port (raw-apps.js names the app and tells).
+    this.onRaw = hooks.onRaw || (() => {});
+    // The server (IPv4) of a connection cut after its handshake was answered
+    // (engine.c, report_cut_addr): Advanced mode sends that server's next
+    // connections the stronger way (advanced-mode.js, escalate).
+    this.onCutAddr = hooks.onCutAddr || (() => {});
+    // Domains the engine tells about each time a program connects to one
+    // (once per name in a while; nothing about the connection changes).
+    this.watch = Array.isArray(hooks.watch) ? hooks.watch : [];
+    // The ad and tracker list in use, when "Block ads and trackers" is on
+    // (adblock.js keeps it): the path, or null for none yet.
+    this.adblockFile = hooks.adblockFile || (() => null);
+    // The remote settings (remote-config.js) in use: {} when there are none.
+    this.remote = hooks.remote || (() => ({}));
+    this._adblockChecks = [];
+    // Where the file naming the user's own server goes (Settings, "Your
+    // own server"; own-server.js): this user's own folder, as it holds the
+    // server's password.
+    this.dataDir = hooks.dataDir || require('os').tmpdir();
+    this._ssClient = null;      // { key, port, close }: the local client for a Shadowsocks, VLESS or Trojan server
+    this._upstreamFile = null;
+    // The last way out (tor-route.js): Tor, for a connection nothing else
+    // got through; main.js brings it (none in the tests unless they do).
+    this.tor = hooks.torRoute || null;
+    // Tor is slow: the user says yes before it first starts (issue #77).
+    // (host) => the window and a notification ask; main.js answers.
+    this.onTorAsk = hooks.onTorAsk || (() => {});
+    this._torFile = null;
+    this._blockedHold = new Map();
+    this._ownDownTimer = null;
+    this.onNeedRestart = hooks.onNeedRestart || (() => {});
+    this.onDnsAutoEnabled = hooks.onDnsAutoEnabled || (() => {});
+    // An antivirus that quarantined, refused or keeps ending the engine
+    // (security-block.js), as { part: 'engine', kind, certain, file, folder,
+    // detail }: main.js tells it once, in the log, a notification and the
+    // window. Without it, the log line alone.
+    this.onSecurityBlock = hooks.onSecurityBlock || ((info) => this.log('error', SecurityBlock.logLine(info)));
+    // The engine's file; the tests bring a stand-in.
+    this.binPath = hooks.binPath || coreBinaryPath();
+    // An installed Shroudly, where a missing engine file was taken by someone
+    // (a developer's run says how to build it instead).
+    this.packaged = hooks.packaged != null ? !!hooks.packaged : __dirname.includes('app.asar');
+    this.platform = hooks.platform || process.platform;
+    // Engines in a row that ended right after they started, by themselves
+    // and without a word (SecurityBlock.classifyEarlyExit). The tests that
+    // end the engine themselves, as a crash, turn this off.
+    this.judgeQuickExits = hooks.judgeQuickExits !== false;
+    this._quickExits = 0;
+    // Sleep and clock jumps (wake.js); the tests bring their own.
+    this.wake = hooks.wake || sharedWake;
+    this.hangTimeoutMs = hooks.hangTimeoutMs || HANG_TIMEOUT_MS;
+    this.pollMs = hooks.pollMs || POLL_MS;
+    this.startTimeoutMs = hooks.startTimeoutMs || 6000;
+    // The current automatic list (site-list.js); the one shipped with the app
+    // when there is none.
+    this.siteList = hooks.siteList || (() => DEFAULT_SITE_LIST);
+    this.lastProbe = null;
+    this.proxyOptions = hooks.proxyOptions || {};
+    // What the system proxy is doing, for the window: SystemProxy.apply()'s
+    // result ({ ok, code: 'ok' | 'partial_env' | 'no_system_proxy' |
+    // 'needs_admin' | 'apply_failed' | 'replaced' | 'machine_policy', ... }), or null while
+    // protection is off.
+    this.onProxyStatus = hooks.onProxyStatus || (() => {});
+    this.proxyStatus = null;
+    // A macOS restore recoverSync() had to leave for the administrator's
+    // password: { declined } for the window, or null (see recoverProxyAsAdmin).
+    // proxyRecoveryPending: it is still to be asked for by itself, once.
+    this.onProxyRecovery = hooks.onProxyRecovery || (() => {});
+    this.proxyRecovery = null;
+    this.proxyRecoveryPending = false;
+    this._restartTimer = null;
+    // A crash restart decided and not yet under way (the system proxy being
+    // put back, the delay before the start): already "coming".
+    this._restartPending = false;
+    // Starts, stops and settings restarts run one at a time, in the order they
+    // were asked for (_serial); _stops counts the stops asked for and not yet
+    // done, during which nothing may point the system at the engine again.
+    this._ops = Promise.resolve();
+    this._starting = null;
+    this._stops = 0;
+    this._stopGen = 0;
+    // How long after a start a system DNS that answered nothing is looked at again.
+    this.dnsRecheckMs = 20000;
+    this.proxy = new SystemProxy(this.log, {
+      ...this.proxyOptions,
+      // Linux desktops without a proxy setting: the PAC's address is written
+      // for the next login, so its port is kept from run to run.
+      portStore: this.proxyOptions.portStore || { get: () => store.get('pacPort'), set: (p) => store.set('pacPort', p) },
+      // Another program took the system proxy over and it was left to it
+      // (or it came back). One that kept taking it is named when it can be
+      // (fight), and the window says that Shroudly stopped setting it back.
+      onOwnership: (owned, info = {}) => {
+        if (!this.proxyStatus) return;
+        const base = this.proxyStatus.replacedFrom || this.proxyStatus;
+        const fight = info.gaveUp ? { by: info.by || [] } : null;
+        this._setProxyStatus(owned ? base : { ...base, ok: false, code: 'replaced', lost: info.lost, fight, replacedFrom: base });
+      },
+      // Who most likely did it: the program serving the PAC that replaced
+      // ours, else a running tool known to set the system proxy.
+      whoTookIt: (takeover) => EngineManager.whoTookProxy(takeover),
+    });
+    this.onAdvice = hooks.onAdvice || (() => {});
+    // What the window should tell the user about this network. Kept here, not
+    // only sent, because most of it is learned before the window has loaded.
+    // ownServerDown: the user's own server not working, as { server, why }.
+    this.advice = { conflicts: [], cut: null, dnsDown: false, offline: false, ownProxy: false, nationalOnly: null, ownServerDown: null };
+    this.cuts = new Map();        // host -> [{ reason, t }]
+    this.cutHosts = new Set();    // hosts already reported this session
+    this.believedAt = new Map();  // host -> when its cut was believed
+    // A cut believed and still standing CUT_SETTLE_MS later (cutHolds), as
+    // (host): what the autopilot acts on (main.js: Advanced mode).
+    this.onCut = hooks.onCut || (() => {});
+    this.cutSettleMs = hooks.cutSettleMs != null ? hooks.cutSettleMs : CUT_SETTLE_MS;
+    // The networks this computer is on, as one string that changes when it
+    // moves to another (main.js: Autopilot.networkFingerprint); null: not
+    // known. Looked at when a cut is told, not polled.
+    this.networkPrint = hooks.networkPrint || null;
+    this._print = null;
+    this.netMovedAt = -Infinity;
+    this.doh = new DohForwarder(this.log, {
+      // The route that worked is remembered, so the next start goes straight to it.
+      preferredId: store.get('dohRoute') || null,
+      onPreferred: (id) => store.set('dohRoute', id),
+      onState: (state) => this._setAdvice({ dnsDown: state === 'down' }),
+    });
+    this.doh.setCustom(this.customDns(), { strict: this.customDnsStrict(), proxy: this.customDnsProxy() });
+    this.dohPort = 0;
+    this.lastDohPort = 0;
+
+    this.proc = null;
+    this.active = false;
+    // Hosts we have already reported on, so a busy page logs one line per site
+    // rather than one per connection.
+    this.bypassed = new Set();
+    this.blockedHosts = new Set();
+    // When a technique last opened each site.
+    this.openedAt = new Map();
+    // How many techniques the engine's ladder has; it says so when it starts.
+    this.techniques = 0;
+    this._dnsAutoFixed = false;
+    this._dnsReenabledForBlock = false;
+    this.port = Number(store.get('listenPort', DEFAULT_PORT)) || DEFAULT_PORT;
+    this.expectingStop = false;
+    this.restarts = 0;
+    this.lastError = null;
+    this.startedAt = 0;
+
+    this.stats = this._empty();
+  }
+
+  _empty() {
+    return {
+      engine: 'shroudly-core',
+      startTime: 0,
+      connsTotal: 0, connsActive: 0,
+      bytesUp: 0, bytesDown: 0,
+      desync: 0, tlsSeen: 0, httpSeen: 0,
+      probeOk: 0, probeFail: 0,
+      strategy: '',
+    };
+  }
+
+  isActive() { return this.active; }
+
+  /* Protection is on and browsers go through it (SystemProxy.routes). */
+  routing() {
+    if (!this.active) return false;
+    if (SystemProxy.routes(this.proxyStatus)) return true;
+    // A proxy this computer's administrator set for all its users
+    // (system-proxy.js, machine_policy): browsers do not follow Shroudly's,
+    // but Advanced mode carries their connections beneath it.
+    return !!(this.proxyStatus && this.proxyStatus.code === 'machine_policy' && this.advancedOn());
+  }
+
+  /* A stop has been asked for and is not done yet. */
+  get stopping() { return this._stops > 0; }
+
+  /* The engine is on its way: a start under way, or a restart after a crash
+   * or a settings change. Programs carried by Shroudly wait for it. */
+  get coming() { return !this.stopping && (!!this._starting || !!this._restartTimer || !!this.restarting || this._restartPending); }
+
+  _serial(fn) {
+    const run = this._ops.then(fn);
+    this._ops = run.catch(() => {});
+    return run;
+  }
+
+  getStats() {
+    return { ...this.stats, uptime: this.startedAt ? Date.now() - this.startedAt : 0 };
+  }
+
+  _settings() {
+    const s = this.store.store || {};
+    const strategy = typeof s.strategy === 'string' && s.strategy ? s.strategy : 'split(sni)';
+    return {
+      strategy,
+      autoProbe: s.autoMode !== false,          // "auto mode" now means real auto-probe
+      useDoh: s.dnsProtection !== false,        // encrypted DNS: default on
+      preferIpv6: s.preferIpv6 === true,
+      // Default: everything goes through Shroudly. That is what makes a blocked
+      // site work without anyone having to know its name in advance, and it is
+      // what gives every lookup our encrypted DNS. It costs nothing, because the
+      // engine leaves a connection completely untouched unless it is refused:
+      // ordinary browsing is relayed as-is, at the same speed as no proxy.
+      routeMode: s.routeMode === 'listed' ? 'listed' : 'all',
+      // The user's own sites are routed with the automatic list, never
+      // instead of it: until 2.6.78 one edit of the box froze the list at
+      // the built-in 84 names, and a site blocked since (LinkedIn on one
+      // network: reset at every first try, "hard refresh and it opens")
+      // went straight to the network's filter, never through Shroudly.
+      siteList: Families.expand(withDiscord([...new Set([...this.siteList(), ...(Array.isArray(s.siteList) ? s.siteList : [])])])),
+      port: Number(s.listenPort) || DEFAULT_PORT,
+      adBlock: s.adBlock === true,
+      adBlockAllow: cleanAllow(s.adBlockAllow),
+    };
+  }
+
+  _args(cfg) {
+    const a = ['--listen', '127.0.0.1', '--port', String(cfg.port), '--strategy', cfg.strategy];
+    if (cfg.autoProbe) a.push('--auto');
+    if (cfg.useDoh) {
+      a.push('--doh');
+      if (this.dohPort) a.push('--doh-port', String(this.dohPort));
+      if (this.dohPort && this.customDnsStrict()) a.push('--dns-strict');
+    }
+    if (cfg.preferIpv6) a.push('--ipv6');
+    for (const d of this.watch) a.push('--watch', d);
+    const list = cfg.adBlock ? this.adblockFile() : null;
+    if (list) {
+      a.push('--adblock', list);
+      for (const d of cfg.adBlockAllow) a.push('--allow', d);
+    }
+    // Block pages and sinkholes of every country we know: an answer pointing
+    // at one is forged, so the engine refuses it and keeps looking.
+    for (const ip of fingerprints.ALL) a.push('--block-ip', ip);
+    if (this._upstreamFile) a.push('--upstream-file', this._upstreamFile);
+    if (this._torFile) a.push('--fallback-file', this._torFile);
+    // Decoys (where this engine sends them) carry the names of large sites in
+    // the user's country, which a network that lets only allowed sites
+    // through keeps open (national-net.js).
+    for (const n of this.decoyNames()) a.push('--decoy-name', n);
+    // What the remote settings add, technique tuning only (remote-config.js
+    // engineArgs: never a server, a file, a port or an address).
+    let extra = [];
+    try { extra = require('./remote-config').engineArgs(this.remote().engineArgs); } catch {}
+    a.push(...extra);
+    return a;
+  }
+
+  /* The names decoys carry here: the country a shutdown showed, else the
+   * system's time zone's (national-net.js). */
+  decoyNames() {
+    let remembered = null;
+    try { remembered = this.store && this.store.get ? this.store.get('homeCountry') : null; } catch {}
+    const NationalNet = require('./national-net');
+    const cc = NationalNet.homeCountry({ remembered });
+    // The remote settings may name this country's decoys (remote-config.js).
+    let remote = null;
+    try { remote = require('./remote-config').decoyNames(this.remote(), cc); } catch {}
+    return remote && remote.length ? remote : NationalNet.decoyNames(cc);
+  }
+
+  /* The engine's last events about sites, as it sent them, for a report
+   * (main.js): the log says each kind once per site (logGate), so a site
+   * that kept being cut or kept failing said so once, and a report sent
+   * later could not tell whether it still did. Kept in memory only, the
+   * last SITE_EVENTS_MAX, across a stop (the report after "off"). */
+  _noteSiteEvent(msg) {
+    if (!msg || !SITE_EVENT_TYPES.has(msg.type)) return;
+    if (!this.siteEvents) this.siteEvents = [];
+    const keep = {};
+    for (const k of ['host', 'strategy', 'next', 'attempts', 'family', 'note', 'why', 'stage', 'raw', 'port', 'alert', 'site_ok', 'ok']) {
+      if (msg[k] !== undefined && msg[k] !== '') keep[k] = msg[k];
+    }
+    this.siteEvents.push({ at: Date.now(), type: msg.type, ...keep });
+    if (this.siteEvents.length > SITE_EVENTS_MAX) this.siteEvents.splice(0, this.siteEvents.length - SITE_EVENTS_MAX);
+  }
+
+  /* The last way out turned off by the user (a "no" to Tor, or Settings),
+   * on a computer that has it and no own server: a site no technique opens
+   * has nothing left here, and the user is asked again now and then
+   * (main.js askTorAgain). */
+  /* What the last way out does for a connection no technique gets through
+   * (raw-apps.js): 'carries' (allowed: Tor takes it), 'asks' (not allowed
+   * yet: the user is asked), 'off' (turned off in Settings), or null (none
+   * here: no Tor in this build, the user's own server carries everything,
+   * or it could not be set up). */
+  torFor() {
+    if (!this.tor || this.ownServer()) return null;
+    if (this.store.get('torLastResort', false) === false) return 'off';
+    if (!this.active || !this._torFile) return null;
+    return this.store.get('torApproved', false) === true ? 'carries' : 'asks';
+  }
+
+  torOffByUser() {
+    return !!this.tor && this.store.get('torLastResort', false) === false && !this.ownServer();
+  }
+
+  /* The user's own server (Settings, "Your own server"), as stored and
+   * read (own-server.js), or null. */
+  ownServer() {
+    const p = OwnServer.parseLink(this.store.get('ownServer'));
+    return p.ok ? p : null;
+  }
+
+  /* Before each engine start: the file that names the server to the
+   * engine (--upstream-file), with Shroudly's own Shadowsocks client in
+   * between for a Shadowsocks server; or none. */
+  async _prepareUpstream() {
+    const p = this.ownServer();
+    // DNS goes where everything else goes: through the engine and the
+    // server, never straight out to a resolver (issue #67).
+    if (this.doh && this.doh.setThroughEngine) this.doh.setThroughEngine(!!p);
+    await this._prepareTor(!!p);
+    // Shadowsocks, VLESS and Trojan: a client of Shroudly's own in between
+    // (kept while the link stays the same).
+    const key = OwnServer.localClient(p) ? String(this.store.get('ownServer')).trim() : null;
+    if (this._ssClient && this._ssClient.key !== key) { this._ssClient.close(); this._ssClient = null; }
+    if (!p) { this._removeUpstream(); return; }
+    if (key && !this._ssClient) {
+      const auth = { user: crypto.randomBytes(8).toString('hex'), pass: crypto.randomBytes(16).toString('hex') };
+      const c = await OwnServer.startLocalClient(p, { ...auth, onDown: (why) => this._onOwnServerDown(why) });
+      this._ssClient = { key, auth, ...c };
+    }
+    const file = path.join(this.dataDir, 'own-server.txt');
+    const line = OwnServer.engineLine(p, this._ssClient ? this._ssClient.port : 0, this._ssClient ? this._ssClient.auth : null);
+    fs.writeFileSync(file, `${line}\n`, { mode: 0o600 });
+    try { fs.chmodSync(file, 0o600); } catch {}
+    this._upstreamFile = file;
+    this._ownServerShown = OwnServer.describe(p);
+    // Sites see the server's address, not the user's (BlockedNotice).
+    this._setAdvice({ ownServerOn: true });
+  }
+
+  /* A site no technique opened, told to the app (a notification); held a
+   * moment where the last way out may carry it instead (its "fallback"
+   * line cancels it). */
+  _tellBlocked(host) {
+    if (!this._torFile || !this.tor || this.tor.status().state !== 'ready') { this.onSiteBlocked(host); return; }
+    if (this._blockedHold.has(host)) return;
+    const t = setTimeout(() => { this._blockedHold.delete(host); if (this.active) this.onSiteBlocked(host); }, BLOCKED_HOLD_MS);
+    if (t.unref) t.unref();
+    this._blockedHold.set(host, t);
+  }
+
+  /* The last way out, named to the engine (--fallback-file) unless the
+   * user turned it off or their own server carries everything (Settings);
+   * Tor itself starts only when the engine first needs it. */
+  async _prepareTor(ownServer) {
+    this._torFile = null;
+    if (!this.tor) return;
+    if (ownServer || this.store.get('torLastResort', false) === false) { this.tor.stop(); return; }
+    try { this._torFile = await this.tor.prepare(); }
+    catch (e) { this.log('warning', `The last way out could not be set up: ${e.message}`); }
+  }
+
+  _removeUpstream() {
+    if (this._upstreamFile) { try { fs.unlinkSync(this._upstreamFile); } catch {} }
+    this._upstreamFile = null;
+    this._setAdvice({ ownServerOn: null });
+  }
+
+  _closeUpstream() {
+    if (this._ssClient) { try { this._ssClient.close(); } catch {} this._ssClient = null; }
+    this._removeUpstream();
+    clearTimeout(this._ownDownTimer);
+    clearTimeout(this._exitTimer);
+    this._setAdvice({ ownServerDown: null, ownServerExit: null });
+  }
+
+  /* Which address sites see while the user's own server carries them
+   * (issue #66): Cloudflare's trace page, asked through the engine the way
+   * every app's connection goes, a few seconds after a start and then every
+   * ten minutes (sooner again after a look that got nothing); said under
+   * the status (advice.ownServerExit). Not written to the log, which people
+   * attach to public issues. */
+  _watchExit() {
+    clearTimeout(this._exitTimer);
+    this._setAdvice({ ownServerExit: null });
+    if (!this._upstreamFile) return;
+    const look = async () => {
+      if (!this.active || !this._upstreamFile) return;
+      let r = null;
+      try { r = await OwnServer.test({ kind: 'socks5', host: '127.0.0.1', port: this.port, user: '' }, { trace: true, timeout: 15000 }); } catch {}
+      if (!this.active || !this._upstreamFile) return;
+      const ip = r && r.ok ? r.ip : null;
+      this._setAdvice({ ownServerExit: ip ? { server: this._ownServerShown || '', ip, loc: (r && r.loc) || null } : null });
+      this._exitTimer = setTimeout(look, ip ? EXIT_EVERY_MS : EXIT_RETRY_MS);
+      if (this._exitTimer.unref) this._exitTimer.unref();
+    };
+    this._exitTimer = setTimeout(look, EXIT_FIRST_MS);
+    if (this._exitTimer.unref) this._exitTimer.unref();
+  }
+
+  /* The server would not carry a connection (the engine's "upstream"
+   * line, or the Shadowsocks client): told in the log now and then, and in
+   * the window until a minute and a half passes without it. */
+  _onOwnServerDown(why) {
+    if (!this.active || !this._upstreamFile) return;
+    // A link to a home network's address, from outside it: that is why.
+    { const p = this.ownServer(); if (p && OwnServer.localHost(p.host)) why = 'local'; }
+    const server = this._ownServerShown || '';
+    if (this.logGate.allow('own-server-down', `${server} ${why}`)) {
+      this.log('warning', `Your own server (${server}) could not be used: ${OwnServer.WHY_TEXT[why] || why}`);
+    }
+    this._setAdvice({ ownServerDown: { server, why } });
+    clearTimeout(this._ownDownTimer);
+    this._ownDownTimer = setTimeout(() => this._setAdvice({ ownServerDown: null }), 90000);
+    if (this._ownDownTimer.unref) this._ownDownTimer.unref();
+  }
+
+  /* Does this link's server carry a site (Settings, before it is used)?
+   * { ok, ms } or { ok: false, why }, or { ok: false, invalid } for a link
+   * that cannot be read. */
+  async testOwnServer(link) {
+    const p = OwnServer.parseLink(link);
+    if (!p.ok) return { ok: false, invalid: p.error, method: p.method, what: p.what };
+    return OwnServer.test(p, { trace: true });
+  }
+
+  /* The engine asks for the last way out (fallback ok:0): Tor starts, once
+   * the user has said yes to it (issue #77); until then they are asked.
+   * Neither while another bypass tool or VPN is running: two tools changing
+   * the same connections is what makes every technique fail then, and Tor
+   * does not mend that. A first start on Türk Telekom beside GoodbyeDPI had
+   * all 20 techniques refused for discord.com, which worked without
+   * Shroudly, and asked "Open discord.com through Tor?" five seconds after
+   * the app first opened. The warning that names the tool is what is said
+   * (see _afterDiagnostics); looked for here too, since the question can
+   * come before the first look at the system has finished. */
+  async _torWanted(host) {
+    let tools = this.advice.conflicts || [];
+    if (!tools.length) {
+      try { tools = await this._runningTools(); } catch { tools = []; }
+      if (!this.active || !this.tor) return;
+    }
+    if (tools.length) {
+      if (this.logGate.allow('fallback-conflict', host || '*')) {
+        this.log('info', `The last way out: not ${this.store.get('torApproved', false) === true ? 'started' : 'asked'} for ${host || 'a site'} while ${tools.join(', ')} is running; two tools changing the same connections is why nothing got through`);
+      }
+      return;
+    }
+    if (this.store.get('torApproved', false) === true) {
+      // Which site needed it: "starting Tor" alone left a report unable
+      // to tell whether the app in question (Discord) was the one.
+      if (host && this.tor.status().state !== 'ready' && this.logGate.allow('fallback-need', host)) {
+        this.log('info', `${host}: no technique got through; the last way out (Tor) is needed for it`);
+      }
+      this.tor.need();
+    } else { try { this.onTorAsk(host); } catch {} }
+  }
+
+  /* The bypass tools and VPNs running now (a seam for the tests). */
+  _runningTools() { return diagnostics.runningTools({ ownTor: this.tor && this.tor.proc ? 1 : 0 }); }
+
+  /* While another VPN or bypass tool is running, look again every half
+   * minute, so the warning goes away by itself once the user quits it. */
+  _watchConflicts() {
+    clearInterval(this._conflictTimer);
+    if (!this.advice.conflicts.length) return;
+    this._conflictTimer = setInterval(async () => {
+      if (!this.active) { clearInterval(this._conflictTimer); return; }
+      let tools = [];
+      try { tools = await diagnostics.runningTools({ ownTor: this.tor && this.tor.proc ? 1 : 0 }); } catch { return; }
+      this._setAdvice({ conflicts: tools });
+      if (!tools.length) {
+        clearInterval(this._conflictTimer);
+        this.log('success', 'The other VPN or bypass tool is no longer running.');
+      }
+    }, 30000);
+    if (this._conflictTimer.unref) this._conflictTimer.unref();
+  }
+
+  /* Settle on a free port at or after `want`. If it is not the one saved,
+   * save it: the next start goes straight to a port that worked, and only
+   * looks again if that one is taken too. */
+  async _claimPort(want) {
+    const saved = Number(this.store.get('listenPort')) || DEFAULT_PORT;
+    const port = await pickPort(want);
+    if (port !== saved) {
+      this.log('warning', `Port ${saved} is in use by another program; Shroudly is using ${port} instead.`);
+      this.store.set('listenPort', port);
+    }
+    this.port = port;
+    this.configuredPort = port;
+    return port;
+  }
+
+  /* What is actually deciding how connections are made. With auto mode the
+   * engine's ladder picks a technique per site and the configured strategy is
+   * not used at all, so naming it ("split(sni) + auto") said something untrue. */
+  _strategyLabel(cfg) {
+    if (!cfg.autoProbe) return cfg.strategy;
+    return this.techniques ? `auto, ${this.techniques} techniques` : 'auto';
+  }
+
+  /* A host the engine could not connect to at all: its name did not resolve,
+   * or none of its addresses answered. Not censorship as far as we can tell,
+   * but without this line the log has nothing to say when a site does not
+   * load. Once per host every few minutes. */
+  _onUnreachable(host, stage) {
+    if (!host) return;
+    this._noteFailure();
+    const what = stage === 'dns' ? 'DNS' : 'connection';
+    if (!this.logGate.allow(`unreachable-${what}`, host)) return;
+    this.log('warning', `${host}: could not be reached (${what})`);
+  }
+
+  /* A connection that got nowhere. With no internet at all every site
+   * fails, the browser shows a proxy error that blames Shroudly, and the
+   * window kept saying "Protected": once enough fail with nothing back and
+   * nothing answers directly either, the window says the network has no
+   * internet instead (advice.offline). */
+  _noteFailure(now = Date.now()) {
+    this._fails = this._fails.filter((t) => now - t < OFFLINE_WINDOW_MS);
+    this._fails.push(now);
+    if (this.advice.offline || this._offlineCheck || !this.active || this._fails.length < OFFLINE_FAILS || this.receivedWithin(OFFLINE_WINDOW_MS, now)) return;
+    this._checkOffline().catch(() => {});
+  }
+
+  async _checkOffline() {
+    this._offlineCheck = true;
+    let up = true;
+    try { up = await this.internetAnswers(); } catch {}
+    if (up || !this.active || this.receivedWithin(OFFLINE_WINDOW_MS)) { this._offlineCheck = false; return; }
+    // A proxy of its own set before Shroudly's (a company's, a school's): the
+    // network lets nothing out any other way, and the engine cannot pass
+    // traffic on to it. Not "no internet" then: Stop puts that proxy back.
+    let own = null;
+    try { own = this.proxy && this.proxy.priorProxy ? this.proxy.priorProxy() : null; } catch {}
+    // The rest of the world cut, the country's own network up: a shutdown,
+    // told as one (national-net.js).
+    let national = null;
+    if (!own) { try { national = await this.domesticAnswers(); } catch {} }
+    this._offlineCheck = false;
+    if (!this.active || this.receivedWithin(OFFLINE_WINDOW_MS)) return;
+    this._setAdvice({ offline: true, ownProxy: !!own, nationalOnly: national ? national.country : null });
+    if (own) this.log('warning', `This network sends everything through its own proxy (${own.what}), which Shroudly cannot pass traffic on to; Stop puts it back`);
+    else if (national) { this._logNational(national); this._rememberCountry(national.country); }
+    else this.log('warning', 'This network has no internet right now: nothing connects, not even directly; Shroudly carries on when it is back');
+    clearInterval(this._offlineTimer);
+    let ticks = 0;
+    this._offlineTimer = setInterval(() => {
+      if (!this.active) { this._clearOffline({ quiet: true }); return; }
+      ticks++;
+      Promise.resolve(this.internetAnswers()).then(async (ok) => {
+        if (ok) { this._clearOffline(); return; }
+        // Still cut off: whether the country's own network came up (or went)
+        // meanwhile, once a minute, not every look.
+        if (own || ticks % 4 !== 0 || !this.advice.offline) return;
+        let now = null;
+        try { now = await this.domesticAnswers(); } catch {}
+        const cc = now ? now.country : null;
+        if (!this.advice.offline || cc === this.advice.nationalOnly) return;
+        this._setAdvice({ nationalOnly: cc });
+        if (now) { this._logNational(now); this._rememberCountry(now.country); }
+      }).catch(() => {});
+    }, OFFLINE_RECHECK_MS);
+    if (this._offlineTimer.unref) this._offlineTimer.unref();
+  }
+
+  /* The internet back: the first byte through the engine, or a control
+   * address answering. */
+  _clearOffline({ quiet = false } = {}) {
+    clearInterval(this._offlineTimer);
+    this._offlineTimer = null;
+    this._fails = [];
+    if (!this.advice.offline) return;
+    this._setAdvice({ offline: false, ownProxy: false, nationalOnly: null });
+    if (!quiet) this.log('info', 'The internet is back');
+  }
+
+  /* The country whose own network answered: decoys carry its sites' names
+   * from the next start of the engines (decoyNames). */
+  _rememberCountry(cc) {
+    try { if (cc && this.store && this.store.set && this.store.get('homeCountry') !== cc) this.store.set('homeCountry', cc); } catch {}
+  }
+
+  _logNational(n) {
+    this.log('warning', `Only this country's own network answers: the connection to the rest of the world is cut (${n.host} opens, the world's addresses do not). No app can get past that; Shroudly carries on when it is back`);
+  }
+
+  _setAdvice(patch) {
+    const next = { ...this.advice, ...patch };
+    if (JSON.stringify(next) === JSON.stringify(this.advice)) return;
+    this.advice = next;
+    try { this.onAdvice(this.advice); } catch {}
+  }
+
+  /* Something came back through the engine in the last `ms`: this network
+   * works for other traffic (raw-apps.js tells nothing otherwise). */
+  receivedWithin(ms, now = Date.now()) { return !!this.lastDownAt && now - this.lastDownAt <= ms; }
+
+  /* The techniques remembered, newest last, without the expired ones. */
+  _learned(now = Date.now(), key = LEARNED_KEY) {
+    const all = this.store.get(key);
+    if (!all || typeof all !== 'object') return [];
+    return Object.entries(all)
+      .filter(([h, v]) => /^[a-z0-9.-]{1,253}$/i.test(h) && v && typeof v.s === 'string' && /^[\w.()+-]{1,63}$/.test(v.s)
+        && Number.isFinite(v.t) && now - v.t < LEARNED_TTL_MS)
+      // Learnt "in the future": the clock was set back since. Counted as
+      // learnt now, not thrown away (the next save would lose them all).
+      .map(([h, v]) => [h, v.t > now ? { ...v, t: now } : v])
+      .sort((a, b) => a[1].t - b[1].t);
+  }
+
+  _rememberTechnique(host, technique, t = Date.now()) {
+    if (!host || !technique) return;
+    const raw = /^raw-/.test(technique);
+    const key = raw ? LEARNED_RAW_KEY : LEARNED_KEY;
+    const max = raw ? LEARNED_RAW_MAX : LEARNED_MAX;
+    const keep = this._learned(Date.now(), key).filter(([h]) => h !== host).slice(-(max - 1));
+    keep.push([host, { s: technique, t }]);
+    try { this.store.set(key, Object.fromEntries(keep)); } catch {}
+  }
+
+  _avoids(now = Date.now()) {
+    const all = this.store.get(AVOID_KEY);
+    if (!all || typeof all !== 'object') return [];
+    return Object.entries(all)
+      .filter(([h, v]) => /^[A-Za-z0-9.-]{1,253}$/.test(h) && v && Number(v.m) > 0 && now - Number(v.t) < AVOID_TTL_MS && Number(v.t) <= now + 60000);
+  }
+
+  _rememberAvoid(host, mask, t = Date.now()) {
+    if (!host || !/^[A-Za-z0-9.-]{1,253}$/.test(host)) return;
+    const keep = this._avoids(t).filter(([h]) => h !== host).slice(-(AVOID_MAX - 1));
+    keep.push([host, { m: mask & 3, t }]);
+    try { this.store.set(AVOID_KEY, Object.fromEntries(keep)); } catch {}
+  }
+
+  /* Oldest first, so where two names of one site disagree, the newer wins.
+   * What a server cannot take goes first: a technique of that kind is then
+   * not restored for it (engine_restore). */
+  _restoreTechniques(now = Date.now()) {
+    const avoid = this._avoids(now);
+    const list = [...this._learned(now, LEARNED_RAW_KEY), ...this._learned(now)];
+    if ((!list.length && !avoid.length) || !this.proc || !this.proc.stdin) return;
+    try {
+      this.proc.stdin.write(avoid.map(([h, v]) => `AVOID ${h} ${v.m} ${Math.max(0, Math.round((now - v.t) / 1000))}\n`).join('')
+        + list.map(([h, v]) => `LEARN ${h} ${v.s} ${Math.max(0, Math.round((now - v.t) / 1000))}\n`).join(''));
+    } catch {}
+    if (!list.length) return;
+    this.log('info', `Techniques remembered for ${list.length} sites restored`);
+  }
+
+  /* A site whose connections start and are then cut. One cut means little;
+   * several on the same host in a few minutes is the network doing it. Told
+   * once per host per session. */
+  _onCut(host, reason, kb, siteOk = false) {
+    if (!host) return;
+    const now = Date.now();
+    // Just moved to another network: the move stalled these (see SILENT_CUTS).
+    if (this._movedLately(now)) return;
+    // Nothing at all came back meanwhile: the link was quiet, not this site.
+    if (SILENT_CUTS.has(reason) && !this.receivedWithin(QUIET_PROOF_MS, now)) return;
+    if (this.cutHosts.has(host)) return;
+    // The rest of the site answers through Shroudly: one of its addresses
+    // being cut is that address's own business (and the engine already tries
+    // another technique for it), not something to put in front of the user.
+    // A site's own page is always counted.
+    if (siteOk && !isMainName(host)) return;
+    const list = (this.cuts.get(host) || []).filter((c) => now - c.t < CUT_WINDOW_MS);
+    list.push({ reason, t: now });
+    this.cuts.set(host, list);
+    if (this.cuts.size > 400) this.cuts.clear();
+    const strong = list.filter((c) => c.reason !== 'noreply').length;
+    const weak = list.length - strong;
+    if (strong < CUT_NEED.stall && weak < CUT_NEED.noreply) return;
+    this.cutHosts.add(host);
+    this.believedAt.set(host, now);
+    if (this.believedAt.size > 400) this.believedAt.delete(this.believedAt.keys().next().value);
+    // With Auto mode off the engine tries nothing else (issue #41: the log
+    // said it did): say what is used, and what would help.
+    const s = this._settings();
+    if (s.autoProbe) this.log('warning', `${host}: connects, then the network cuts it (${reason} after ${kb} KB). This network filters whole connections; Shroudly is trying other techniques for it.`);
+    else this.log('warning', `${host}: connects, then the network cuts it (${reason} after ${kb} KB). Auto mode is off, so only ${s.strategy} is used: turn Auto mode on in Settings to let Shroudly try its other techniques.`);
+    this._setAdvice({ cut: { host, reason, auto: s.autoProbe } });
+    const settled = setTimeout(() => { if (this.cutHolds(host)) { try { this.onCut(host); } catch {} } }, this.cutSettleMs);
+    if (settled.unref) settled.unref();
+  }
+
+  /* Whether a cut believed for host still stands, as protection runs: not
+   * taken back since (this computer moved to another network meanwhile,
+   * which is looked at now). */
+  cutHolds(host, now = Date.now()) {
+    this._networkMoved(now);
+    return this.active && this.cutHosts.has(host) && this.believedAt.has(host);
+  }
+
+  /* A cut believed around a move to another network: the move's doing, not
+   * the network's. Forgotten, its notice gone from the window, and said in
+   * the log, which said otherwise. */
+  _withdrawCut(host) {
+    if (!this.believedAt.has(host)) return;
+    this.cutHosts.delete(host);
+    this.believedAt.delete(host);
+    this.cuts.delete(host);
+    if (this.advice.cut && this.advice.cut.host === host) this._setAdvice({ cut: null });
+    this.log('info', `${host}: not cut by the network after all; this computer moved to another network at that moment`);
+  }
+
+  /* This computer moved to another network less than NET_SETTLE_MS ago. A
+   * move "in the future" (the clock was set back since) counts as now, so
+   * cuts are never ignored for longer. */
+  _movedLately(now = Date.now()) {
+    this._networkMoved(now);
+    if (this.netMovedAt > now) this.netMovedAt = now;
+    return now - this.netMovedAt < NET_SETTLE_MS;
+  }
+
+  /* Has this computer moved to another network since this was last looked
+   * at (networkPrint)? Then the cuts of the NET_SETTLE_MS before are taken
+   * back, and none counts for NET_SETTLE_MS (_onCut). The first look only
+   * notes where it is. */
+  _networkMoved(now = Date.now()) {
+    if (!this.networkPrint) return false;
+    let p = null;
+    try { p = String(this.networkPrint()); } catch { return false; }
+    const was = this._print;
+    this._print = p;
+    if (was === null || was === p) return false;
+    this.netMovedAt = now;
+    for (const [h, list] of this.cuts) {
+      const keep = list.filter((c) => now - c.t >= NET_SETTLE_MS);
+      if (keep.length) this.cuts.set(h, keep); else this.cuts.delete(h);
+    }
+    for (const [h, t] of [...this.believedAt]) if (now - t < NET_SETTLE_MS) this._withdrawCut(h);
+    return true;
+  }
+
+  /* Asked again while a start is under way (the automatic start at launch
+   * and a click on Start at the same moment): the same start, never a second
+   * engine and PAC server. A start asked for after a Stop is a new one, made
+   * once that stop is done. */
+  start() {
+    if (this._starting) return this._starting;
+    const p = this._serial(() => this._start());
+    this._starting = p;
+    const done = () => { if (this._starting === p) this._starting = null; };
+    p.then(done, done);
+    return p;
+  }
+
+  async _start() {
+    this.lastConns = null;
+    if (this.active) return { success: true, alreadyActive: true };
+
+    const bin = this.binPath;
+    // Not there, empty or unreadable in an installed Shroudly: an antivirus
+    // took it (or a damaged install), never "npm run build:core".
+    const state = await SecurityBlock.settledFileState(bin, { platform: this.platform });
+    if (SecurityBlock.isGone(state)) {
+      if (this.packaged) throw this._blocked({ kind: state });
+      const msg = `Engine binary not found for ${process.platform}-${process.arch}. Run: npm run build:core`;
+      this.log('error', msg);
+      throw new Error(msg);
+    }
+
+    const cfg = this._settings();
+    // Back after a crash: its own port again if it frees within a moment
+    // (Windows may hold a port a little after its process is gone), so the
+    // system setting kept for it needs nothing new (see SystemProxy._repoint).
+    if (this._crashRestart) {
+      this._crashRestart = false;
+      for (let i = 0; i < 12 && !(await portFree(cfg.port)); i++) await new Promise((r) => setTimeout(r, 250));
+    }
+    cfg.port = await this._claimPort(cfg.port);
+    this.stats = this._empty();
+    this.bypassed.clear();
+    this.blockedHosts.clear();
+    // A host that could not be reached, and "Shroudly is restarting": news
+    // again with this start (log-gate.js).
+    this.logGate.forgetKinds((k) => k.startsWith('unreachable-') || k.endsWith('-unreachable') || k.endsWith('-restarting'));
+    this.cuts.clear();
+    this._networkMoved();
+    this._setAdvice({ cut: null });
+    this._clearOffline({ quiet: true });
+    this._describeEnvironment();
+    this.expectingStop = false;
+
+    // Start the local DoH forwarder so the engine gets real encrypted DNS.
+    // If it can't start, the engine falls back to public UDP resolvers.
+    if (cfg.useDoh && !this.dohPort) {
+      try { this.dohPort = await this.doh.start(this.lastDohPort); this.lastDohPort = this.dohPort; }
+      catch (e) { this.dohPort = 0; this.log('warning', `Encrypted DNS unavailable: ${e.message}`); }
+    }
+
+    try { await this._prepareUpstream(); }
+    catch (e) {
+      await this._cleanup();
+      throw new Error(`Your own server could not be set up: ${e.message}`);
+    }
+    let ready = await this._spawn(bin, this._args(cfg));
+    // Something took the port between our check and the engine binding it:
+    // move on to another one rather than fail.
+    for (let tries = 0; !ready && /listen failed/.test(this.lastError || '') && tries < 3; tries++) {
+      cfg.port = await this._claimPort(cfg.port + 1);
+      ready = await this._spawn(bin, this._args(cfg));
+    }
+    if (!ready) {
+      await this._cleanup();
+      // Refused by Windows, or ended right after it started twice in a row:
+      // told as what it is, not as an engine failure.
+      if (this._spawnBlock) throw this._spawnBlock;
+      if (this._quickExits >= 2) throw this._blocked({ kind: 'early_exit', certain: false, detail: this._quickDetail });
+      throw new Error(this.lastError || 'Engine failed to start');
+    }
+
+    let status;
+    try {
+      // When an engine restart kept the system setting (see _onClose), this
+      // only points the PAC at the new port.
+      status = await this.proxy.apply(this.port, cfg.routeMode, cfg.siteList);
+    } catch (e) {
+      this.log('error', `Could not set system proxy: ${e.message}`);
+      await this._cleanup();
+      throw e;
+    }
+    // The engine ended while the system was being pointed at it. _onClose
+    // had no session to restart then: undo it all and fail this start, never
+    // show protection on with no engine behind it.
+    if (!this.proc) {
+      this.log('error', `Engine exited unexpectedly (code ${this._exitCode ?? '?'}).`);
+      await this._cleanup();
+      throw new Error(this.lastError || 'The engine exited while starting');
+    }
+    this._setProxyStatus(status);
+
+    this.active = true;
+    this.startedAt = Date.now();
+    this.stats.startTime = this.startedAt;
+    this.store.set('runtimeActive', true);
+    // Running again: an antivirus block told earlier is over.
+    if (this.advice.security && this.advice.security.part === 'engine') this._setAdvice({ security: null });
+    this._startStatsPoll();
+    this.onStatusChange(true);
+    this.stats.strategy = this._strategyLabel(cfg);
+    this.log('success', `Shroudly engine active (strategy: ${this.stats.strategy})`);
+    this._watchExit();
+    return { success: true };
+  }
+
+  _spawn(bin, args) {
+    return new Promise((resolve) => {
+      // The block-page list is long and the same every time: count it, don't print it.
+      const shown = args.filter((x, i) => x !== '--block-ip' && args[i - 1] !== '--block-ip');
+      const blockIps = (args.length - shown.length) / 2;
+      this.log('info', `Starting engine: ${path.basename(bin)} ${shown.join(' ')}${blockIps ? ` (+${blockIps} known block pages)` : ''}`);
+      let settled = false;
+      const finish = (v) => { if (!settled) { settled = true; resolve(v); } };
+      // What this start said and when, so that its end can be told apart
+      // (SecurityBlock.classifyEarlyExit); and no older error stands in for it.
+      const run = { at: Date.now(), quiet: true };
+      this._run = run;
+      this.lastError = null;
+      this._spawnBlock = null;
+
+      try {
+        this.proc = spawn(bin, args, { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+      } catch (e) {
+        // Windows' refusals (EPERM, UNKNOWN) come here, at once.
+        this.lastError = e.message;
+        if (!this._spawnFailed(e, bin)) this.log('error', `engine error: ${e.message}`);
+        return finish(false);
+      }
+
+      let buf = '';
+      this.lastOutputAt = Date.now();
+      // A command written as the engine dies (STATS, STOP) fails later, as
+      // an event: never an uncaught error that takes the whole app down.
+      this.proc.stdin.on('error', () => {});
+      this.proc.stdout.on('data', (d) => {
+        this.lastOutputAt = Date.now();
+        buf += d.toString();
+        let i;
+        while ((i = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, i).trim();
+          buf = buf.slice(i + 1);
+          if (line) { if (line.includes('"type":"error"')) run.quiet = false; this._onLine(line, finish); }
+        }
+      });
+      this.proc.stderr.on('data', (d) => {
+        const t = d.toString().trim();
+        if (t) { run.quiet = false; this.lastError = t; this.log('warning', `engine: ${t}`); }
+      });
+      // ENOENT and EACCES come here, a moment later.
+      this.proc.on('error', (e) => { this.lastError = e.message; if (!this._spawnFailed(e, bin)) this.log('error', `engine error: ${e.message}`); finish(false); });
+      // Only this process's own exit counts: a replaced engine (restart())
+      // may close after its successor is already running.
+      const proc = this.proc;
+      proc.on('close', (code) => { if (this.proc !== proc) return; this._onClose(code, run); if (!settled) finish(false); });
+
+      // Not counted across a sleep: one during a start, and the engine's
+      // "ready" waiting unread at wake, is no failed start.
+      const limit = this.wake.timeout(() => { if (!settled) { this.lastError = 'engine start timeout'; finish(false); } }, this.startTimeoutMs);
+      proc.once('close', () => limit.cancel());
+    });
+  }
+
+  /* Where the user adds the antivirus exception: the folder Shroudly is
+   * installed in (a developer's run: the engine's own). */
+  _securityFolder() {
+    return this.packaged ? SecurityBlock.installFolder({ platform: this.platform }) : path.dirname(this.binPath);
+  }
+
+  /* An antivirus block of the engine, told (onSecurityBlock), as the error
+   * a start fails with (code 'security_blocked'). */
+  _blocked({ kind, certain = true, detail = null }) {
+    const info = { part: 'engine', kind, certain, file: path.basename(this.binPath), folder: this._securityFolder(), detail };
+    try { this.onSecurityBlock(info); } catch {}
+    const e = new Error(SecurityBlock.logLine(info).replace(/^Security software: /, 'Blocked by security software: '));
+    e.code = 'security_blocked';
+    e.info = info;
+    return e;
+  }
+
+  /* The engine could not be started at all: refused by Windows with its
+   * file there, or its file gone meanwhile, is a block, told once in its
+   * own line and kept as the start's error (true); anything else stays an
+   * engine error (false). */
+  _spawnFailed(err, bin) {
+    const kind = SecurityBlock.classifySpawnError(err, SecurityBlock.fileState(bin, { platform: this.platform }), this.platform);
+    // A developer's run without the engine built: not someone else's doing.
+    if (!kind || (kind === 'missing' && !this.packaged)) return false;
+    this._spawnBlock = this._blocked({ kind, detail: err.code ? `spawn ${err.code}` : null });
+    return true;
+  }
+
+  /* Write down what this machine looks like, and act on the two findings that
+   * change the outcome: another tool steering the same traffic, and a resolver
+   * handing back forged answers. Runs in the background so it never delays the
+   * engine coming up. */
+  /* Running programs that need a restart to use Shroudly on this system
+   * (diagnostics.restartHelps has the per-program, per-system facts). None
+   * while the system proxy is not set at all (a macOS account waiting for an
+   * administrator): a restart would not help there. */
+  _staleProgramsOf(names) {
+    const st = this.proxyStatus;
+    if (!names || !names.length || !st || !(st.ok || st.code === 'partial_env')) return [];
+    return diagnostics.restartHelps(names, st.system);
+  }
+
+  async _describeEnvironment() {
+    let d;
+    // Shroudly's own Tor (the last way out) is not another tool.
+    try { d = await diagnostics.collect({ ownTor: this.tor && this.tor.proc ? 1 : 0 }); } catch { return; }
+
+    const net = `${d.iface.name} (${d.iface.kind})`;
+    const dnsList = d.dnsServers.length ? d.dnsServers.join(', ') : 'unknown';
+    this.log('info', `System: ${d.os} — network ${net}, DNS ${dnsList}`);
+    // A DNS program on this computer (often left behind by another bypass
+    // tool), and a system DNS that answers nothing: both break every program
+    // that does not go through Shroudly, while the browser keeps working.
+    if (d.localDns && d.localDns.programs && d.localDns.programs.length) {
+      this.log('info', `System DNS is a program on this computer: ${d.localDns.programs.join(', ')}`);
+    }
+    if (d.dnsAsked && d.dnsAnswered === 0) this._recheckDns();
+
+    const stale = this._staleProgramsOf(d.needRestart);
+    if (stale.length && !this._restartTold) {
+      // A program that read the connection settings when it launched and has
+      // not looked since: "works in my browser, not in the app". Only the
+      // programs for which a restart is really the fix on this system, and
+      // only once per session — a later Stop/Start keeps the same address,
+      // so a program that saw it once keeps working.
+      this._restartTold = true;
+      const names = stale.join(', ');
+      this.log('warning', `${names} was already running when protection started. Close and reopen it, or it will keep using the unprotected connection it started with.`);
+      if (typeof this.onNeedRestart === 'function') this.onNeedRestart(stale);
+    }
+
+    if (d.conflicts.length) {
+      // Two tools rewriting the same connections is the most common reason a
+      // working setup stops working, so say it plainly and name them.
+      this.log('warning', `Also running: ${d.conflicts.join(', ')}. Another bypass tool or VPN changes the same connections as Shroudly; if sites misbehave, turn one of them off.`);
+      if (typeof this.onConflicts === 'function') this.onConflicts(d.conflicts);
+    }
+    if (d.idleVpns && d.idleVpns.length) {
+      // Installed and running in the background, but not connected: no
+      // conflict, and worth saying so, since people suspect it first.
+      this.log('info', `${d.idleVpns.join(', ')} is installed but not connected; that does not interfere.`);
+    }
+    this._setAdvice({ conflicts: d.conflicts });
+    this._watchConflicts();
+    // Which filter it is (d.region, from the known block pages) stays in the
+    // data; the explanation never names a country.
+    if (d.region) {
+      this.log('info', d.region === 'filter'
+        ? 'Your DNS service filters sites; Shroudly\'s encrypted DNS goes around it.'
+        : 'DNS on this network answers blocked sites with a known block page.');
+    }
+
+    if (d.forgedDns.length) {
+      const names = d.forgedDns.map((h) => h.host).join(', ');
+      if (this.store.get('dnsProtection') === false) {
+        // The user switched it off and their network is forging answers. The
+        // engine reads this setting once, at startup, and this check finishes
+        // after it has already started — so flipping the setting is not enough,
+        // the engine has to be restarted to pick it up. Guarded so it can only
+        // happen once per session, and not gated on `active`, which may still
+        // be false at the moment this resolves.
+        this.store.set('dnsProtection', true);
+        this.log('warning', `Your DNS is being tampered with (${names}). Encrypted DNS has been switched back on automatically.`);
+        if (!this._dnsAutoFixed) {
+          this._dnsAutoFixed = true;
+          setTimeout(() => { if (this.active) this.restart().catch(() => {}); }, 1200);
+        }
+      } else {
+        this.log('info', `Your provider's DNS returns forged answers for ${names}; Shroudly's encrypted DNS is handling it.`);
+      }
+      if (typeof this.onDnsTampering === 'function') this.onDnsTampering(d.forgedDns);
+    }
+  }
+
+  /* The system DNS answered none of the test names at the start. At login
+   * that is mostly the network not being up yet (the Wi-Fi connects after
+   * Shroudly starts), so it is looked at once more a little later, and said
+   * only if the DNS still answers nothing while the network itself is up
+   * (diagnostics.dnsDead). */
+  _recheckDns() {
+    clearTimeout(this._dnsRecheck);
+    this._dnsRecheck = setTimeout(async () => {
+      if (!this.active) return;
+      let dead = false;
+      try { dead = await diagnostics.dnsDead(); } catch {}
+      if (dead && this.active) {
+        this.log('warning', 'The system DNS answered none of the test names. Programs that do not go through Shroudly cannot reach anything; check the DNS program or the network settings.');
+      }
+    }, this.dnsRecheckMs);
+    if (this._dnsRecheck.unref) this._dnsRecheck.unref();
+  }
+
+  _onLine(line, finishStart) {
+    let msg;
+    try { msg = JSON.parse(line); } catch { this.log('info', `engine: ${line}`); return; }
+    this._noteSiteEvent(msg);
+    switch (msg.type) {
+      case 'ready':
+        this.techniques = Number(msg.techniques) || 0;
+        this.log('success', `Engine listening on 127.0.0.1:${msg.port}`);
+        this._restoreTechniques();
+        // The names the user blocked in the Connections list (issue #74).
+        this._applyBlocks();
+        this._applyTorSites();
+        // Advanced mode beside it (setAdvanced): told again to a new engine.
+        if (this._advancedOn) this._command('ADVANCED 1');
+        // Encrypted DNS routes that go through the engine can start now.
+        this.doh.setSocksPort(msg.port);
+        clearTimeout(this._dohReport);
+        this._dohReport = setTimeout(() => {
+          const routes = this.doh.summary();
+          if (routes && this.active) this.log('info', this.doh.usingCustom() ? `Your DNS server is answering: ${routes}` : `Encrypted DNS answering via ${routes}`);
+        }, 6000);
+        if (this._dohReport.unref) this._dohReport.unref();
+        // A session that has been up for a while has earned a fresh restart
+        // budget; otherwise a handful of crashes spread over days eventually
+        // leaves the engine refusing to come back at all.
+        clearTimeout(this._restartCredit);
+        this._restartCredit = setTimeout(() => { this.restarts = 0; }, 120000);
+        if (this._restartCredit.unref) this._restartCredit.unref();
+        if (finishStart) finishStart(true);
+        break;
+      case 'stats':
+        if (msg.fallback != null) { this.stats.fallback = Number(msg.fallback) || 0; if (this.tor) this.tor.noteUse(this.stats.fallback); }
+        this.stats.connsTotal = msg.conns_total;
+        this.stats.connsActive = msg.conns_active;
+        this.stats.bytesUp = msg.bytes_up;
+        if (Number(msg.bytes_down) > Number(this.stats.bytesDown || 0)) {
+          this.lastDownAt = Date.now();
+          if (this.advice.offline) this._clearOffline();
+        }
+        this.stats.bytesDown = msg.bytes_down;
+        this.stats.desync = msg.desync;
+        this.stats.tlsSeen = msg.tls;
+        this.stats.httpSeen = msg.http;
+        this.stats.probeOk = msg.probe_ok;
+        this.stats.probeFail = msg.probe_fail;
+        this.stats.adsBlocked = Number(msg.blocked) || 0;
+        this.stats.sampledAt = Date.now(); // lets the UI compute rates per sample
+        break;
+      // A site that needed a technique, and one that defeated all of them. These
+      // two lines are what makes a user's log enough to diagnose a report: the
+      // site, the technique that worked, and how many had to be tried.
+      case 'bypass':
+        // What the filter does is judged from what it did (forged DNS
+        // answers, cut connections, silent drops), never from which country
+        // the clock is set to.
+        try { this.onHostEvent('bypass', msg.host, msg.note || null); } catch {}
+        this._rememberTechnique(msg.host, msg.strategy);
+        this.blockedHosts.delete(msg.host);
+        if (this.openedAt.size > 400) this.openedAt.clear();
+        this.openedAt.set(msg.host, Date.now());
+        // It got through: a later failure to reach it is news again.
+        this.logGate.forget('unreachable-DNS', msg.host);
+        this.logGate.forget('unreachable-connection', msg.host);
+        if (!this.bypassed.has(msg.host)) {
+          // One line per site, but the set is only there to stop repeats, so
+          // it is capped rather than allowed to track a whole session.
+          if (this.bypassed.size > 400) this.bypassed.clear();
+          this.bypassed.add(msg.host);
+          // A silent drop is a different kind of filter from one that refuses,
+          // and worth telling apart when reading a report.
+          const how = msg.note === 'silent' ? ' — the network drops these connections silently instead of refusing them' : '';
+          // How long it took to open (engines since 2.6.83 say): what the
+          // first visit to a blocked site cost, for a report to show.
+          const took = Number.isFinite(msg.ms) && msg.ms >= 0 ? `, ${(msg.ms / 1000).toFixed(1)} s` : '';
+          this.log('success', `${msg.host}: blocked here, opened with ${msg.strategy} (${msg.attempts} tries, ${msg.family}${took})${how}`);
+        }
+        break;
+      // A technique kept here opened its site again (engine.c, hs_keep): its
+      // age starts over, so the next engine is not made to race the untouched
+      // request against it on the site's first connection. At most every ten
+      // minutes a site; nothing to say in the log.
+      case 'kept':
+        if (typeof msg.host === 'string' && typeof msg.strategy === 'string') this._rememberTechnique(msg.host, msg.strategy);
+        break;
+      case 'blocked':
+        if (msg.raw) { try { this.onRaw('blocked', msg); } catch {} break; }
+        try { this.onHostEvent('blocked', msg.host, msg.note || null, { alert: !!msg.alert, siteOk: !!msg.site_ok, note: msg.note || null }); } catch {}
+        // Not the network: the server itself turned the handshake down (an
+        // alert, never a reset), or the rest of this site answers through
+        // Shroudly and only this one of its addresses does not (an API, a
+        // tracker or a socket that refuses this client). A line in the log,
+        // once, and never a notification: the page the user opened works. A
+        // site's own page (example.com, www.example.com) is still told.
+        if (msg.alert || (msg.site_ok && !isMainName(msg.host))) {
+          if (!this.blockedHosts.has(msg.host)) {
+            if (this.blockedHosts.size > 400) this.blockedHosts.clear();
+            this.blockedHosts.add(msg.host);
+            this.log('info', msg.alert
+              ? `${msg.host}: the server refused the connection itself (a TLS alert to the unchanged request); not a block`
+              : `${msg.host}: does not answer, while the rest of the site works through Shroudly; not a block`);
+          }
+          break;
+        }
+        // Every attempt went unanswered. A filter that drops silently and a
+        // server that is down look exactly the same from here, so this is a
+        // line in the log, not a notification, and no setting is changed
+        // because of it. The engine starts the next connection to this host
+        // further along the ladder, so a technique that works is still found.
+        // Unless a technique opened the site a little while ago (not just
+        // after a wake): the site is up, so the silence is the network's (one
+        // that follows these connections, or stops an address once it has
+        // seen a way through, issue #43): told as a block, below, with
+        // Advanced mode. Not while the link itself is quiet (nothing came
+        // back through the engine meanwhile) or has just moved to another
+        // network: then everything is silent, this site with it (SILENT_CUTS).
+        const opened = this.openedAt.get(msg.host);
+        const upNow = msg.note === 'silent' && opened != null && Date.now() - opened < OPENED_RECENTLY_MS && !this.wake.recent(WAKE_QUIET_MS)
+          && this.receivedWithin(QUIET_PROOF_MS) && !this._movedLately();
+        if (msg.note === 'silent' && !upNow) {
+          if (!this.blockedHosts.has(msg.host)) {
+            if (this.blockedHosts.size > 400) this.blockedHosts.clear();
+            this.blockedHosts.add(msg.host);
+            this.log('warning', `${msg.host}: no answer after ${msg.attempts} techniques (${msg.family}) — the network may be dropping these connections silently, or the site is down`);
+          }
+          break;
+        }
+        // A site that defeated every technique while encrypted DNS was switched
+        // off: the most likely cause is the DNS answer itself, which none of
+        // the techniques can fix. Turn it back on and retry rather than leave
+        // the user staring at a page that will never load. Once per session.
+        if (!upNow && this.store.get('dnsProtection') === false && !this._dnsReenabledForBlock) {
+          this._dnsReenabledForBlock = true;
+          this.store.set('dnsProtection', true);
+          this.log('warning', `${msg.host} could not be opened with encrypted DNS switched off. It has been switched back on.`);
+          if (typeof this.onDnsAutoEnabled === 'function') this.onDnsAutoEnabled(msg.host);
+          setTimeout(() => { if (this.active) this.restart().catch(() => {}); }, 300);
+          break;
+        }
+        if (!this.blockedHosts.has(msg.host)) {
+          if (this.blockedHosts.size > 400) this.blockedHosts.clear();
+          this.blockedHosts.add(msg.host);
+          // Advanced mode already on (issue #29: turned on 15 s before):
+          // nothing to suggest, and the engine goes on to further techniques
+          // with the next connections to this host.
+          let advanced = false;
+          try { advanced = !!this.advancedOn(); } catch {}
+          if (upNow) {
+            this.log('warning', advanced
+              ? `${msg.host}: opened a moment ago, now no answer after ${msg.attempts} techniques (${msg.family}) — the site is up, so the network is stopping it; Advanced mode is on, and Shroudly keeps trying other ways`
+              : `${msg.host}: opened a moment ago, now no answer after ${msg.attempts} techniques (${msg.family}) — the site is up, so the network is stopping it; this network may need Advanced mode`);
+          } else {
+            this.log('warning', advanced
+              ? `${msg.host}: still blocked after ${msg.attempts} techniques (${msg.family}) — Advanced mode is on, and Shroudly keeps trying other ways`
+              : `${msg.host}: still blocked after ${msg.attempts} techniques (${msg.family}) — this network may need Advanced mode`);
+          }
+          // Nobody reads a log unprompted. A site that could not be opened at
+          // all is the one moment the user needs telling, because otherwise
+          // they conclude the app simply does not work.
+          // With the last way out there, the engine sends this connection
+          // through Tor next: told only if Tor does not carry it.
+          if (typeof this.onSiteBlocked === 'function') this._tellBlocked(msg.host);
+        }
+        break;
+      // The browser turned down the handshake a technique produced: the
+      // server answered it with another certificate (#68, DDoS-Guard and a
+      // ClientHello in two records). The engine opens the next connection
+      // with a technique of another kind, and that is what is kept.
+      case 'refused':
+        if (msg.next) this._rememberTechnique(msg.host, msg.next);
+        if (Number(msg.avoid) > 0) this._rememberAvoid(msg.host, Number(msg.avoid));
+        this.log('warning', `${msg.host}: the browser refused the certificate the server sent after ${msg.strategy}; the next connection uses ${msg.next || 'no technique'} instead (reload the page)`);
+        break;
+      case 'cut':
+        // Just after a wake: connections the sleep stalled, whatever the
+        // network does (the engine's stall timers count the sleep on Windows
+        // and macOS). Nothing to tell, nothing to turn on.
+        if (this.wake.recent(WAKE_QUIET_MS)) break;
+        try { this.onHostEvent('cut', msg.host, msg.strategy || null); } catch {}
+        this._onCut(msg.host, msg.strategy, msg.attempts, msg.note === 'site_ok');
+        break;
+      // A connection to a watched domain: nothing in the log, it is no news
+      // to the user.
+      // The last way out did not reach a name twice (engine.c, fbmiss): it
+      // goes the usual way at once for a while instead of waiting on Tor.
+      case 'fallback_skip':
+        if (typeof msg.host === 'string' && msg.host && this.logGate.allow('fallback-skip', msg.host)) {
+          this.log('info', `${msg.host}: the last way out (Tor) did not reach it; it goes the usual way for ${Number(msg.min) || 10} minutes instead of waiting on Tor`);
+        }
+        break;
+      case 'cut_addr':
+        if (typeof msg.addr === 'string' && !this.wake.recent(WAKE_QUIET_MS)) { try { this.onCutAddr(msg.addr, msg.host); } catch {} }
+        break;
+      case 'seen':
+        try { this.onHostEvent('seen', msg.host, null); } catch {}
+        break;
+      case 'unreachable':
+        if (msg.raw) { try { this.onRaw('unreachable', msg); } catch {} break; }
+        try { this.onHostEvent('unreachable', msg.host, msg.stage || null); } catch {}
+        this._onUnreachable(msg.host, msg.stage);
+        break;
+      case 'send_failed':
+        this.log('warning', `${msg.host}: connection dropped while sending (${msg.family})`);
+        break;
+      // A site whose addresses from encrypted DNS got nowhere, connected
+      // where the network's own DNS says (core/src/engine.c).
+      case 'netdns':
+        // The engine asked the system's DNS about this site itself: its
+        // names in the system's DNS cache are no sign of a program going
+        // around Shroudly (around-watch.js).
+        try { this.onHostEvent('netdns', msg.host, msg.stage || null); } catch {}
+        // The same name, address and outcome again (each of a page's
+        // connections asks): said once in NETDNS_AGAIN_MS.
+        if (!this._netdnsOnce(msg)) break;
+        if (msg.stage === 'try') this.log('info', `${msg.host}: the addresses encrypted DNS gives get nowhere here; trying the one this network's DNS gives (${msg.addr})`);
+        else if (msg.stage === 'ok') this.log('success', `${msg.host}: opened at the address this network's DNS gives (${msg.addr})`);
+        else if (msg.stage === 'same') this.log('info', `${msg.host}: this network's DNS gives the same addresses (${msg.addr}); they get nowhere here`);
+        else this.log('info', `${msg.host}: the address this network's DNS gives (${msg.addr}) gets nowhere either`);
+        break;
+      // Every UDP flow the engine takes at once is in use (core/src/engine.c).
+      case 'udp_full':
+        this.log('warning', `UDP: ${msg.max} flows at once, the most the engine takes; a new one (a game, a call, an app's QUIC) was refused until others end`);
+        break;
+      case 'probe':
+        if (msg.ok && msg.strategy === 'none') {
+          this.log('info', `Auto: ${msg.host} is not blocked here`);
+        } else if (msg.ok) {
+          this.log('success', `Auto: ${msg.host} works with ${msg.strategy}`);
+        } else {
+          this.log('warning', `Auto: ${msg.host} stays blocked — split/disorder can't defeat this DPI`);
+        }
+        // Surface the probe result (incl. suggest:"advanced") to the app so the UI
+        // can offer Advanced mode when a site can't be unblocked at this level.
+        this.lastProbe = { host: msg.host, ok: !!msg.ok, blocked: !!msg.blocked,
+                           strategy: msg.strategy || null, suggest: msg.suggest || null };
+        if (typeof this.onProbe === 'function') this.onProbe(this.lastProbe);
+        break;
+      case 'adblock':
+        // What became of the list: never a path or a name, only its size.
+        if (msg.error) this.log('warning', `Ad blocking: the list could not be used (${msg.error})`);
+        else if (msg.on) this.log('info', `Ad blocking: a list of ${msg.entries} names in use`);
+        break;
+      // The Connections list (CONNS, core/src/conns.c): rows, then the end.
+      case 'conn':
+        if (this._connsRows) this._connsRows.push(msg);
+        break;
+      // What the ad list stopped lately (listed with CONNS): Connections
+      // shows them with a button to let one through, the report lists them.
+      case 'ad':
+        if (this._connsAds) this._connsAds.push({ host: String(msg.host || ''), count: Number(msg.count) || 0, ago: Number(msg.ago) || 0 });
+        break;
+      case 'conns_end':
+        if (this._connsAds) this.lastAds = this._connsAds.sort((a, b) => a.ago - b.ago);
+        this._connsAds = null;
+        if (this._connsDone) { const done = this._connsDone; this._connsDone = null; done(this._connsRows || []); }
+        this._connsRows = null;
+        break;
+      case 'block':
+        break;
+      // The programs and TCP connections (PROCS, TCP; core/src/winprocs.h).
+      case 'proc':
+      case 'tcp': {
+        const w = this._native && this._native[msg.type === 'proc' ? 'PROCS' : 'TCP'];
+        if (w && w.rows.length < 20000) w.rows.push(msg);
+        break;
+      }
+      case 'procs_end':
+      case 'tcp_end': {
+        const key = msg.type === 'procs_end' ? 'PROCS' : 'TCP';
+        const w = this._native && this._native[key];
+        if (w) { this._native[key] = null; w.done(Number(msg.n) >= 0 ? w.rows : null); }
+        break;
+      }
+      case 'adblock_check': {
+        const w = this._adblockChecks.shift();
+        if (w) w(msg);
+        break;
+      }
+      case 'upstream':
+        if (!msg.ok) this._onOwnServerDown(OwnServer.whyCode(msg.why));
+        break;
+      case 'fallback':
+        // Nothing was listening: Tor is started for the next connection,
+        // once the user has said yes to it (issue #77); until then they are
+        // asked (a notification and a card in the window), never Tor by itself.
+        if (!msg.ok) {
+          // Not for an engine being stopped: a late line must not start Tor.
+          if (!this.active || !this.tor || !this._torFile || msg.why === 'file unusable' || this.store.get('torLastResort', false) === false) break;
+          this._torWanted(msg.host || '');
+          break;
+        }
+        if (msg.host && this.logGate.allow('fallback', msg.host)) {
+          this.log('info', `${msg.host}: no technique got through; opened through the last way out (Tor)`);
+        }
+        if (msg.host && this._blockedHold.has(msg.host)) { clearTimeout(this._blockedHold.get(msg.host)); this._blockedHold.delete(msg.host); }
+        try { this.onHostEvent('fallback', msg.host || '', ''); } catch {}
+        break;
+      case 'direct':
+        // A name the last way out carried is reached without it again: a
+        // technique found behind it, or the network itself again (engine.c,
+        // bg_search). For the log: the name is off Tor from here on.
+        if (msg.host && this.logGate.allow('direct', msg.host)) {
+          this.log('info', msg.strategy
+            ? `${msg.host}: ${msg.strategy} opens it after all; it no longer goes through the last way out (Tor)`
+            : `${msg.host}: reached without the last way out (Tor) again`);
+        }
+        break;
+      case 'error':
+        this.lastError = msg.msg || `code ${msg.code}`;
+        this.log('error', `engine: ${this.lastError}`);
+        break;
+      case 'stopped':
+        break;
+      default:
+        break;
+    }
+  }
+
+  _startStatsPoll() {
+    this._stopStatsPoll();
+    this._pollWall = Date.now();
+    this._pollMono = this.wake.mono();
+    this._pollEpoch = this.wake.epoch;
+    this._poll = setInterval(() => {
+      if (!this.proc) return;
+      if (this._pollGap()) return;
+      if (this.active && Date.now() - this.lastOutputAt > this.hangTimeoutMs) {
+        this.log('error', 'Engine stopped responding; restarting it');
+        this.lastOutputAt = Date.now();
+        // Ended by us: no sign of anyone else ending it.
+        if (this._run) this._run.quiet = false;
+        try { this.proc.kill('SIGKILL'); } catch {} // _onClose restarts it
+        return;
+      }
+      if (this.proc.stdin.writable) {
+        try { this.proc.stdin.write('STATS\n'); } catch {}
+      }
+    }, this.pollMs);
+  }
+  _stopStatsPoll() { if (this._poll) { clearInterval(this._poll); this._poll = null; } }
+
+  /* This poll ran much later than asked for since the last one (the
+   * computer slept, the main process was frozen), the clock jumped, or a
+   * wake was seen elsewhere meanwhile: the engine had no chance to answer
+   * in between, and its answer may be waiting unread (timers run before
+   * pending output is read). It gets a fresh window; nothing is decided on
+   * this poll. A real hang still shows within the window after it. */
+  _pollGap() {
+    const late = this.wake.gap(this._pollWall, this._pollMono, this.pollMs);
+    this._pollWall = Date.now();
+    this._pollMono = this.wake.mono();
+    if (late) this.wake.resumed(late);
+    if (this._pollEpoch === this.wake.epoch) return false;
+    this._pollEpoch = this.wake.epoch;
+    this.lastOutputAt = Date.now();
+    return true;
+  }
+
+  /* The system says it woke up (powerMonitor 'resume'): the same fresh
+   * window, at once, before any poll runs. */
+  resumed() {
+    this.wake.resumed('system');
+    if (this.proc) this.lastOutputAt = Date.now();
+  }
+
+  /* Another network, or a wake (main.js): what the old network's DNS
+   * answered through the plain or system fallback (a hotel portal's forged
+   * answers before login among them) is dropped and its resolvers are asked
+   * again, instead of being kept for their TTL (doh.c, DNS-CLEAR). And the
+   * technique that opened sites on the old network is no longer tried first
+   * for new names on this one (engine.c, net_best; NET-CHANGED). */
+  /* Advanced mode runs beside the engine (main.js advancedState): it
+   * escalates a server that cut a connection after its handshake, so the
+   * engine gives that its chance before the last way out (engine.c,
+   * engine_set_advanced). Kept for an engine started later. */
+  setAdvanced(on) {
+    this._advancedOn = !!on;
+    return this.active ? this._command(on ? 'ADVANCED 1' : 'ADVANCED 0') : false;
+  }
+
+  networkChanged() {
+    if (!this.active) return false;
+    const ok = this._command('DNS-CLEAR');
+    this._command('NET-CHANGED');
+    return ok;
+  }
+
+  // Ask the engine to probe a host (used by UI "test site").
+  /* Something better than Tor is there now (Advanced mode came on): the
+   * names the last way out carried go back to the techniques first. */
+  forgetFallback() { return this._command('FALLBACK-FORGET'); }
+
+  /* A line to the engine; false when it is not running. */
+  _command(line) {
+    if (!this.proc || !this.proc.stdin.writable) return false;
+    try { this.proc.stdin.write(`${line}\n`); return true; } catch { return false; }
+  }
+
+  /* The user's own DNS server (Settings, "DNS server", issue #34) as
+   * stored, read: { kind, host, port, path }, or null for the built-in
+   * encrypted routes (none set, or one that cannot be read). */
+  customDns() {
+    const c = this.store.get('customDns');
+    const spec = c && typeof c === 'object' ? CustomDnsLib.parse(c.kind, c.server) : null;
+    return spec && !spec.error ? spec : null;
+  }
+
+  /* That server set to be used alone ("Only this server"): no fallback in
+   * the forwarder, and none in the engine (--dns-strict). */
+  customDnsStrict() {
+    const c = this.store.get('customDns');
+    return !!(c && typeof c === 'object' && c.strict === true && this.customDns());
+  }
+
+  /* The user's proxy for that server (#58), or null: not for UDP. */
+  customDnsProxy() {
+    const c = this.store.get('customDns');
+    const spec = this.customDns();
+    if (!spec || spec.kind === 'udp' || !c.proxy) return null;
+    const p = CustomDnsLib.parseProxy(c.proxy);
+    return p && !p.error ? p : null;
+  }
+
+  /* The server now set into the forwarder, and the answers the engine keeps
+   * dropped: the next lookup asks it, nothing restarted. */
+  applyCustomDns() {
+    const spec = this.customDns();
+    const strict = this.customDnsStrict();
+    this.doh.setCustom(spec, { strict, proxy: this.customDnsProxy() });
+    this._command(strict ? 'DNS-STRICT 1' : 'DNS-STRICT 0');
+    this._command('DNS-CLEAR');
+    return spec;
+  }
+
+  /* Does this server answer (Settings, before it is used)? Asked twice, the
+   * second time on the connection the first opened: { ok: true, ms, address }
+   * or { ok: false, error }. */
+  async testDns(spec, proxy = null) {
+    const { CustomDns, firstA } = CustomDnsLib;
+    const d = new CustomDns(spec, {
+      proxy,
+      socksPort: () => this.doh.socksPort,
+      bootstrap: async (name) => firstA(await this.doh.resolveRoutes(DohForwarder.buildQuery(name, 1))),
+    });
+    try {
+      await d.query(DohForwarder.buildQuery('cloudflare.com', 1));
+      const t0 = Date.now();
+      const a = await d.query(DohForwarder.buildQuery('example.com', 1));
+      const address = firstA(a);
+      // Answered, but with no address: refused, or a server that does not
+      // look names up for others.
+      return address ? { ok: true, ms: Date.now() - t0, address } : { ok: false, error: `rcode ${a[3] & 15}` };
+    } catch (e) {
+      return { ok: false, error: String((e && (e.code || e.message)) || 'no answer').slice(0, 80) };
+    } finally {
+      d.close();
+    }
+  }
+
+  /* Is the list in file one to use? Resolves the engine's verdict
+   * ({ ok, entries, error }), or { ok: false } with no engine. */
+  adblockCheck(file) {
+    if (!this.proc) return Promise.resolve({ ok: false, error: 'engine not running' });
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => { this._adblockChecks = this._adblockChecks.filter((f) => f !== done); resolve({ ok: false, error: 'no answer' }); }, 30000);
+      const done = (msg) => { clearTimeout(timer); resolve(msg); };
+      this._adblockChecks.push(done);
+      if (!this._command(`ADBLOCK-CHECK ${file}`)) { this._adblockChecks = this._adblockChecks.filter((f) => f !== done); clearTimeout(timer); resolve({ ok: false, error: 'engine not running' }); }
+    });
+  }
+
+  /* The setting and the list, as they are now, into the running engine:
+   * no restart, nothing dropped. */
+  adblockApply() {
+    const cfg = this._settings();
+    const list = cfg.adBlock ? this.adblockFile() : null;
+    if (!list) return this._command('ADBLOCK OFF');
+    this._command('ALLOW-CLEAR');
+    for (const d of cfg.adBlockAllow) this._command(`ALLOW ${d}`);
+    return this._command(`ADBLOCK ${list}`);
+  }
+
+  /* A netdns line not said in the last NETDNS_AGAIN_MS: false to keep quiet. */
+  _netdnsOnce(msg, now = Date.now()) {
+    if (!this._netdnsSaid) this._netdnsSaid = new Map();
+    const k = `${msg.stage} ${msg.host} ${msg.addr}`;
+    const at = this._netdnsSaid.get(k);
+    if (at !== undefined && now - at >= 0 && now - at < NETDNS_AGAIN_MS) return false;
+    if (this._netdnsSaid.size > 500) this._netdnsSaid.clear();
+    this._netdnsSaid.set(k, now);
+    return true;
+  }
+
+  /* The Connections list (issue #74): what went through, by name, as the
+   * engine counts it; [] while it is not running. */
+  connsList(timeoutMs = 1500) {
+    if (!this.proc || !this.proc.stdin.writable) return Promise.resolve([]);
+    if (this._connsWait) return this._connsWait;
+    this._connsWait = new Promise((resolve) => {
+      const timer = setTimeout(() => { this._connsDone = null; this._connsRows = null; resolve([]); }, timeoutMs);
+      this._connsRows = [];
+      this._connsAds = [];
+      this._connsDone = (rows) => { clearTimeout(timer); resolve(rows); };
+      if (!this._command('CONNS')) { clearTimeout(timer); this._connsDone = null; this._connsRows = null; resolve([]); }
+    }).finally(() => { this._connsWait = null; });
+    return this._connsWait;
+  }
+
+  /* What tasklist (PROCS) or netstat (TCP) would list, read by the engine
+   * itself (core/src/winprocs.h, Windows): no program started for it, which
+   * on a slow PC costs real CPU every few seconds. Rows, or null when the
+   * engine is not running, cannot say (not Windows), or does not answer in
+   * time: the caller then uses tasklist or netstat (procnet.js). */
+  nativeList(what, timeoutMs = 2000) {
+    if (what !== 'PROCS' && what !== 'TCP') return Promise.resolve(null);
+    if (!this.proc || !this.proc.stdin.writable || !this.active) return Promise.resolve(null);
+    if (!this._native) this._native = {};
+    if (!this._nativeWait) this._nativeWait = {};
+    if (this._nativeWait[what]) return this._nativeWait[what];
+    this._nativeWait[what] = new Promise((resolve) => {
+      const timer = setTimeout(() => { this._native[what] = null; resolve(null); }, timeoutMs);
+      this._native[what] = { rows: [], done: (rows) => { clearTimeout(timer); resolve(rows); } };
+      if (!this._command(what)) { clearTimeout(timer); this._native[what] = null; resolve(null); }
+    }).finally(() => { this._nativeWait[what] = null; });
+    return this._nativeWait[what];
+  }
+
+  /* The user's blocks (Settings key userBlocked), into a running engine. */
+  _applyBlocks() {
+    const list = this.store.get('userBlocked', []);
+    if (!Array.isArray(list) || !list.length) return;
+    this._command('BLOCK-CLEAR');
+    for (const h of list) this._command(`BLOCK ${h}`);
+    this.log('info', `Connections: ${list.length} name${list.length === 1 ? '' : 's'} you blocked are refused`);
+  }
+
+  /* The names the user sends through Tor (Settings key torSites; the
+   * Connections list), into a running engine: a site that turns the user's
+   * country away itself goes straight through the last way out. */
+  _applyTorSites() {
+    const sites = this.store.get('torSites', []);
+    const apps = TorApps.clean(this.store.get('torApps', []));
+    const list = this._torEntries();
+    if (!list.length) return;
+    this._command('TOR-CLEAR');
+    for (const h of list) this._command(`TOR ${h}`);
+    const n = Array.isArray(sites) ? sites.length : 0;
+    const parts = [];
+    if (n) parts.push(`${n} site${n === 1 ? '' : 's'} you send through Tor go there first`);
+    if (apps.length) parts.push(`${apps.map((id) => TorApps.APPS.find((a) => a.id === id).name).join(', ')} always through Tor`);
+    this.log('info', `Connections: ${parts.join('; ')}`);
+  }
+
+  /* Tor has just become ready: the names and ranges the user sends through
+   * it are given again, which ends their open connections (made the usual
+   * way while Tor was starting), so the apps connect again through Tor. */
+  torReady() {
+    if (!this._torEntries().length) return;
+    this._applyTorSites();
+  }
+
+  /* Every name and range the engine sends through Tor by the user's
+   * choice: the sites typed (torSites) and the apps picked (torApps). */
+  _torEntries() {
+    const sites = this.store.get('torSites', []);
+    return [...new Set([...(Array.isArray(sites) ? sites : []), ...TorApps.entriesOf(this.store.get('torApps', []))])];
+  }
+
+  /* An app picked in "Apps always through Tor", or put back: kept, and the
+   * running engine given what changed (a name another pick or a typed site
+   * still needs stays). */
+  setTorApp(id, on) {
+    const app = TorApps.APPS.find((a) => a.id === id);
+    if (!app) return { ok: false };
+    const before = new Set(this._torEntries());
+    const now = new Set(TorApps.clean(this.store.get('torApps', [])));
+    if (on) now.add(id); else now.delete(id);
+    this.store.set('torApps', TorApps.clean([...now]));
+    const after = new Set(this._torEntries());
+    for (const h of before) if (!after.has(h)) this._command(`UNTOR ${h}`);
+    for (const h of after) if (!before.has(h)) this._command(`TOR ${h}`);
+    this.log('info', on ? `Connections: ${app.name} goes through Tor (the last way out) from now on, all of it` : `Connections: ${app.name} goes the usual way again`);
+    const torApps = this.store.get('torApps', []);
+    return { ok: true, torApps, torAppNames: TorApps.entriesOf(torApps).filter((n) => !n.includes('/')) };
+  }
+
+  /* For a moment, a name through Tor while it is ready, without keeping it
+   * (a report that could not reach codeshare.me the usual way: Russia's
+   * networks slow Cloudflare's addresses down until nothing gets through).
+   * Returns what puts it back, or null when Tor is not ready. A name the
+   * user sends through Tor anyway stays there. */
+  torForNow(host) {
+    const h = String(host || '').trim().toLowerCase();
+    if (!this.isActive() || !this.tor || this.tor.state !== 'ready' || !/^[a-z0-9.-]{1,253}$/.test(h)) return null;
+    if (!this._command(`TOR ${h}`)) return null;
+    const kept = new Set(this._torEntries());
+    return () => { if (!kept.has(h) && !new Set(this._torEntries()).has(h)) this._command(`UNTOR ${h}`); };
+  }
+
+  /* A name sent through Tor, or back the usual way, from the Connections
+   * list: kept, and into the running engine at once (its open connections
+   * end, so the next ones take the new way). */
+  setTorSite(host, on) {
+    const h = String(host || '').trim().toLowerCase().replace(/\.$/, '');
+    if (!/^[a-z0-9._:-]{1,253}$/.test(h)) return { ok: false };
+    const now = new Set(this.store.get('torSites', []));
+    if (on) now.add(h); else now.delete(h);
+    this.store.set('torSites', [...now].sort());
+    // Back the usual way only if no app picked needs it too.
+    if (on || !TorApps.entriesOf(this.store.get('torApps', [])).includes(h)) this._command(on ? `TOR ${h}` : `UNTOR ${h}`);
+    this.log('info', on ? `Connections: ${h} goes through Tor (the last way out) from now on` : `Connections: ${h} goes the usual way again`);
+    return { ok: true, torSites: [...now] };
+  }
+
+  /* A name blocked or allowed again in the Connections list: kept, and into
+   * the running engine at once (its open connections end). */
+  setBlocked(host, on) {
+    const h = String(host || '').trim().toLowerCase().replace(/\.$/, '');
+    if (!/^[a-z0-9._:-]{1,253}$/.test(h)) return { ok: false };
+    const now = new Set(this.store.get('userBlocked', []));
+    if (on) now.add(h); else now.delete(h);
+    this.store.set('userBlocked', [...now].sort());
+    this._command(on ? `BLOCK ${h}` : `UNBLOCK ${h}`);
+    this.log('info', on ? `Connections: ${h} blocked` : `Connections: ${h} allowed again`);
+    return { ok: true, blocked: [...now] };
+  }
+
+  probe(host) {
+    if (this.proc && this.proc.stdin.writable) {
+      try { this.proc.stdin.write(`PROBE ${host}\n`); } catch {}
+    }
+  }
+
+  async _onClose(code, run = null) {
+    const wasActive = this.active;
+    this.proc = null;
+    this._exitCode = code;
+    // Ended by us: no sign of anything.
+    if (this.expectingStop) { this._quickExits = 0; return; }
+    // Ended right after it started, by itself and without a word: two of
+    // those in a row (a start's or a restart's) look like an antivirus
+    // ending it, and are told as "may" (SecurityBlock.classifyEarlyExit).
+    const ms = run ? Date.now() - run.at : -1;
+    const quick = run && this.judgeQuickExits && SecurityBlock.classifyEarlyExit({ code, ms, quiet: run.quiet, platform: this.platform });
+    this._quickExits = quick ? this._quickExits + 1 : 0;
+    if (quick) this._quickDetail = `exit code ${code}, ${ms} ms after its start`;
+    if (!wasActive) return;
+
+    this.log('error', `Engine exited unexpectedly (code ${code}).`);
+    // Its file gone (an antivirus quarantines a program and ends it at the
+    // same moment), or ended right after its start again: no restart, which
+    // could only fail or give the antivirus one more reason; told instead.
+    const gone = SecurityBlock.isGone(SecurityBlock.fileState(this.binPath, { platform: this.platform }));
+    const blocked = gone || this._quickExits >= 2;
+    const retry = !blocked && this.restarts < MAX_RESTARTS;
+    // Coming back from this moment on: programs carried by Shroudly (the
+    // Discord relay, the app proxy) wait for it instead of going out
+    // directly, which a filtering network refuses (a Discord update mid
+    // download, a name its DNS does not answer).
+    if (retry) this._restartPending = true;
+    // While the engine is about to come back the system proxy stays, and
+    // the restarted engine's port goes into the PAC: browsers wait a few
+    // seconds instead of going out directly and failing on a network that
+    // filters, and the system setting is not taken down and written again
+    // (each change is one more for other programs to answer, and a macOS
+    // setting made with an administrator's password would ask for it
+    // again). Not coming back (it keeps crashing, or the start fails): the
+    // user's own settings are put back at once.
+    const kept = retry && this._keepsProxy();
+    // Off at once, so nothing points the system at the dead engine while
+    // the restore runs (a re-apply, a settings restart).
+    this.active = false;
+    this._stopStatsPoll();
+    const gen = this._stopGen;
+    if (!kept) {
+      try { await this.proxy.restore(); } catch {}
+      this._setProxyStatus(null);
+    }
+    this.onStatusChange(false);
+    // A Stop pressed while that restore ran: nothing comes back after it.
+    if (gen !== this._stopGen) { this._restartPending = false; return; }
+
+    if (blocked) {
+      this.restarts = 0;
+      this._blocked(gone ? { kind: 'vanished' } : { kind: 'early_exit', certain: false, detail: this._quickDetail });
+    } else if (retry) {
+      this.restarts++;
+      const delay = Math.min(500 * this.restarts, 4000);
+      this.log('warning', `Restarting engine in ${delay}ms (attempt ${this.restarts}/${MAX_RESTARTS})`);
+      clearTimeout(this._restartTimer);
+      this._restartTimer = setTimeout(() => {
+        this._restartTimer = null;
+        this._restartPending = false;
+        this._crashRestart = true;
+        this.start().catch(async (e) => {
+          // A block has been told already, in its own line.
+          if (e.code !== 'security_blocked') this.log('error', `Restart failed: ${e.message}`);
+          // A kept system setting must not outlive an engine that is not
+          // coming back.
+          if (!this.active && this.proxy.applied) { try { await this.proxy.restore(); } catch {} this._setProxyStatus(null); }
+        });
+      }, delay);
+    } else {
+      this.log('error', 'Engine keeps crashing; giving up. Check logs.');
+      this.restarts = 0;
+    }
+  }
+
+  /* Apply changed settings while active: replace the engine process but keep
+   * the system proxy pointed at it, so the switch is a brief blip instead of a
+   * full proxy off/on cycle. Nothing once a stop is asked for: a settings
+   * change and a Stop within a second must end stopped. */
+  restart() {
+    if (!this.active || this.restarting || this.stopping) return Promise.resolve({ success: true });
+    return this._serial(() => this._restart());
+  }
+
+  async _restart() {
+    if (!this.active || this.restarting || this.stopping) return { success: true };
+    const cfg = this._settings();
+    // A changed port setting needs a full stop and start; otherwise keep the
+    // port this session is actually on (it may be a free one we moved to).
+    // A system proxy set with an administrator's password stays through it
+    // (see _onClose): only the PAC learns the new port.
+    if (cfg.port !== (this.configuredPort || this.port)) {
+      await this._stop({ keepProxy: this._keepsProxy({ adminOnly: true }) });
+      return this._start();
+    }
+    cfg.port = this.port;
+    this.restarting = true;
+    try {
+      this.expectingStop = true;
+      this._stopStatsPoll();
+      const old = this.proc;
+      if (old) {
+        try { old.stdin.write('STOP\n'); } catch {}
+        await this._waitExit(2500);
+        if (this.proc === old) { try { old.kill('SIGKILL'); } catch {} await this._waitExit(1000); }
+      }
+      this.proc = null;
+      this.expectingStop = false;
+      // DNS protection may have just been turned on: start the forwarder;
+      // or turned off: it keeps running harmlessly and is dropped on stop().
+      if (cfg.useDoh && !this.dohPort) {
+        try { this.dohPort = await this.doh.start(this.lastDohPort); this.lastDohPort = this.dohPort; } catch { this.dohPort = 0; }
+      }
+      this._setAdvice({ ownServerDown: null });
+      let ready = false;
+      try {
+        await this._prepareUpstream();
+        ready = await this._spawn(this.binPath, this._args(cfg));
+      } catch (e) {
+        this.lastError = `Your own server could not be set up: ${e.message}`;
+      }
+      if (!ready) {
+        await this._cleanup(); // restores the proxy
+        this.store.set('runtimeActive', false);
+        this.onStatusChange(false);
+        throw this._spawnBlock || new Error(this.lastError || 'Engine failed to restart');
+      }
+      this._startStatsPoll();
+      this.stats.strategy = this._strategyLabel(cfg);
+      this.log('success', `Settings applied (strategy: ${this.stats.strategy})`);
+      this._watchExit();
+      return { success: true };
+    } finally {
+      this.restarting = false;
+    }
+  }
+
+  /* user: the user switched protection off (window or tray). Only then may a
+   * macOS restore ask for the administrator's password, and only then goes
+   * what was written for the next login on Linux desktops without a proxy
+   * setting; a quit, an update or a restart keeps it (system-proxy.js).
+   * keepProxy: an engine restart that keeps an administrator-set proxy.
+   * From the moment it is asked for, re-applies, settings restarts and the
+   * administrator button do nothing (stopping), and a start still under way
+   * finishes first and is then stopped, so it always ends stopped. */
+  stop(opts = {}) {
+    this._stops++;
+    this._stopGen++;
+    // A start asked for after this is a new one, and a crash restart still
+    // waiting must not undo it.
+    this._starting = null;
+    clearTimeout(this._restartTimer);
+    this._restartTimer = null;
+    this._restartPending = false;
+    this._crashRestart = false;
+    const p = this._serial(() => this._stop(opts));
+    const done = () => { this._stops--; };
+    p.then(done, done);
+    return p;
+  }
+
+  async _stop({ user = false, keepProxy = false } = {}) {
+    if (!this.active && !this.proc) {
+      if (!keepProxy) { await this.proxy.restore({ interactive: user }); this._setProxyStatus(null); this._refreshRecovery(); }
+      if (user) this._clearProxyEnv();
+      return { success: true };
+    }
+    // What went through, for a report sent after this stop: most are sent
+    // once the user has turned protection off. In memory only, until the
+    // next start (lastConns).
+    if (this.proc) {
+      try { const rows = await this.connsList(800); if (rows.length) this.lastConns = { rows, at: Date.now() }; } catch {}
+    }
+    this.expectingStop = true;
+    this._stopStatsPoll();
+
+    // Restore proxy first so traffic goes direct the instant we stop.
+    let restored = true;
+    if (!keepProxy) {
+      restored = (await this.proxy.restore({ interactive: user })) !== false;
+      this._setProxyStatus(null);
+    }
+    if (user) this._clearProxyEnv();
+
+    if (this.proc) {
+      try { this.proc.stdin.write('STOP\n'); } catch {}
+      await this._waitExit(2500);
+      if (this.proc) { try { this.proc.kill(); } catch {} }
+    }
+
+    this.active = false;
+    this.restarts = 0;
+    this.startedAt = 0;
+    this.doh.stop(); this.dohPort = 0;
+    this._closeUpstream();
+    // Kept a few minutes: a quick Stop and Start goes on with it.
+    if (this.tor) this.tor.linger();
+    this._torFile = null;
+    this.store.set('runtimeActive', false);
+    this.onStatusChange(false);
+    if (!keepProxy) {
+      // Only said restored when it was (the proxy has said what was not).
+      this.log('success', restored ? 'Shroudly engine stopped; system restored' : 'Shroudly engine stopped');
+      // A restore whose password dialog was dismissed: the window offers it.
+      this._refreshRecovery();
+    }
+    return { success: true };
+  }
+
+  /* Is the system proxy set (by us, wholly or in part, or taken over since)
+   * so that an engine restart can leave it in place and only give the PAC
+   * the new port? adminOnly: only one set with an administrator's password
+   * (a port changed in Settings: the setting is made again with it, except
+   * where that would ask for the password again). */
+  _keepsProxy({ adminOnly = false } = {}) {
+    const st = this.proxyStatus;
+    if (!st || !this.proxy.applied || typeof this.proxy.updatePort !== 'function') return false;
+    if (adminOnly) return !!st.admin;
+    return !!(st.ok || st.admin || st.partial || st.code === 'partial_env' || st.code === 'replaced');
+  }
+
+  _clearProxyEnv() {
+    try { if (typeof this.proxy.clearEnv === 'function') this.proxy.clearEnv(); } catch {}
+  }
+
+  /* Re-apply the system proxy with the current route mode / site list, without
+   * restarting the engine. Used when the user changes those settings. */
+  /* The automatic site list changed: serve it from the PAC in place. */
+  updateSiteList() {
+    if (!this.active) return false;
+    return this.proxy.updateList(this._settings().siteList);
+  }
+
+  /* Also the window's "Set Shroudly again" after another program took the
+   * system proxy over. Resolves to { success, status }: the status it ends
+   * with, null when protection went off meanwhile. */
+  async reapplyProxy({ userAsked = false } = {}) {
+    // Not while protection is off or on its way off (a Stop pressed within a
+    // second of a settings change): a re-apply finishing after the Stop would
+    // point the system at an engine that is gone.
+    if (!this._live()) return { success: true, status: null };
+    const cfg = this._settings();
+    const st = this.proxyStatus;
+    // Taking the proxy back from another program needs the administrator's
+    // password on a macOS Standard account, so it is done only when the user
+    // asked for it (the "Set Shroudly again" button), never from a background
+    // settings change, which must never pop an unrequested password dialog.
+    const replaced = !!(st && st.code === 'replaced') && userAsked;
+    try {
+      // Set with an administrator's password (macOS) and still ours: the
+      // system already points at our PAC, and re-applying would ask for the
+      // password again, so only the PAC's answer changes. Taken over by
+      // another program, it has to be set again, password and all.
+      // Still ours (or taken over but the user did not ask to retake it):
+      // the PAC's answer is all that changes, no system change and no
+      // password. A background settings change always takes this path.
+      if (st && (st.admin || st.code === 'replaced') && !replaced && this.proxy.updateRouting &&
+          this.proxy.updateRouting(cfg.routeMode, cfg.siteList)) {
+        if (st.code !== 'replaced') this.log('success', 'Proxy routing updated');
+        return { success: true, status: st };
+      }
+      // Taken over and the user asked: where Shroudly would set it back by
+      // itself (removed, or another tool's PAC on this computer), it is set
+      // back the same way, the user's own settings still what Stop puts back.
+      // A newer choice (a manual proxy, a PAC elsewhere) is set over with a
+      // new snapshot below, so Stop brings that back.
+      if (replaced && typeof this.proxy.retakeNow === 'function') {
+        const back = await this.proxy.retakeNow();
+        if (back && this._live()) {
+          if (this.proxy.updateRouting) this.proxy.updateRouting(cfg.routeMode, cfg.siteList);
+          this._setProxyStatus(back);
+          if (back.ok) this.log('success', 'Proxy routing updated');
+          return { success: true, status: back };
+        }
+        if (!this._live()) return { success: true, status: null };
+      }
+      await this.proxy.restore();                       // back to the user's own settings
+      let status = this._live() ? await this.proxy.apply(this.port, cfg.routeMode, cfg.siteList) : null;
+      if (status && replaced && st.admin && status.code === 'needs_admin' && this.proxy.applyAsAdmin && this._live()) {
+        status = await this.proxy.applyAsAdmin();
+      }
+      // Stopped meanwhile: that stop's restore runs after this one's apply
+      // (the proxy makes one change at a time), and its status stands.
+      if (!status || status.code === 'not_active' || !this._live()) return { success: true, status: null };
+      this._setProxyStatus(status);
+      if (status.ok || !replaced) this.log('success', 'Proxy routing updated');
+      return { success: true, status };
+    } catch (e) {
+      this.log('error', `Could not update proxy routing: ${e.message}`);
+      return { success: false, status: this.proxyStatus };
+    }
+  }
+
+  /* Protection is on, and no stop is on its way. */
+  _live() { return this.active && !this.stopping; }
+
+  /* The system proxy is read again in a few seconds, ahead of its timer: at
+   * the moments another program most often takes it over (a Discord that
+   * just started, a program the autopilot restarted). */
+  checkProxySoon() {
+    if (this._live() && this.proxy && typeof this.proxy.checkSoon === 'function') this.proxy.checkSoon();
+  }
+
+  /* The programs that most likely took the system proxy over (see
+   * SystemProxy.checkOwnership): the one listening where the PAC that
+   * replaced ours is served, if it is on this computer; otherwise the
+   * running tools known to set the system proxy. Names as people know them
+   * where the tool is a known one. `probe` stands in for both lookups in the
+   * tests. */
+  static async whoTookProxy(takeover, probe = {}) {
+    const listener = probe.listener || ((port) => procnet.listener(port));
+    const tools = probe.tools || (() => diagnostics.proxyTools());
+    // A PAC or a manual proxy on this computer: whoever listens on its port.
+    const { port } = SystemProxy.describeTakeover(takeover);
+    if (port) {
+      let who = null;
+      try { who = await listener(port); } catch {}
+      if (who && who.name) return [diagnostics.toolName(who.name)];
+    }
+    try { return (await tools()) || []; } catch { return []; }
+  }
+
+  _setProxyStatus(status) {
+    this.proxyStatus = status || null;
+    try { this.onProxyStatus(this.proxyStatus); } catch {}
+  }
+
+  /* macOS Standard account ('needs_admin'): set the system proxy with an
+   * administrator's password, asked for by the system's own dialog. For a
+   * button in the window; resolves to the new status (code 'ok', 'cancelled'
+   * or 'needs_admin'). */
+  async applyProxyAsAdmin() {
+    if (!this._live() || !this.proxy.applyAsAdmin) return { ok: false, code: 'not_active' };
+    const status = await this.proxy.applyAsAdmin();
+    // Protection was stopped (and maybe started again) while the dialog was
+    // open: that answer belongs to no session that is still running.
+    if (!this._live() || !status || status.code === 'not_active') return status || { ok: false, code: 'not_active' };
+    this._setProxyStatus(status);
+    return status;
+  }
+
+  _waitExit(ms) {
+    return new Promise((resolve) => {
+      if (!this.proc) return resolve();
+      const t = setTimeout(resolve, ms);
+      this.proc.once('close', () => { clearTimeout(t); resolve(); });
+    });
+  }
+
+  async _cleanup() {
+    this._stopStatsPoll();
+    if (this.proc) { try { this.proc.kill(); } catch {} this.proc = null; }
+    this.doh.stop(); this.dohPort = 0;
+    this._closeUpstream();
+    try { await this.proxy.restore(); } catch {}
+    this._setProxyStatus(null);
+    this.active = false;
+  }
+
+  // Synchronous last-resort cleanup on hard exit.
+  cleanupSync() {
+    try { if (this.proc) this.proc.kill(); } catch {}
+    try { this.doh.stop(); } catch {}
+    this._removeUpstream();
+    try { this.proxy.restoreSync(); } catch {}
+  }
+
+  /* protectionOn: whether protection is about to start (the user left it
+   * on). When it is off, what was written for the next login on Linux
+   * desktops without a proxy setting goes too. */
+  async recover({ protectionOn } = {}) {
+    // A previous run that never restored the proxy (crash, kill, power loss)
+    // left a state file with the user's settings: put them back. 2.0.0 left
+    // only the runtimeActive flag, so fall back to switching its proxy off.
+    // The app's own start waits only briefly for a macOS root helper, and
+    // never asks for a password here, before there is a window.
+    // A record of a Shroudly that is still running (another copy started
+    // with the same settings) is its live setting, never a leftover: it is
+    // left alone, and so is its restore at the next login.
+    let restored = false;
+    try { restored = SystemProxy.recoverSync({ ...this.proxyOptions, helperWaitMs: 3000, skipIfOwnerAlive: true }, this.log); } catch {}
+    if (restored === 'running') return;
+    // 'kept': ours, still set, waiting for an administrator's password. Not
+    // 2.0.0's leftover: switching it off blindly would lose the user's own
+    // setting recorded with it.
+    this.proxyRecovery = restored === 'kept' ? SystemProxy.pendingAdminRecovery(this.proxyOptions) : null;
+    this.proxyRecoveryPending = !!(this.proxyRecovery && !this.proxyRecovery.declined);
+    if (!restored && this.store.get('runtimeActive')) {
+      this.log('info', 'Recovering: restoring proxy from previous session');
+      try { SystemProxy.resetLegacySync(this.log); } catch {}
+    }
+    // Windows: a manual proxy for https:// at the engine, left by a test
+    // build with no Shroudly owning it, is switched off (never written).
+    try {
+      const saved = Number(this.store.get('listenPort')) || DEFAULT_PORT;
+      const ports = [saved, ...Array.from({ length: 21 }, (_, i) => DEFAULT_PORT + i)];
+      SystemProxy.clearStrayHttpsSync(this.log, { ...this.proxyOptions, ports });
+    } catch {}
+    if (protectionOn === false) { try { SystemProxy.clearEnvSync(this.proxyOptions, this.log); } catch {} }
+    this.store.set('runtimeActive', false);
+  }
+
+  /* With protection staying off: finish a macOS restore that needs the
+   * administrator's password (one dialog, in one process; see
+   * SystemProxy.recoverAsAdmin). When protection starts instead, apply()
+   * carries the recorded settings over and its own password request covers
+   * both.
+   * By itself (user false) it asks once per run, and only with the window on
+   * screen (windowShown): never from the tray alone, where a dialog out of
+   * nowhere is all the user would see. Once they have dismissed it, only
+   * the window's button (user true) asks again. */
+  async recoverProxyAsAdmin({ user = false, windowShown = true } = {}) {
+    if (!this.proxyRecovery) return false;
+    if (!user && (!this.proxyRecoveryPending || this.proxyRecovery.declined || !windowShown)) return false;
+    this.proxyRecoveryPending = false;
+    let done = false;
+    try { done = await SystemProxy.recoverAsAdmin({ ...this.proxyOptions, userAsked: user }, this.log); } catch {}
+    this._refreshRecovery(done);
+    return done;
+  }
+
+  /* What the window shows about it: still waiting (declined or not), or done. */
+  _refreshRecovery(done = false) {
+    const next = done ? null : SystemProxy.pendingAdminRecovery(this.proxyOptions);
+    if (JSON.stringify(next) === JSON.stringify(this.proxyRecovery)) return;
+    this.proxyRecovery = next;
+    try { this.onProxyRecovery(next); } catch {}
+  }
+}
+
+module.exports = EngineManager;
+module.exports.coreBinaryPath = coreBinaryPath;
+module.exports.DEFAULT_SITE_LIST = DEFAULT_SITE_LIST;
+module.exports.FALLBACK_SITE_LIST = FALLBACK_SITE_LIST;

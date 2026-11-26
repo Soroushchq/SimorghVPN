@@ -1,0 +1,290 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Shroudly" parent="android:Theme.Material.NoActionBar">
+        <item name="android:colorPrimary">@color/bg</item>
+        <item name="android:colorPrimaryDark">@color/bg</item>
+        <item name="android:colorAccent">?attr/accentLight</item>
+        <item name="android:colorBackground">@color/bg</item>
+        <item name="android:windowBackground">@color/bg</item>
+        <item name="android:statusBarColor">@color/bg</item>
+        <item name="android:navigationBarColor">@color/bg</item>
+        <item name="android:textColorPrimary">@color/text</item>
+        <item name="android:textColorSecondary">@color/text_dim</item>
+        <item name="android:textColorLink">?attr/accentLight</item>
+        <item name="android:colorControlHighlight">?attr/accentSoft</item>
+        <item name="android:alertDialogTheme">@style/Theme.Shroudly.Dialog</item>
+        <item name="accent">@color/accent</item>
+        <item name="accentLight">@color/accent_light</item>
+        <item name="accentSoft">@color/accent_soft</item>
+        <item name="accentLine">@color/accent_line</item>
+        <item name="accentButtonStart">@color/brand_royal</item>
+        <item name="accentButtonEnd">@color/accent</item>
+    </style>
+
+    <style name="Theme.Shroudly.Dialog" parent="android:Theme.Material.Dialog.Alert">
+        <item name="android:colorAccent">?attr/accentLight</item>
+        <item name="android:colorBackground">@color/surface_pop</item>
+        <item name="android:textColorPrimary">@color/text</item>
+        <item name="android:textColorSecondary">@color/text_dim</item>
+    </style>
+
+    <!-- A small heading over a group, like the desktop's section titles. -->
+    <style name="SectionTitle">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_marginTop">22dp</item>
+        <item name="android:layout_marginBottom">8dp</item>
+        <item name="android:paddingStart">6dp</item>
+        <item name="android:paddingEnd">6dp</item>
+        <item name="android:textAlignment">viewStart</item>
+        <item name="android:textColor">@color/text_dim</item>
+        <item name="android:textSize">16sp</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+    </style>
+
+    <!-- A section title with an (i) at its end: a tap shows or hides the
+         explanations under the section's settings (issue #47). -->
+    <style name="SectionTitle.Explained">
+        <item name="android:drawableEnd">@drawable/ic_info</item>
+        <item name="android:drawableTint">@color/text_dim</item>
+        <item name="android:drawablePadding">8dp</item>
+        <item name="android:gravity">center_vertical</item>
+        <item name="android:minHeight">40dp</item>
+        <item name="android:clickable">true</item>
+        <item name="android:focusable">true</item>
+        <item name="android:background">?android:attr/selectableItemBackground</item>
+    </style>
+
+    <!-- The counters (StatsPanel.js Stat): label over a large tabular value. -->
+    <style name="StatTile">
+        <item name="android:layout_width">0dp</item>
+        <item name="android:layout_height">match_parent</item>
+        <item name="android:layout_weight">1</item>
+        <item name="android:background">@drawable/tile</item>
+        <item name="android:orientation">vertical</item>
+        <item name="android:padding">14dp</item>
+    </style>
+
+    <style name="StatHead">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:orientation">horizontal</item>
+        <item name="android:gravity">center_vertical</item>
+    </style>
+
+    <style name="StatIcon">
+        <item name="android:layout_width">15dp</item>
+        <item name="android:layout_height">15dp</item>
+        <item name="android:importantForAccessibility">no</item>
+        <item name="android:tint">@color/text_faint</item>
+    </style>
+
+    <!-- One line, the size giving way first (large text, a long
+         language): broken in two ("Connec-tions"), the label pushed its
+         value below its neighbour's. -->
+    <style name="StatLabel">
+        <item name="android:layout_width">0dp</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_weight">1</item>
+        <item name="android:maxLines">1</item>
+        <item name="android:autoSizeTextType">uniform</item>
+        <item name="android:autoSizeMinTextSize">8sp</item>
+        <item name="android:autoSizeMaxTextSize">12.5sp</item>
+        <item name="android:autoSizeStepGranularity">0.5sp</item>
+        <item name="android:layout_marginStart">7dp</item>
+        <item name="android:textAlignment">viewStart</item>
+        <item name="android:textColor">@color/text_dim</item>
+        <item name="android:textSize">12.5sp</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+    </style>
+
+    <style name="StatValue">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_marginTop">10dp</item>
+        <item name="android:maxLines">1</item>
+        <item name="android:ellipsize">end</item>
+        <item name="android:textAlignment">viewStart</item>
+        <item name="android:textDirection">ltr</item>
+        <item name="android:textColor">@color/text</item>
+        <item name="android:textSize">22sp</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="android:fontFeatureSettings">tnum</item>
+        <item name="android:letterSpacing">-0.01</item>
+    </style>
+
+    <!-- The About list (InfoPanel.js LinkRow): icon, label, chevron. -->
+    <style name="AboutRow">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:minHeight">52dp</item>
+        <item name="android:orientation">horizontal</item>
+        <item name="android:gravity">center_vertical</item>
+        <item name="android:paddingStart">14dp</item>
+        <item name="android:paddingEnd">12dp</item>
+        <item name="android:paddingTop">8dp</item>
+        <item name="android:paddingBottom">8dp</item>
+        <item name="android:background">@drawable/row</item>
+        <item name="android:clickable">true</item>
+        <item name="android:focusable">true</item>
+    </style>
+
+    <!-- An AboutRow that is one TextView: the tile and the chevron are its
+         compound drawables (row_*.xml, chevron_end.xml), one view instead of
+         four. -->
+    <style name="AboutRowText">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:minHeight">52dp</item>
+        <item name="android:gravity">center_vertical|start</item>
+        <item name="android:paddingStart">14dp</item>
+        <item name="android:paddingEnd">12dp</item>
+        <item name="android:paddingTop">8dp</item>
+        <item name="android:paddingBottom">8dp</item>
+        <item name="android:background">@drawable/row</item>
+        <item name="android:drawablePadding">14dp</item>
+        <item name="android:textAlignment">viewStart</item>
+        <item name="android:textColor">@color/text</item>
+        <item name="android:textSize">15sp</item>
+        <item name="android:clickable">true</item>
+        <item name="android:focusable">true</item>
+        <item name="android:drawableEnd">@drawable/chevron_end</item>
+    </style>
+
+    <!-- Its tag lets Fit hide it where a row needs the room. -->
+    <style name="RowIcon">
+        <item name="android:tag">tile</item>
+        <item name="android:layout_width">30dp</item>
+        <item name="android:layout_height">30dp</item>
+        <item name="android:padding">7dp</item>
+        <item name="android:background">@drawable/icon_tile</item>
+        <item name="android:importantForAccessibility">no</item>
+        <item name="android:tint">?attr/accentLight</item>
+    </style>
+
+    <style name="RowLabel">
+        <item name="android:layout_width">0dp</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_weight">1</item>
+        <item name="android:layout_marginStart">14dp</item>
+        <item name="android:layout_marginEnd">8dp</item>
+        <item name="android:textAlignment">viewStart</item>
+        <item name="android:textColor">@color/text</item>
+        <item name="android:textSize">15sp</item>
+    </style>
+
+    <style name="Chevron">
+        <item name="android:layout_width">18dp</item>
+        <item name="android:layout_height">18dp</item>
+        <item name="android:src">@drawable/ic_chevron</item>
+        <item name="android:importantForAccessibility">no</item>
+        <item name="android:tint">@color/text_faint</item>
+    </style>
+
+    <!-- Between rows, from under the label to the card's edge. -->
+    <style name="Divider">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">1dp</item>
+        <item name="android:layout_marginStart">58dp</item>
+        <item name="android:background">@color/line</item>
+    </style>
+
+    <!-- The Settings bar's title, in sp like every other text: the
+         system's is in dp and stayed small with large text. -->
+    <style name="ToolbarTitle" parent="@android:style/TextAppearance.Material.Widget.Toolbar.Title">
+        <item name="android:textSize">20sp</item>
+    </style>
+
+    <style name="Link">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:minHeight">48dp</item>
+        <item name="android:gravity">center</item>
+        <item name="android:paddingStart">12dp</item>
+        <item name="android:paddingEnd">12dp</item>
+        <item name="android:textColor">?attr/accentLight</item>
+        <item name="android:textSize">14sp</item>
+        <item name="android:background">@drawable/pressable</item>
+        <item name="android:clickable">true</item>
+        <item name="android:focusable">true</item>
+    </style>
+
+    <!-- The desktop's accents (components/Appearance.js ACCENTS), applied over
+         the theme (Accent.kt): the swatch for large text and the ring, a
+         lighter step for small text, and a darker pair for button fills.
+         White text needs 4.5:1 on all of a button: where the lighter end was
+         below it (sky 4.1, teal 3.7, emerald 3.8), the fill is the darker one
+         throughout, as lime's and amber's are. -->
+    <style name="Accent.Sky" parent="">
+        <item name="accent">#FF38BDF8</item>
+        <item name="accentLight">#FF7DD3FC</item>
+        <item name="accentSoft">#2438BDF8</item>
+        <item name="accentLine">#8038BDF8</item>
+        <item name="accentButtonStart">#FF0369A1</item>
+        <item name="accentButtonEnd">#FF0369A1</item>
+    </style>
+    <style name="Accent.Teal" parent="">
+        <item name="accent">#FF2DD4BF</item>
+        <item name="accentLight">#FF5EEAD4</item>
+        <item name="accentSoft">#242DD4BF</item>
+        <item name="accentLine">#802DD4BF</item>
+        <item name="accentButtonStart">#FF0F766E</item>
+        <item name="accentButtonEnd">#FF0F766E</item>
+    </style>
+    <style name="Accent.Emerald" parent="">
+        <item name="accent">#FF34D399</item>
+        <item name="accentLight">#FF6EE7B7</item>
+        <item name="accentSoft">#2434D399</item>
+        <item name="accentLine">#8034D399</item>
+        <item name="accentButtonStart">#FF047857</item>
+        <item name="accentButtonEnd">#FF047857</item>
+    </style>
+    <style name="Accent.Lime" parent="">
+        <item name="accent">#FFA3E635</item>
+        <item name="accentLight">#FFBEF264</item>
+        <item name="accentSoft">#24A3E635</item>
+        <item name="accentLine">#80A3E635</item>
+        <item name="accentButtonStart">#FF4D7C0F</item>
+        <item name="accentButtonEnd">#FF4D7C0F</item>
+    </style>
+    <style name="Accent.Amber" parent="">
+        <item name="accent">#FFFBBF24</item>
+        <item name="accentLight">#FFFCD34D</item>
+        <item name="accentSoft">#24FBBF24</item>
+        <item name="accentLine">#80FBBF24</item>
+        <item name="accentButtonStart">#FFB45309</item>
+        <item name="accentButtonEnd">#FFB45309</item>
+    </style>
+    <style name="Accent.Rose" parent="">
+        <item name="accent">#FFFB7185</item>
+        <item name="accentLight">#FFFDA4AF</item>
+        <item name="accentSoft">#24FB7185</item>
+        <item name="accentLine">#80FB7185</item>
+        <item name="accentButtonStart">#FFBE123C</item>
+        <item name="accentButtonEnd">#FFE11D48</item>
+    </style>
+    <style name="Accent.Pink" parent="">
+        <item name="accent">#FFF472B6</item>
+        <item name="accentLight">#FFF9A8D4</item>
+        <item name="accentSoft">#24F472B6</item>
+        <item name="accentLine">#80F472B6</item>
+        <item name="accentButtonStart">#FFBE185D</item>
+        <item name="accentButtonEnd">#FFDB2777</item>
+    </style>
+    <style name="Accent.Violet" parent="">
+        <item name="accent">#FFA78BFA</item>
+        <item name="accentLight">#FFC4B5FD</item>
+        <item name="accentSoft">#24A78BFA</item>
+        <item name="accentLine">#80A78BFA</item>
+        <item name="accentButtonStart">#FF6D28D9</item>
+        <item name="accentButtonEnd">#FF7C3AED</item>
+    </style>
+    <style name="Accent.Indigo" parent="">
+        <item name="accent">#FF818CF8</item>
+        <item name="accentLight">#FFA5B4FC</item>
+        <item name="accentSoft">#24818CF8</item>
+        <item name="accentLine">#80818CF8</item>
+        <item name="accentButtonStart">#FF4338CA</item>
+        <item name="accentButtonEnd">#FF4F46E5</item>
+    </style>
+</resources>

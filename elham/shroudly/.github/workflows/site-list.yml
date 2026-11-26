@@ -1,0 +1,74 @@
+name: Site list
+
+# Rebuilds the list that "only listed sites" routing uses, from OONI's
+# measurements of the last 30 days (scripts/site-list/update.js), and publishes
+# it on the site-list branch, which the app reads. Sites blocked somewhere are
+# added; sites no longer blocked anywhere for 90 days are dropped. Only that
+# branch is written: main's history stays as it is. The branch also holds the
+# ad and tracker list (adblock-list.yml), which this leaves as it is.
+
+on:
+  schedule:
+    - cron: '17 3 * * 1'   # Mondays, 03:17 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: site-list-branch   # adblock-list.yml publishes on the same branch
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false   # the build reads network data; no token near it
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Previous list and state
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          if git fetch --depth=1 origin site-list 2>/dev/null; then
+            git show FETCH_HEAD:sites.json > "$RUNNER_TEMP/out/sites.json"
+            git show FETCH_HEAD:state.json > "$RUNNER_TEMP/out/state.json"
+          fi
+
+      - name: Build
+        shell: bash   # -eo pipefail: a failed build must fail the job, not hide behind tee
+        run: node scripts/site-list/update.js --out "$RUNNER_TEMP/out" | tee "$RUNNER_TEMP/summary.txt"
+
+      - name: Publish on the site-list branch
+        shell: bash
+        env:
+          OUT: ${{ runner.temp }}/out
+          TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          cd "$RUNNER_TEMP"
+          rm -rf publish && mkdir publish && cd publish
+          git init -q -b site-list
+          git config user.name "umutxyp"
+          git config user.email "69085038+umutxyp@users.noreply.github.com"
+          git remote add origin "https://github.com/$REPO.git"
+          git config http.extraheader "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+          # --mixed: the branch's other files (adblock.txt) stay in the index
+          # and so in the commit.
+          if git fetch -q --depth=1 origin site-list 2>/dev/null; then git reset -q --mixed FETCH_HEAD; fi
+          cp "$OUT/sites.json" "$OUT/state.json" .
+          printf '%s\n' "This branch holds data only, which Shroudly reads:" \
+            "- sites.json, state.json: the sites \"only listed sites\" routing uses, rebuilt every week by .github/workflows/site-list.yml on main;" \
+            "- adblock.txt: the ad and tracker list (GPL-3.0, sources in its header), rebuilt every week by .github/workflows/adblock-list.yml on main." \
+            "Do not edit it by hand." > README.md
+          git add sites.json state.json README.md
+          if git diff --cached --quiet; then echo "No change."; exit 0; fi
+          git commit -q -m "site list: $(grep -m1 -o '^[0-9]* domains.*' "$RUNNER_TEMP/summary.txt" || echo update)"
+          git push -q origin HEAD:site-list
+          git log -1 --format='%h %s'

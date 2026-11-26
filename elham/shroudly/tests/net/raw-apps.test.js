@@ -1,0 +1,185 @@
+'use strict';
+
+/* Naming the app behind a connection that is not TLS or HTTP and cannot get
+ * through, and telling the user in one line (electron/raw-apps.js):
+ *  - an address or name of a known service is that service;
+ *  - on the desktop, the program holding the app's end of the connection to
+ *    the engine is found from the port the engine reports (procnet.owner),
+ *    checked here against a real connection of this very process;
+ *  - a notification only for an app that can be named, once per network,
+ *    and only after enough of its addresses failed; an address nothing can be
+ *    said about is a line in the log, once in a while. */
+
+const net = require('net');
+const { suite } = require('./helpers');
+const raw = require('../../electron/raw-apps');
+const procnet = require('../../electron/procnet');
+
+const t = suite('raw-apps');
+
+(async () => {
+  /* 1. services */
+  t.ok(raw.serviceOf('149.154.167.50').id === 'telegram', 'a Telegram data centre address is Telegram');
+  t.ok(raw.serviceOf('91.108.56.130').id === 'telegram', 'and one in another of its ranges');
+  t.ok(raw.serviceOf('2001:67c:4e8:f002::a').id === 'telegram' && raw.serviceOf('[2001:b28:f23d:f001::a]').id === 'telegram', 'and its IPv6 ones');
+  t.ok(raw.serviceOf('kws2.web.telegram.org').id === 'telegram' && raw.serviceOf('t.me').id === 'telegram', 'and its names');
+  t.ok(raw.serviceOf('149.154.176.1') === null && raw.serviceOf('8.8.8.8') === null && raw.serviceOf('nottelegram.org') === null, 'nothing else is');
+  t.ok(raw.serviceOf('g.whatsapp.net').name === 'WhatsApp', 'WhatsApp by its names');
+  t.ok(raw.inCidr(raw.v6Bytes('::ffff:1.2.3.4'), '::ffff:0:0/96') && raw.v6Bytes('1::2::3') === null && raw.v4Bytes('1.2.3.256') === null, 'addresses are read strictly');
+  const ranges = raw.pacRanges();
+  t.ok(ranges.some(([n, m]) => n === '149.154.160.0' && m === '255.255.240.0') && ranges.every(([n]) => !n.includes(':')), 'the PAC gets the IPv4 ranges with their masks');
+  t.ok(raw.programName('C:\\Users\\a\\AppData\\Roaming\\Telegram Desktop\\Telegram.exe') === 'Telegram' && raw.programName('') === null, 'a program by the name people know');
+
+  /* 2. procnet: the program at the other end of a connection to "the engine" */
+  t.ok(procnet.parseNetstatOwner('  TCP    127.0.0.1:50123        127.0.0.1:10808        ESTABLISHED     4242\n  TCP    127.0.0.1:10808        127.0.0.1:50123        ESTABLISHED     900\n', 50123, 10808) === 4242, 'netstat: the app end, not the engine end');
+  t.ok(procnet.parseLsofOwner('p77\ncTelegram\nn127.0.0.1:50123->127.0.0.1:10808\np900\ncshroudly\nn127.0.0.1:10808->127.0.0.1:50123\n', 50123, 10808).name === 'Telegram', 'lsof: the app end, by name');
+  const srv = net.createServer(() => {});
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const c = net.connect(srv.address().port, '127.0.0.1');
+  await new Promise((r) => c.once('connect', r));
+  const o = await procnet.owner(c.localPort, srv.address().port);
+  t.ok(o && o.pid === process.pid, `a real connection of this process is found (${o && o.name}, pid ${o && o.pid})`);
+  c.destroy(); srv.close();
+
+  /* 3. what the user is told */
+  let now = 1e6;
+  const said = [], told = [];
+  const mk = (owner) => new raw.RawWatch({ log: (l, m) => said.push(m), tell: (id, p) => told.push([id, p]), owner, now: () => now });
+  const w = mk(async (cport) => (cport === 7 ? 'SomeApp' : cport === 8 ? 'Telegram.exe' : null));
+  // a known service: after its second address does not answer
+  t.ok(await w.onEvent('unreachable', { host: '149.154.167.50', port: 443, cport: 0 }) === 'counting', 'one Telegram address: not yet');
+  t.ok(await w.onEvent('unreachable', { host: '149.154.175.50', port: 443, cport: 0 }) === 'notified', 'two: told');
+  t.ok(told.length === 1 && told[0][0] === 'autoRawUnreachable' && told[0][1].app === 'Telegram', 'in one line naming Telegram');
+  t.ok(/^Telegram cannot reach its servers \(149\.154\.167\.50:443, 149\.154\.175\.50:443\): the network blocks those addresses themselves;/.test(said[said.length - 1]), 'and a log line with the addresses');
+  t.ok(await w.onEvent('unreachable', { host: '149.154.167.91', port: 443 }) === 'told' && told.length === 1, 'not told again on this network');
+  // one address that keeps failing (an app retrying the same server)
+  const wa = mk(async () => null);
+  t.ok(await wa.onEvent('unreachable', { host: '91.108.56.130', port: 443 }) === 'counting', 'one Telegram address once: not yet');
+  now += 10 * 1000;
+  t.ok(await wa.onEvent('unreachable', { host: '91.108.56.130', port: 443 }) === 'counting', 'the same one 10 s later: not yet');
+  now += raw.AGAIN_MS;
+  t.ok(await wa.onEvent('unreachable', { host: '91.108.56.130', port: 443 }) === 'notified', 'still failing half a minute on: told');
+  const wb = mk(async () => 'SomeApp');
+  for (let i = 0; i < 4; i++) { await wb.onEvent('unreachable', { host: '198.51.100.9', port: 6881, cport: 3 }); now += 60 * 1000; }
+  t.ok(told.filter(([, p]) => p.app === 'SomeApp').length === 0, 'a program retrying one dead address is never told (it may be a dead peer)');
+  // a program: three addresses
+  told.length = 0;
+  for (const h of ['198.51.100.1', '198.51.100.2']) t.ok(await w.onEvent('unreachable', { host: h, port: 6881, cport: 7 }) === 'counting', `a program's address ${h}: not yet`);
+  t.ok(await w.onEvent('unreachable', { host: '198.51.100.3', port: 6881, cport: 7 }) === 'notified' && told[0][1].app === 'SomeApp', 'its third: told, by the program name');
+  // spread out over more than the window: never enough at once
+  told.length = 0;
+  const w2 = mk(async () => 'Game');
+  for (let i = 0; i < 5; i++) { await w2.onEvent('unreachable', { host: `203.0.113.${i}`, port: 7000, cport: 9 }); now += raw.WINDOW_MS + 1; }
+  t.ok(told.length === 0, 'failures far apart in time are never added up');
+  // every technique failed: one is enough, it is strong evidence
+  // nothing got through: told only once it is confirmed to be the network,
+  // not the service being down (one address once could be an outage)
+  t.ok(await w.onEvent('blocked', { host: '149.154.167.50', port: 443, attempts: 6, cport: 8 }) === 'counting', 'nothing got through on one address: not yet (an outage looks the same)');
+  t.ok(await w.onEvent('blocked', { host: '149.154.175.50', port: 443, attempts: 6, cport: 8 }) === 'notified', 'on a second address of the app: told');
+  t.ok(told[0][0] === 'autoRawBlocked' && told[0][1].app === 'Telegram', 'naming the program (Telegram.exe as Telegram)');
+  // nothing to name it by: a log line, rarely, never a notification
+  told.length = 0;
+  t.ok(await w.onEvent('unreachable', { host: '203.0.113.50', port: 9000 }) === 'logged', 'an address of no known app: a log line');
+  t.ok(said[said.length - 1] === '203.0.113.50:9000: could not be reached (not a web connection)', 'saying what it is');
+  t.ok(await w.onEvent('unreachable', { host: '203.0.113.50', port: 9000 }) === 'quiet', 'not again soon');
+  t.ok(await w.onEvent('blocked', { host: '2001:db8::5', port: 443, attempts: 6 }) === 'logged' && said[said.length - 1] === '[2001:db8::5]:443: still blocked after 6 techniques (not a web connection)', 'an IPv6 one, bracketed');
+  t.ok(told.length === 0, 'and no notification for either');
+  // another network: told again there
+  w.networkChanged();
+  await w.onEvent('unreachable', { host: '149.154.167.50', port: 443 });
+  t.ok(await w.onEvent('unreachable', { host: '149.154.175.50', port: 443 }) === 'notified', 'on another network it is told again');
+  // a host learnt from a program earlier names a later line with no program
+  const w3 = mk(async (cport) => (cport === 5 ? 'Signal' : null));
+  await w3.onEvent('blocked', { host: '203.0.113.77', port: 443, cport: 5 });
+  told.length = 0;
+  now += raw.BLOCKED_AGAIN_MS;
+  t.ok(await w3.onEvent('blocked', { host: '203.0.113.77', port: 443, cport: 0 }) === 'notified' && told[0][1].app === 'Signal',
+    'the same address blocked again after the engine\'s rest: told, and an address once seen with a program keeps its name');
+
+  // a service whose own name a blockcheck finds filtered here: told at once
+  told.length = 0;
+  const confirmed = [];
+  const wc = new raw.RawWatch({ log: () => {}, tell: (id, p) => told.push([id, p]), now: () => now,
+    confirm: async (svc) => { confirmed.push(svc.probe); return 'blocked'; } });
+  t.ok(await wc.onEvent('blocked', { host: '91.108.56.130', port: 443, attempts: 6 }) === 'notified' && confirmed[0] === 'telegram.org',
+    'a service confirmed blocked by a check of its own name (telegram.org): told at once');
+  const wo = new raw.RawWatch({ log: () => {}, tell: (id, p) => told.push([id, p]), now: () => now, confirm: async () => 'open' });
+  t.ok(await wo.onEvent('blocked', { host: '91.108.56.130', port: 443, attempts: 6 }) === 'counting', 'its name opens directly: not confirmed, waits');
+
+  // never told: a name that did not resolve, connections only unanswered
+  // ("silent": an app that sends and waits looks the same), or while nothing
+  // else comes back either (offline)
+  told.length = 0;
+  const wd = mk(async () => 'Telegram');
+  t.ok(await wd.onEvent('unreachable', { host: 'dc.example', port: 5222, stage: 'dns' }) === 'ignored', 'a name that did not resolve: ignored');
+  t.ok(await wd.onEvent('blocked', { host: '149.154.167.50', port: 443, attempts: 6, note: 'silent', cport: 3 }) === 'silent'
+    && await wd.onEvent('blocked', { host: '149.154.175.50', port: 443, attempts: 6, note: 'silent', cport: 3 }) === 'silent', 'only unanswered ("silent"): a log line, never a notification');
+  const off = new raw.RawWatch({ log: () => {}, tell: (id, p) => told.push([id, p]), now: () => now, networkWorks: () => false });
+  await off.onEvent('unreachable', { host: '149.154.167.50', port: 443 });
+  t.ok(await off.onEvent('unreachable', { host: '149.154.175.50', port: 443 }) === 'offline', 'nothing else comes back either (offline): not told');
+  t.ok(told.length === 0, 'and no notification for any of these');
+
+  // Another app trying a list of servers: a few lines a minute, the rest
+  // counted in one line, so the log's other lines are not pushed out.
+  {
+    const lines = [];
+    const wb = new raw.RawWatch({ log: (l, m) => lines.push(m), tell: () => {}, owner: async () => null, now: () => now });
+    now += 3600 * 1000;
+    for (let i = 0; i < 20; i++) await wb.onEvent('unreachable', { host: `192.0.2.${i}`, port: 22 });
+    t.ok(lines.length === raw.BURST_LINES, `20 addresses in a minute: ${lines.length} lines, not 20`);
+    now += raw.BURST_MS;
+    await wb.onEvent('unreachable', { host: '192.0.2.200', port: 443 });
+    t.ok(lines.length === raw.BURST_LINES + 2 && /^17 more addresses .* could not be reached in the minute from /.test(lines[raw.BURST_LINES]) && lines[raw.BURST_LINES + 1].startsWith('192.0.2.200:443'),
+      'a minute on: the 17 others in one line, then the new address');
+  }
+
+  /* 4. the last way out (an Iran Telegram report: told to use Telegram's
+   * own proxy, and asked about Tor for a bare IPv6 address; Tor was never
+   * allowed and Telegram stayed shut) */
+  {
+    const run = async (state, again = false) => {
+      const lines = [], notes = [], asked = [];
+      const x = new raw.RawWatch({ log: (l, m) => lines.push(m), tell: (id) => notes.push(id), now: () => now,
+        tor: () => state, askTor: (app) => asked.push(app), askTorAgain: (app) => { asked.push(`again ${app}`); return again; } });
+      now += 3600 * 1000;
+      await x.onEvent('unreachable', { host: '149.154.167.92', port: 443 });
+      const r = await x.onEvent('unreachable', { host: '2001:67c:4e8:f004::a', port: 443 });
+      return { r, lines, notes, asked };
+    };
+    let o = await run('carries');
+    t.ok(o.r === 'tor' && o.notes.length === 0 && o.asked.length === 0 && /they go through the last way out \(Tor\)$/.test(o.lines.pop()), 'Tor allowed: it carries them; no notice, no question, no "own proxy" advice');
+    o = await run('asks');
+    t.ok(o.r === 'asked' && o.notes.length === 0 && o.asked.join() === 'Telegram' && /once allowed, asked in the window$/.test(o.lines.pop()), 'Tor not allowed yet: asked for, naming Telegram; no "own proxy" notice');
+    o = await run('off', true);
+    t.ok(o.r === 'asked' && o.notes.length === 0 && o.asked.join() === 'again Telegram', 'Tor turned off: asked again (when its rest is over), instead of the notice');
+    o = await run('off', false);
+    t.ok(o.r === 'notified' && o.notes.join() === 'autoRawUnreachable' && /own proxy setting or a VPN/.test(o.lines.pop()), 'turned off and not asked again: the notice, as before');
+    o = await run(null);
+    t.ok(o.r === 'notified' && o.notes.join() === 'autoRawUnreachable', 'no Tor here (or an own server): the notice, as before');
+  }
+
+  /* 5. what the Tor question names */
+  {
+    let q = raw.askLabel(null, '2001:4188:2:600:10:10:34:35');
+    t.ok(q.host === '2001:4188:2:600:10:10:34:35' && q.rank === 0, 'only an unknown address: that address');
+    q = raw.askLabel(q, 't.me');
+    t.ok(q.host === 'Telegram' && q.rank === 2, 'then t.me: the question names Telegram');
+    const keep = q;
+    t.ok(raw.askLabel(q, '2001:b28:f23d:f001::a') === keep && raw.askLabel(q, 'example.com') === keep && raw.askLabel(q, '') === keep, 'and keeps it: neither an address nor a site name replaces an app');
+    q = raw.askLabel(null, '[2001:67c:4e8:f004::a]');
+    t.ok(q.host === 'Telegram', 'a Telegram address (IPv6, in brackets) is Telegram from the start');
+    q = raw.askLabel(null, 'www.youtube.com');
+    t.ok(q.host === 'www.youtube.com' && q.rank === 1 && raw.askLabel(q, '172.217.117.4') === q, 'a site by its name, never replaced by an address');
+    t.ok(raw.askLabel({ host: '192.0.2.1', rank: 0 }, 'x.example').host === 'x.example', 'a name replaces a bare address');
+    t.ok(raw.askLabel(null, '198.51.100.7', (h) => (h === '198.51.100.7' ? 'SomeGame' : null)).host === 'SomeGame', 'a program the connection was traced to names it too');
+    t.ok(raw.askLabel(null, '').host === '' , 'nothing at all: empty, as before ("a site")');
+    const TorApps = require('../../electron/tor-apps');
+    const both = (x) => { const sv = raw.serviceOf(x); return sv ? sv.name : TorApps.appOfName(x); };
+    t.ok(raw.askLabel(null, 'abs.twimg.com', both).host === 'X (Twitter)' && raw.askLabel(null, 'rr3---sn-x.googlevideo.com', both).host === 'YouTube'
+      && TorApps.appOfName('nottwimg.com') === null && TorApps.appOfName('') === null,
+    'one of an app\'s many names is asked about as the app (X for abs.twimg.com, YouTube for a googlevideo.com server)');
+  }
+
+  console.log(`raw-apps: ${t.count} checks passed`);
+  process.exit(0);
+})().catch((e) => { console.error(e); process.exit(1); });

@@ -1,0 +1,53 @@
+# Dependencies
+node_modules
+
+# Next.js
+.next/
+out/
+
+# Electron build output
+dist/
+dist_*/
+release/
+
+# Compiled engine binaries (built from core/ via `npm run build:core`)
+electron/tools/core/
+# Tor's own builds (scripts/fetch-tor.js), fetched and checked at build time
+electron/tools/tor/
+android/app/src/main/assets/tor/
+# Legacy engine artifacts (removed)
+electron/tools/shroudly-engine/
+
+# Android: the engine was an executable here up to 2.6.1 (now Gradle builds
+# it into libshroudlycore_jni.so); only Tor's programs go here, fetched at
+# build time (scripts/fetch-tor.js --android)
+android/app/src/main/jniLibs/
+
+# Core native build artifacts
+core/shroudly-core
+core/shroudly-core.exe
+core/*.o
+core/*.obj
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.eslintcache
+
+# Environment
+.env
+.env.*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.suo
+*.user
+
+# End-to-end screenshots and memory reports
+test-results/
+dist-legacy/

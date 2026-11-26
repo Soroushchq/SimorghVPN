@@ -1,0 +1,199 @@
+/**
+ * English strings — the source of truth, ported from the production
+ * `android/app/src/main/res/values/strings.xml` (declared en-US). Other locales override a subset
+ * and fall back to these values for any missing key.
+ *
+ * Pure-native notification/service-log resources (vpn_notification_*, log_*, error_*) are not
+ * ported: the native layer emits those already-localized inside `logLines` / `lastError`.
+ */
+export const en = {
+  appName: 'OpenRung',
+  actionConnect: 'CONNECT',
+  actionDisconnect: 'DISCONNECT',
+  readyLog: 'ready. tap connect to route through a relay.',
+  logLineFormat: (line: string) => `> ${line}`,
+  errorLineFormat: (error: string) => `! ${error}`,
+  settingsTitle: 'Settings',
+  backContentDescription: 'Back',
+  openContentDescription: 'Open',
+  languageSettingTitle: 'Language',
+  languageSettingSubtitle: 'Use system language or choose one for OpenRung.',
+  speedTestSettingTitle: 'Speed test',
+  speedTestSettingSubtitle: 'Opens fast.com in your browser',
+  speedTestRequiresConnection: 'Connect first to measure the tunnel',
+  languageSystem: 'System default',
+  languageEnglish: 'English',
+  languageSimplifiedChinese: 'Simplified Chinese',
+  languageTraditionalChinese: 'Traditional Chinese',
+  languagePersian: 'Persian',
+  languageRussian: 'Russian',
+  languageArabic: 'Arabic',
+  languageTurkish: 'Turkish',
+  languageVietnamese: 'Vietnamese',
+  languageBurmese: 'Burmese',
+  statusDisconnected: 'Disconnected',
+  statusPreparing: 'Preparing VPN',
+  statusConnecting: 'Connecting',
+  statusConnected: 'Connected',
+  statusDisconnecting: 'Disconnecting',
+  statusFailed: 'Failed',
+  mapContentDescription:
+    'Map of available exit nodes across the Asia-Pacific region',
+  mapLoading: 'locating available exit nodes…',
+  mapFailed: "couldn't load exit nodes — tap to retry",
+  mapRelaysOnline: (count: number) =>
+    count === 1 ? '1 relay online' : `${count} relays online`,
+  mapNoNodes: 'no exit nodes available right now',
+  recentsLabel: 'Recents',
+  viewToggleMap: 'Map',
+  viewToggleList: 'List',
+  listContentDescription: 'List of available exit nodes',
+  listRelayCount: (count: number) =>
+    count === 1 ? '1 relay' : `${count} relays`,
+  debugSettingTitle: 'Debug',
+  debugSettingSubtitle: 'Connection console and diagnostics.',
+  debugTitle: 'Debug console',
+  licensesSettingTitle: 'Open-source licenses',
+  licensesSettingSubtitle: 'Licenses and attribution for bundled software.',
+  licensesTitle: 'Open-source licenses',
+  licensesIntro:
+    'OpenRung is free software licensed under GPL-3.0-or-later because it links sing-box. The complete corresponding source for this build is available at the link below.',
+  licensesSourceTitle: 'Source code',
+  privacyPolicyTitle: 'Privacy policy',
+  privacyPolicySubtitle:
+    'How OpenRung handles diagnostics and personal information.',
+  licensesFullTextTitle: 'Full license texts',
+  licensesFullTextSubtitle: 'GNU GPL-3.0 and third-party notices.',
+  licensesComponentsHeader: 'Components',
+  shareApkTitle: 'Share OpenRung offline',
+  shareApkSubtitle: 'Send this APK to a nearby Android phone without internet.',
+  shareApkErrorTitle: 'Unable to share OpenRung',
+  shareApkErrorBody:
+    'The APK could not be shared. Keep OpenRung open and try again.',
+  shareApkSplitInstallError:
+    'This copy was installed as multiple APK files and cannot be shared safely. Install the standalone OpenRung APK to use offline sharing.',
+  shareAppStoreTitle: 'Share OpenRung',
+  shareAppStoreSubtitle:
+    'Send the App Store link so others can install OpenRung.',
+  shareAppStoreMessage:
+    'Get OpenRung on the App Store:',
+  shareAppStoreErrorTitle: 'Unable to share OpenRung',
+  shareAppStoreErrorBody:
+    'The App Store link could not be shared. Try again.',
+
+  // --- Redesigned shell (tabs, home overlay, about) ---
+  tabHome: 'Home',
+  tabSettings: 'Settings',
+  tabAbout: 'About us',
+  homeTagline: 'relay network',
+  // Home header slogan. Each line of this value is drawn on its own line.
+  homeSlogan: 'Internet access is a right,\nnot a privilege',
+  relayAuto: 'auto select relay',
+  // iOS home-screen widget: gallery name and description. Rendered into Swift by
+  // `npm run widget:strings` together with the status/connect/disconnect labels above.
+  // The widget's disconnected face. It is narrow, so the label is broken where it should wrap:
+  // each line of this value is drawn on its own line.
+  widgetStatusDisconnected: 'Not\nconnected',
+  widgetName: 'Quick connect',
+  widgetDescription:
+    'Connect to an automatically chosen relay from your home screen.',
+  // Relay-class badge (stored natural case; upcased at render like other chrome labels).
+  relayClassOfficial: 'official',
+  relayClassVolunteer: 'volunteer',
+  settingsGeneralHeader: 'General',
+  settingsDiagnosticsHeader: 'Diagnostics',
+  aboutTitle: 'About us',
+  aboutMissionLead: 'We believe internet access is a right, not a privilege',
+  aboutMissionBody:
+    'and not a bargaining chip to be traded away by those in power. The right to information is written into who we are as human beings - and no firewall should be allowed to erase it. Yet today billions of people live behind walls built to keep information out and keep silence in, where a Google search returns 404, a question can be dangerous and curiosity ends at a blocked page.\n\nOpenRung exists to change that.\n\nWe are building a ladder over those walls. Ordinary people around the world share their connections so that someone on the other side of a firewall can reach the open internet.\n\nInformation is power - and that power belongs to us, and not to those who would take it from us.',
+  aboutSupportHeader: 'Support us',
+  donateTitle: 'Donate',
+  donateSubtitle:
+    'Help keep the ladder standing. Donations go to the OpenRung Foundation.',
+  aboutLegalHeader: 'Legal',
+  aboutFollowHeader: 'Follow us',
+
+  // --- Split tunneling (settings row + screen + Android app picker) ---
+  splitTunnelSettingTitle: 'Split tunneling',
+  splitTunnelSettingSubtitleOn: 'On — selected traffic bypasses the relay.',
+  splitTunnelSettingSubtitleOff: 'Off — all traffic goes through the relay.',
+  splitTunnelHeader: 'Split tunneling',
+  splitTunnelMasterTitle: 'Split tunneling',
+  splitTunnelMasterSubtitle: 'Send selected traffic outside the relay tunnel.',
+  splitTunnelBypassHeader: 'Bypass',
+  splitTunnelLanTitle: 'Local network',
+  splitTunnelLanSubtitle: 'Reach printers, TVs and other LAN devices directly.',
+  splitTunnelIranTitle: 'Iranian sites & apps',
+  splitTunnelIranSubtitle: 'Route Iranian services directly, at full speed.',
+  splitTunnelChinaTitle: 'Chinese sites & apps',
+  splitTunnelChinaSubtitle: 'Route Chinese services directly, at full speed.',
+  splitTunnelAppsHeader: 'Apps',
+  splitTunnelAppsTitle: 'Bypassed apps',
+  splitTunnelAppsSubtitle: (count: number) =>
+    count === 1 ? '1 app skips the VPN.' : `${count} apps skip the VPN.`,
+  splitTunnelAppPickerTitle: 'Bypassed apps',
+  splitTunnelAppPickerLoading: 'loading installed apps…',
+  splitTunnelAppPickerEmpty: 'no launchable apps found.',
+  splitTunnelAppPickerClose: 'CLOSE',
+  splitTunnelApplyHint:
+    'changes apply immediately; the tunnel reconnects for a few seconds.',
+  // Two variants because the APPS section is Android-only: on iOS the footer must not mention a
+  // bypassed-apps list the user cannot see.
+  splitTunnelResetHint:
+    'the Iran and China presets reset when you restart the app.',
+  splitTunnelResetHintWithApps:
+    'the Iran and China presets reset when you restart the app; bypassed apps are kept.',
+
+  // --- In-app update check (manifest banner / blocking screen / broadcast notice) ---
+  updateRequiredTitle: 'Update required',
+  updateRequiredBody:
+    'This version of OpenRung can no longer connect to the relay network. Install the latest release to keep going.',
+  updateVersionTransition: (current: string, latest: string) =>
+    `v${current} -> v${latest}`,
+  updateActionNow: 'UPDATE',
+  updateActionLater: 'Later',
+  updateContinueAnyway: 'Continue anyway',
+  updateBannerTitle: 'Update available',
+  updateBannerBody: (latest: string) =>
+    `Version ${latest} includes important fixes. Update when you can.`,
+  updateSettingTitle: 'Update available',
+  updateSettingSubtitle: (current: string, latest: string) =>
+    `You have v${current}; v${latest} is out. Tap to get it.`,
+  noticeDismiss: 'Dismiss',
+  noticeLearnMore: 'Learn more',
+  // Replaces the native lastError when lastErrorCode is 'access_denied' (see nativeErrorText).
+  errorAccessDenied:
+    'Access for this device has been disabled, so it cannot connect. Contact OpenRung support.',
+  // Replaces the native lastError when lastErrorCode is 'enrollment_refused' (see nativeErrorText).
+  errorEnrollmentRefused:
+    'Registration failed. Disconnect other VPNs and retry.',
+  // Home-screen warning when the device clock looks wrong (see AppState.directoryClockSkew);
+  // the body also replaces the native lastError when lastErrorCode is 'clock_skew'.
+  clockWarningTitle: "Check your device's date and time",
+  clockWarningBody:
+    "This device's date and time look incorrect, which can stop OpenRung from connecting. Turn on automatic date and time in your device settings, then try again.",
+  clockWarningRetry: 'Try again',
+  // Desktop client only: the local proxy rows in Settings (DesktopProxySection).
+  desktopProxyHeader: 'Local proxy',
+  desktopProxyEndpointTitle: 'Endpoint',
+  desktopProxyEndpointConnected: (endpoint: string) => `${endpoint} · available now`,
+  desktopProxyEndpointIdle: (endpoint: string) => `${endpoint} · available while connected`,
+  desktopProxyPreparing: 'Preparing the local proxy endpoint…',
+  desktopProxyPersistenceTitle: 'Endpoint persistence',
+  desktopShellIntegrationTitle: 'Shell integration',
+  desktopShellEnableTitle: 'Enable in this shell',
+  desktopShellEnableSubtitle: 'Preserves existing proxy values and unset state.',
+  desktopShellEnableRequiresConnection: 'Connect OpenRung before enabling this shell.',
+  desktopShellRestoreTitle: 'Restore this shell',
+  desktopShellRestoreSubtitle: 'Run after disconnect, failure, quit, or crash.',
+  // Desktop client only: the capture-mode switch in Settings (DesktopTunnelModeSection).
+  desktopTunModeTitle: 'TUN mode',
+  desktopTunModeSubtitleOff: 'Off. Only apps that use the system proxy go through OpenRung.',
+  desktopTunModeSubtitleOn: 'On. All traffic from this device goes through OpenRung.',
+  desktopTunModeRestartNote: 'Turning it on restarts OpenRung with administrator rights.',
+  desktopTunModeRequiresDisconnect: 'Disconnect to change the mode.',
+  actionCopy: 'Copy',
+  actionCopied: 'Copied',
+};
+
+export type Strings = typeof en;

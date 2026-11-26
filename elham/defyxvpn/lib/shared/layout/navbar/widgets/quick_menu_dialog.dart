@@ -1,0 +1,241 @@
+import 'package:defyx_vpn/core/theme/app_icons.dart';
+import 'package:defyx_vpn/shared/layout/navbar/widgets/custom_webview_screen.dart';
+import 'package:defyx_vpn/shared/layout/navbar/widgets/introduction_dialog.dart';
+import 'package:defyx_vpn/shared/layout/navbar/widgets/quick_menu_item.dart';
+import 'package:defyx_vpn/shared/layout/navbar/widgets/social_icon_button.dart';
+import 'package:flutter/cupertino.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_screenutil/flutter_screenutil.dart';
+import 'package:package_info_plus/package_info_plus.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'package:defyx_vpn/l10n/app_localizations.dart';
+
+class QuickMenuDialog extends StatefulWidget {
+  const QuickMenuDialog({super.key});
+
+  @override
+  State<QuickMenuDialog> createState() => _QuickMenuDialogState();
+}
+
+class _QuickMenuDialogState extends State<QuickMenuDialog> {
+  String _version = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _loadVersion();
+  }
+
+  Future<void> _loadVersion() async {
+    final packageInfo = await PackageInfo.fromPlatform();
+    setState(() {
+      _version = '${packageInfo.version}+${packageInfo.buildNumber}';
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
+
+    return SafeArea(
+      child: Padding(
+        padding: EdgeInsets.only(bottom: 20.h),
+        child: Stack(
+          children: [
+            Positioned.fill(
+              child: GestureDetector(
+                onTap: () => Navigator.of(context).pop(),
+                child: Container(color: Colors.transparent),
+              ),
+            ),
+            Positioned(
+              bottom: 90.h,
+              right: 24.w,
+              child: Material(
+                borderRadius: BorderRadius.circular(12.r),
+                color: const Color(0xFFd1d1d1),
+                child: SizedBox(
+                  width: 230.w,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      QuickMenuItem(
+                        topBorderRadius: true,
+                        title: l10n.introduction,
+                        onTap: () {
+                          Navigator.of(context).pop();
+                          showCupertinoDialog(
+                            context: context,
+                            barrierDismissible: true,
+                            builder: (ctx) => const IntroductionDialog(),
+                          );
+                        },
+                      ),
+                      Divider(
+                        height: 1.h,
+                        thickness: 1,
+                        color: const Color(0x8080808C),
+                      ),
+                      QuickMenuItem(
+                        title: l10n.privacyPolicy,
+                        onTap: () {
+                          Navigator.of(context).pop();
+                          Navigator.of(context).push(
+                            MaterialPageRoute(
+                              builder: (context) => CustomWebViewScreen(
+                                url: 'https://defyxvpn.com/privacy-policy',
+                                title: l10n.privacyPolicy,
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                      Divider(
+                        height: 1.h,
+                        thickness: 1,
+                        color: const Color(0x8080808C),
+                      ),
+                      QuickMenuItem(
+                        title: l10n.termsAndConditions,
+                        onTap: () {
+                          Navigator.of(context).pop();
+                          Navigator.of(context).push(
+                            MaterialPageRoute(
+                              builder: (context) => CustomWebViewScreen(
+                                url:
+                                    'https://defyxvpn.com/terms-and-conditions',
+                                title: l10n.termsAndConditions,
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                      Divider(
+                        height: 1.h,
+                        thickness: 1,
+                        color: const Color(0x8080808C),
+                      ),
+                      SizedBox(
+                        height: 44,
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                          children: [
+                            SocialIconButton(
+                              iconPath: AppIcons.telegramPath,
+                              url: 'https://t.me/defyxvpn',
+                              iconWidth: 17.w,
+                              iconHeight: 17.w,
+                            ),
+                            SocialIconButton(
+                              iconPath: AppIcons.instagramPath,
+                              url: 'https://instagram.com/defyxvpn',
+                              iconWidth: 24.w,
+                              iconHeight: 24.w,
+                            ),
+                            SocialIconButton(
+                              iconPath: AppIcons.xPath,
+                              url: 'https://x.com/defyxvpn',
+                              iconWidth: 20.w,
+                              iconHeight: 20.w,
+                            ),
+                            SocialIconButton(
+                              iconPath: AppIcons.facebookPath,
+                              url:
+                                  'https://www.facebook.com/profile.php?id=61584237212686',
+                              enable: true,
+                            ),
+                            SocialIconButton(
+                              iconPath: AppIcons.websitePath,
+                              url: 'https://defyxvpn.com',
+                              iconWidth: 20.w,
+                              iconHeight: 20.w,
+                            ),
+                          ],
+                        ),
+                      ),
+                      Divider(
+                        height: 1.h,
+                        thickness: 1,
+                        color: const Color(0x8080808C),
+                      ),
+                      QuickMenuItem(
+                        title: l10n.marketplace,
+                        leadingIcon: AppIcons.shop(
+                          width: 18.w,
+                          height: 18.w,
+                          colorFilter: const ColorFilter.mode(
+                            Colors.black,
+                            BlendMode.srcIn,
+                          ),
+                        ),
+                        onTap: () async {
+                          Navigator.of(context).pop();
+                          final uri = Uri.parse('https://market.defyxvpn.com');
+                          await launchUrl(
+                            uri,
+                            mode: LaunchMode.externalApplication,
+                          );
+                        },
+                      ),
+                      Divider(
+                        height: 1.h,
+                        thickness: 1,
+                        color: const Color(0x8080808C),
+                      ),
+                      QuickMenuItem(
+                        title: l10n.telegramBot,
+                        leadingIcon: AppIcons.telegramBot(
+                          width: 18.w,
+                          height: 18.w,
+                        ),
+                        onTap: () async {
+                          Navigator.of(context).pop();
+                          final uri = Uri.parse('https://t.me/DefyxVPN_bot');
+                          await launchUrl(
+                            uri,
+                            mode: LaunchMode.externalApplication,
+                          );
+                        },
+                      ),
+                      Divider(
+                        height: 1.h,
+                        thickness: 1,
+                        color: const Color(0x8080808C),
+                      ),
+                      Container(
+                        height: 44,
+                        padding: EdgeInsets.symmetric(horizontal: 16.w),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Text(
+                              '© DEFYX',
+                              style: TextStyle(
+                                fontSize: 17.sp,
+                                color: const Color(0xff747474),
+                                fontWeight: FontWeight.w500,
+                              ),
+                            ),
+                            Text(
+                              _version,
+                              style: TextStyle(
+                                fontSize: 14.sp,
+                                color: const Color(0xff141414),
+                                fontWeight: FontWeight.w400,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}

@@ -1,0 +1,597 @@
+# OpenRung Broker
+
+The broker is the **control plane**: it matches clients with healthy relays and
+records operational telemetry. It never carries user traffic and never holds any
+Reality key — it only serves the relay directory (`GET /api/v1/relays`), accepts
+relay registrations/heartbeats, optionally issues relay- and front-bound WSS
+tickets, ingests client telemetry, and (optionally) serves a protected telemetry
+dashboard.
+
+Because its traffic is tiny (control-plane only), the broker can run anywhere —
+unlike relay hubs, egress cost is not a concern. In production it is typically
+fronted by Cloudflare with a direct-IP origin fallback on `:8080`.
+
+## Quick start
+
+```sh
+install -m 0600 .env.example .env  # edit: signing seeds, token/anonymous, dashboard, store
+docker compose up -d --build
+docker compose logs -f
+```
+
+The broker listens on `:8080` (host networking). Point hubs and relay runtimes
+at it with `OPENRUNG_BROKER_URL`, and check it:
+
+```sh
+curl http://localhost:8080/healthz
+curl http://localhost:8080/api/v1/relays
+```
+
+### Broker releases and build identity
+
+The broker is versioned independently in `cmd/broker/VERSION`. Release tags use
+`broker-vX.Y.Z` and must match that file; the image workflow publishes the clean
+`X.Y.Z` image tag. Builds from `main` include the source commit in their
+development version. Run `broker --version` to inspect an executable; startup
+logs also include the version and full revision.
+
+Broker versions do not determine relay or client compatibility. Those contracts
+remain in the versioned HTTP API, relay tunnel/punch protocol versions, and
+capability negotiation.
+
+## Deploy to a cloud host
+
+The Foundation's provisioning helpers live in the private `openrung/ops`
+repository. Any host that runs the image under the [container hardening](#container-hardening)
+flags below, with a root-owned mode-`0600` env file, is equivalent.
+
+> **GHCR package visibility:** the first time the broker image is published, the
+> GHCR package defaults to **private**. Make it public once: GitHub → org
+> **Packages** → `openrung-broker` → *Package settings* → *Change visibility* →
+> *Public*. (Or have the host `docker login ghcr.io`.)
+
+## ⚠️ Auth: the broker fails closed
+
+The broker **refuses to start without a registration token** so that not just
+anyone can register a relay into the directory clients route their VPN traffic
+through. You must either:
+
+- set `OPENRUNG_VOLUNTEER_TOKEN` to a long random string (shared with your hubs
+  and volunteer-run relays), **or**
+- explicitly opt into an open, unauthenticated broker with
+  `OPENRUNG_ALLOW_ANONYMOUS_REGISTRATION=true` (the `.env.example` default).
+  OpenRung's public network intentionally runs open so any volunteer can
+  contribute a relay without a shared secret.
+
+A token, when set, takes precedence and enforces auth; the anonymous flag then
+becomes a no-op. Generate a token with `openssl rand -hex 32`. Send it only over
+TLS — see Cloudflare below.
+
+Keep whichever auth line you choose **in the env file** (`.env` / the
+`--env-file` broker.env), never as an ad-hoc `docker run -e
+OPENRUNG_ALLOW_ANONYMOUS_REGISTRATION=true`. Because the broker fails closed at
+startup, a redeploy that forgets an inline `-e` flag crash-loops; keeping the
+opt-in in the env file means it travels with every `--env-file` recreate.
+
+Separately, `OPENRUNG_FOUNDATION_TOKEN` (optional) authorizes registrations
+that claim `node_class: foundation`, marking relays the foundation operates
+itself apart from community volunteers in the signed relay list. It works with
+either auth mode above, must differ from `OPENRUNG_VOLUNTEER_TOKEN` (the
+broker refuses to start otherwise), and belongs only on foundation-operated
+relays. Heartbeats for a foundation relay must also present this token; the
+broker refuses to extend the lease otherwise. At the origin store, an unattended
+foundation row therefore disappears after one lease TTL. That is not an instant
+client-visible revocation guarantee: an ordinary API directory has a 30-minute
+signed freshness window, the Worker may serve its last healthy response for up
+to 15 minutes (still bounded by that response's `not_after`). Clients and their
+local caches must enforce each
+snapshot's `not_after` with only the protocol's bounded clock-skew allowance;
+operators should treat `node_class` as provenance captured when it was signed.
+
+Treat the Foundation token like the relay-list signing seed. Never place it in
+cloud-init/user-data, provider metadata, an inline `docker -e` argument, or a
+shell command that tracing or history can retain. Transfer it only after boot
+over an authenticated channel, store it in the root-owned mode-`0600` broker env
+file, then **recreate** the container with `--env-file` (a Docker restart does
+not reload a changed env file). The provisioning helpers intentionally reject
+`OPENRUNG_FOUNDATION_TOKEN` for this reason.
+
+> **Rolling back past `node_class`:** a broker image that predates the
+> `node_class` column does not guard registrations or heartbeats, so it can
+> overwrite a foundation relay's `host:port` row — replacing its id, keys, and
+> endpoint with one controlled by an attacker or volunteer-run relay — while
+> leaving `node_class` stuck at `'foundation'`. An upgraded broker would then
+> sign that forged descriptor as Foundation.
+>
+> **Never run pre-`node_class` and `node_class`-aware broker binaries against
+> the same database while any foundation row exists** — a mixed-version fleet
+> (a partial rollback, or a blue/green deploy straddling this change) lets the
+> old writer poison rows that the new writer signs. Keep the whole fleet on one
+> side of this change.
+>
+> To roll back and later re-upgrade safely, order it strictly so no
+> `node_class`-aware broker ever serves a row an old writer could have touched:
+>
+> 1. **Roll back:** stop every `node_class`-aware broker first, *then* start the
+>    old image. (The forged-class window exists only while both run.)
+> 2. **Re-upgrade:** stop and drain every old (pre-`node_class`) broker so
+>    nothing can still write the poisoned state — confirm none remain.
+> 3. With every broker still stopped (the new one not yet started), **delete**
+>    all descriptors so every relay is forced to re-attest:
+>
+>    ```sql
+>    DELETE FROM relay_descriptors;
+>    ```
+> 4. Only after that `DELETE` commits, start the new broker. Each relay's next
+>    heartbeat now returns `404`, so it re-registers and re-attests: foundation
+>    relays present the foundation token and are re-signed as `foundation`;
+>    every other relay registers as `volunteer`.
+>
+> Use `DELETE`, not `UPDATE ... SET node_class = 'volunteer'`. An `UPDATE` clears
+> the column, but heartbeats never rewrite `node_class` — a live foundation relay
+> would keep heartbeating its downgraded row and never regain its class until it
+> happened to restart. Deleting forces the `404` → re-register → re-attest cycle
+> across the whole fleet, and deleting *before* the new broker starts guarantees
+> it never signs a stale or forged `foundation` label.
+>
+> **Old brokers do not understand the foundation token.** A pre-`node_class`
+> broker knows only its single `OPENRUNG_VOLUNTEER_TOKEN`, so while the old image
+> runs, a foundation relay's bearer (`OPENRUNG_FOUNDATION_TOKEN`) is not a
+> privileged credential to it: a token-gated old broker rejects it (`401`, since
+> it differs from the volunteer token), and an anonymous old broker accepts it
+> but its insert leaves `node_class` at the column default (`volunteer`).
+> Foundation relays are therefore rejected or silently downgraded for the whole
+> rollback window; the re-upgrade `DELETE` above is what restores them.
+
+## Relay-list signing
+
+Every 2xx relay-list response (`/api/v1/relays` and the operational
+`/admin/api/relays/inventory`) is signed with an Ed25519 key — a detached signature over the exact body bytes in
+the `X-OpenRung-Relays-Signature` header — so clients can verify the directory
+over non-TLS channels (the direct-IP fallback). The broker
+**refuses to start** without `OPENRUNG_RELAY_SIGNING_KEY` (standard base64 of
+the 32-byte seed): serving unsigned lists would keep healthz green while every
+verifying client rejected discovery. Generate a seed with
+`openssl rand -base64 32`, keep it in the env file (root-owned, `0600`), and
+redeploy with `--env-file` — never hand-typed inline `-e` vars. Clients pin the
+matching public keys, so production must run the operator's active seed; the
+startup log line `relay list signing enabled key_id=…` and the `signing_key_id`
+field on `/healthz` confirm which key is live.
+
+## Client user authentication
+
+Client enrollment and authentication (`POST /api/v1/users/challenge` and
+`POST /api/v1/users/auth`, see `docs/api.md`) are optional and switch on with
+`OPENRUNG_USER_TOKEN_KEY`: the standard base64 of a 32-byte HMAC key that
+signs the access tokens the broker hands authenticated clients. Generate it
+like the other seeds and keep it in the root-owned mode-`0600` env file:
+
+```sh
+openssl rand -base64 32
+```
+
+Only the broker ever reads the key, so it is never handed to relays or
+clients. Rotating it invalidates every outstanding access token at once;
+clients then re-authenticate on their next connect. Do not reuse any other
+broker credential for it; startup refuses a value shared with
+`OPENRUNG_API_TOKEN`. With the key set, the operational user routes
+(`GET /admin/api/users/{id}`, `PUT /admin/api/users/{id}/status`) also
+appear when `OPENRUNG_API_TOKEN` is configured; disabling a user there is the
+revocation lever. The user tables live in the relay database
+(`OPENRUNG_RELAY_STORE=postgres`); the memory store also supports them but
+forgets every user on restart.
+
+Relays that register with the `access_leases` capability (standalone relay
+0.3.0 and later, and the volunteer desktop app on the same engine, in direct
+mode with credential rotation) synchronise broker-issued per-client
+credentials through `GET /api/v1/relays/{id}/leases` and its `ack`
+endpoint; see `docs/api.md`. Those routes need no extra configuration — they
+authenticate with each registration's lease token — and `GET
+/admin/api/leases/{id}` resolves a relay-log label to its user once
+`OPENRUNG_API_TOKEN` is set. `OPENRUNG_ACCESS_LEASE_TTL`,
+`OPENRUNG_MAX_LEASES_PER_USER` and `OPENRUNG_MAX_LEASES_PER_RELAY` tune the
+lease lifetime and caps. Deploy the broker before updating relays: the
+capability is recorded at registration, and a relay only starts its syncer
+when the broker echoes it.
+
+### Datacenter source classification
+
+With user authentication enabled, the broker can refuse to enroll **new**
+user identities from datacenter and hosting networks (`403` with code
+`datacenter_source`, see `docs/api.md`). An identity that already exists
+authenticates from any network. Classification is off until both data files
+are configured, and it never makes a network request: it is a lookup in two
+local files that a host-side refresh job keeps current.
+
+| File | Source | Licence |
+| --- | --- | --- |
+| `ip2asn.tsv` — IP range → ASN, IPv4 and IPv6 | [iptoasn.com](https://iptoasn.com/) `ip2asn-combined.tsv.gz` (updated hourly upstream) | Public Domain Dedication and License (PDDL) |
+| `datacenter-asns.txt` — datacenter/hosting ASNs | [bad-asn-list](https://github.com/brianhama/bad-asn-list), a published list of cloud, managed hosting and colocation ASNs, plus the optional local file `datacenter-asns.local` | MIT |
+
+Neither file is committed to this repository. The list's format is one ASN
+per line (`AS64500` or `64500`, with anything after the number ignored, so
+both the CSV and `AS… # comment` styles work); put operator additions, one per
+line, in `datacenter-asns.local` next to the generated files. Any other
+source that produces the same two formats works too
+(`OPENRUNG_SOURCE_ASN_URL`, `OPENRUNG_DATACENTER_ASN_URL`).
+
+Generate both files into `/var/lib/openrung-source` on the broker host with a
+daily job (the Foundation's refresh helper lives in the private `openrung/ops`
+repository), then mount the directory read-only into the broker container
+(`-v /var/lib/openrung-source:/var/lib/openrung-source:ro`; the compose file
+has the line commented out) and add to the env file:
+
+```sh
+OPENRUNG_SOURCE_ASN_DB=/var/lib/openrung-source/ip2asn.tsv
+OPENRUNG_DATACENTER_ASN_LIST=/var/lib/openrung-source/datacenter-asns.txt
+#OPENRUNG_SOURCE_ASN_MAX_AGE=168h
+#OPENRUNG_ENROLLMENT_EXEMPT_CIDRS=
+```
+
+A refresh job should validate both downloads before replacing either file: every
+table line must hold two addresses of one family in ascending order and a
+32-bit ASN (it refuses anything the broker's loader would reject), and both
+files must meet minimum row and ASN counts. Files are replaced atomically and
+only when both pass, so a failed refresh leaves the previous data in place. The broker re-reads the files
+within a minute of a change, logs the number of datacenter ASNs and ranges it
+loaded, and keeps its previous data if a new file fails to parse. The table's
+modification time dates the data: once it is older than
+`OPENRUNG_SOURCE_ASN_MAX_AGE` (default 7 days), or while no data has loaded,
+new enrollments get a retryable `503` (`Retry-After: 300`, code
+`source_unclassified`) and `/healthz` reports
+`"source_classification_available": false` — alert on that rather than on
+user reports. Setting only one of the two paths refuses to start.
+
+Classification needs the **real** client address: behind a front, the
+broker must see it through `OPENRUNG_TRUSTED_PROXY_CIDRS` (see Fronting with Cloudflare
+below), or every enrollment arrives from the front's own (datacenter)
+network and is refused. `OPENRUNG_ENROLLMENT_EXEMPT_CIDRS` (comma-separated)
+lists sources that are never refused, for example a test network.
+
+Refusals are counted in the ten-minute `access requests` summary line
+(`enroll_refused_datacenter`, `enroll_unclassified`); individual requests
+are not logged.
+
+## WSS ticket signing and relay public-key handoff
+
+WSS ticket signing is optional and uses a dedicated Ed25519 key. Set
+`OPENRUNG_WSS_TICKET_SIGNING_SEED` to standard base64 of a 32-byte seed in the
+root-owned mode-`0600` broker env file:
+
+```sh
+openssl rand -base64 32
+```
+
+Do not reuse `OPENRUNG_RELAY_SIGNING_KEY`; relay-list and ticket keys have
+different trust and rotation lifecycles. Recreate the broker container with
+`--env-file` after adding the seed. When the variable is unset, the broker does
+not register `POST /api/v1/wss/tickets` and rejects registrations that advertise
+`wss_fronts`; ordinary direct Reality discovery and connections are unchanged.
+
+Only the broker receives the private seed. Print the active public verification
+key from the configured compose environment with:
+
+```sh
+docker compose run --rm broker -print-wss-ticket-public-key
+# <16-hex-key-id>=<standard-base64-32-byte-public-key>
+```
+
+Copy that complete `key-id=public-key` entry to
+`OPENRUNG_WSS_TICKET_PUBLIC_KEYS` on every eligible relay-local sidecar. Never
+copy the seed. Each sidecar also has its own configured relay ID and fixed
+loopback Reality target, so possession of a valid ticket for one relay cannot
+authorize another. `/healthz` includes `wss_ticket_key_id` while issuance is
+enabled; compare it with the printed ID during deployment checks. The broker
+remains a control plane and never receives the WebSocket or Reality byte stream.
+
+Rotate with overlap:
+
+1. Derive the next seed's public key in a secured staging environment and add
+   it alongside the current public key on every eligible relay sidecar.
+2. After sidecar rollout completes, switch every broker issuer to the next
+   private seed. Brokers sign new tickets with only that current key.
+3. Keep the previous public key accepted until the maximum ticket lifetime,
+   allowed clock skew, and replay-retention window have elapsed, then remove it.
+
+Do not clear sidecar replay state during rotation. A load-balanced broker fleet
+may briefly contain both issuers only after every affected sidecar accepts both
+public keys. The provisioning helpers do not generate or install the WSS
+ticket seed; transfer it post-boot into `/etc/openrung/broker.env` over an
+authenticated channel, then recreate the container with the existing hardened
+flags and `--env-file`. See the [broker API](../../docs/api.md#issue-wss-session-ticket)
+for the wire contract and the [relay README](../relay/README.md#per-relay-wss-sidecar-foundation-only)
+for sidecar and origin deployment.
+
+## Telemetry persistence
+
+By default (`OPENRUNG_TELEMETRY_STORE=jsonl`) the broker appends client
+telemetry to a JSONL file and periodically compacts it in place (7-day
+retention). The image points `OPENRUNG_TELEMETRY_FILE` at
+`/var/lib/openrung/telemetry.jsonl` on a persistent named volume, so dashboard
+history survives restarts. The root filesystem is otherwise read-only.
+
+- **Named volume (default):** works out of the box — Docker gives the fresh
+  volume the image dir's `openrung` ownership.
+- **Bind mount instead?** `chown` the host directory to the container's
+  `openrung` uid first, or the broker will fail to open the telemetry file.
+- **Don't need history?** Point `OPENRUNG_TELEMETRY_FILE` at `/tmp/…` (tmpfs) and
+  drop the volume.
+
+For production, set `OPENRUNG_TELEMETRY_STORE=postgres` to write events to a
+partitioned `telemetry_events` table (one partition per day, created
+automatically) instead of the JSONL file. It uses
+`OPENRUNG_TELEMETRY_DATABASE_URL`, falling back to
+`OPENRUNG_RELAY_DATABASE_URL` so a broker already on the Postgres relay store
+needs no extra configuration; the broker refuses to start if neither is set.
+In postgres mode the admin dashboard aggregates in SQL, bounded by the selected
+time window, so dashboard cost and broker memory stay flat as event history
+grows. Event partitions are dropped after 7 days. The dashboard rollup the
+24-hour and longer windows read (`telemetry_sessions`, one row per session, and
+`telemetry_event_counts`, hourly counts) is kept for 31 days so the 14- and
+31-day windows have history; the hourly prune blanks the client IP fields, city,
+ISP, organization, and ASN on rollup sessions older than 7 days, so IP-level
+data is never kept longer than the raw events. A broker older than 0.9.3 prunes
+the rollup back to 7 days on its next maintenance pass, and the extra rows are
+harmless to it. Brokers 0.9.3 through 0.15.0 create a BRIN index on
+`telemetry_sessions.last_seen_at` at startup; later versions drop it, so
+rolling back to one of them only brings the index back. High-volume `application_connection` events
+are not stored as rows in either store: ingestion folds them into an hourly
+per-application count (`telemetry_app_counts` in postgres mode), summing the
+bounded optional `measurements.connection_count` used by aggregating clients
+and defaulting to one for legacy or out-of-range integer values. One
+application can contribute at most 100,000 represented flows per batch. The
+aggregate feeds the dashboard's top-applications panel; per-event destination
+and client metadata is discarded.
+
+## Relay reachability probe
+
+The broker checks that every direct-transport relay's advertised
+`public_host:public_port` accepts inbound connections with a bounded TCP
+connect from the broker host. At registration the check gates admission: a
+relay whose port cannot be reached is refused (`422`, body `public endpoint
+unreachable: ...`, no `Retry-After` so the relay's quick startup retries log
+the refusal within seconds), nothing is stored, and the relay's own retries
+re-run the check until the port opens; the relay logs the
+refusal verbatim, which is what `volunteer-up.sh` reads to tell its operator
+which firewall to open. A relay that registered reachable is re-checked on a
+heartbeat once its result is five minutes old, and one whose latest check
+failed is withheld from the public list and access answers until a check
+succeeds, staying registered and visible in the inventory and the relays
+page with `reachable: false`. It is on by default:
+
+```sh
+OPENRUNG_RELAY_PROBE=off           # disable; every relay is listed on its lease alone
+OPENRUNG_RELAY_PROBE_TIMEOUT=5s    # time limit for one probe
+OPENRUNG_RELAY_PROBE_INTERVAL=5m   # re-probe on heartbeat once the result is this old
+```
+
+The probe runs from the broker host's own network, so the host needs egress to
+every address family the fleet advertises; a family the host has no route for
+is skipped (the relay keeps its previous result) rather than counted as
+unreachable. Only public unicast addresses are ever dialled — never loopback,
+private, link-local or the broker host's own — so an anonymous registration
+cannot use the broker to test ports near it. After deploying a broker, check
+the inventory for `"reachable": false` rows before assuming a relay is at
+fault. Switching the probe off ignores stored results immediately, so it is
+also the way to relist every withheld relay at once.
+
+## Telemetry dashboard
+
+Set `OPENRUNG_DASHBOARD_TOKEN` to a long random string to enable the protected
+dashboard at `/admin/dashboard`. When unset, the dashboard and its data API
+return 404. Always serve it over HTTPS so the admin session cookie is protected.
+
+## Operational relay inventory
+
+Set `OPENRUNG_API_TOKEN` to enable the machine-to-machine fleet endpoint:
+
+```sh
+curl -fsS -H "Authorization: Bearer $OPENRUNG_API_TOKEN" \
+  https://broker-origin.openrung.org/admin/api/relays/inventory
+```
+
+Note the hostname: the **origin**, not the public `broker.openrung.org` front.
+That front is a Cloudflare Worker (`deploy/broker-proxy`) which terminates TLS
+for every client and passes unknown paths through with no timeout — no reason
+to disclose a privileged operator credential to an edge, or to hold an edge
+connection open for a full-fleet read, when the tooling holding this token
+already reaches the origin directly.
+
+It returns every currently active relay — never the ranked, truncated page
+clients receive — in stable relay-ID order, signed like the relay list under
+its own `"inventory"` channel. Use it for fleet audits and deployment checks,
+where "did this relay come back?" must not be confounded with "did it rank into
+the page?". When the variable is unset the route is not registered and returns
+404.
+
+Generate the token independently of every other credential
+(`openssl rand -hex 32`): the broker refuses to start when it equals the
+volunteer, foundation, or dashboard token, or either signing seed. Like
+`OPENRUNG_FOUNDATION_TOKEN` it is a secret the deploy helpers deliberately do
+not accept — install it post-boot in `/etc/openrung/broker.env` and recreate
+the container with `--env-file`.
+
+## Relay ranking weights
+
+Every `GET /api/v1/relays` page is ranked from the last 30 minutes of client
+telemetry. A **ranking weight** is the operator's dial on top of that: a
+per-relay multiplier in `[0, 1]`, default `1.0`, applied last to the relay's
+score. Use it to shift load between relays — for example to balance egress
+across providers approaching their transfer allowance — without touching the
+relay itself:
+
+- `1.0` (default) leaves the telemetry ranking untouched.
+- `0.5` halves the relay's score, so it drops below comparable relays and
+  receives proportionally fewer clients.
+- `0` **drains** the relay: it sorts last on every page but stays listed, so a
+  client with no other reachable candidate can still use it. A drained
+  WSS-capable relay is also never pulled back into a short page by the WSS
+  candidate reservation; any weight above `0` keeps that reservation, since the
+  WSS slot is a functional need rather than a share of load.
+
+Weights key on the identity-derived relay ID (the `id` in the inventory), so a
+weight survives the relay's lease expiring, `docker restart`, and
+re-registration from a new endpoint; it is never pruned with descriptors. The
+Postgres store keeps them in the `relay_ranking_weights` table (created by the
+idempotent schema on startup); the in-memory store loses them on broker restart
+along with everything else.
+
+The same `OPENRUNG_API_TOKEN` that enables the inventory enables three
+token-gated endpoints beside it, sharing its rate limit and `no-store` posture:
+
+```http
+GET    /admin/api/relays/weights          # every stored override, relay-ID order
+PUT    /admin/api/relays/{id}/weight      # body {"weight": 0.5}; 400 outside [0, 1]
+DELETE /admin/api/relays/{id}/weight      # restore the default (idempotent)
+```
+
+Halve a relay's share of new clients, then check the fleet-wide overrides:
+
+```sh
+curl -fsS -X PUT \
+  -H "Authorization: Bearer $OPENRUNG_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"weight": 0.5}' \
+  https://broker-origin.openrung.org/admin/api/relays/relay_0123456789abcdef0123456789abcdef/weight
+# {"relay_id":"relay_0123…","weight":0.5,"previous_weight":1}
+
+curl -fsS -H "Authorization: Bearer $OPENRUNG_API_TOKEN" \
+  https://broker-origin.openrung.org/admin/api/relays/weights
+```
+
+Restore the default with `-X DELETE` on the same path. Each inventory
+descriptor also carries its effective `ranking_weight`, so a fleet audit shows
+where load has been shifted. As with the inventory, call the **origin**, not
+the public front.
+
+The admin dashboard's relays page (`/admin/dashboard/relays`) exposes the
+same dial as a **Weight** column with an inline Save/Reset control per relay,
+behind the dashboard session cookie rather than the API token (mutations must be
+same-origin, judged from the browser's `Sec-Fetch-Site` so the check also holds
+through a CDN front that rewrites `Host`); relays weighted below `1` are marked
+amber (red at `0`) so shifted load is visible at a glance.
+Every change through either door is logged at info level with the relay ID,
+old and new value, and the caller's IP:
+
+```
+INFO relay ranking weight changed relay_id=relay_0123… old_weight=1 new_weight=0.5 restored_default=false client_ip=203.0.113.9 via="operational api"
+```
+
+## Shared PostgreSQL state (optional)
+
+For safer restarts or multiple brokers behind a load balancer, use Postgres
+instead of the default in-memory store:
+
+```sh
+OPENRUNG_RELAY_STORE=postgres
+OPENRUNG_RELAY_DATABASE_URL=postgres://openrung:change-me@db:5432/openrung?sslmode=disable
+```
+
+## Fronting with Cloudflare
+
+Put the broker behind Cloudflare (or another proxy) for TLS and DDoS absorption.
+The broker trusts `CF-Connecting-IP` / `X-Forwarded-For` only from the CIDRs in
+`OPENRUNG_TRUSTED_PROXY_CIDRS` (none by default). Production fronts reach the
+broker through the local Caddy terminator, which decides the forwarded client IP
+(see [end-to-end TLS to the origin](#end-to-end-tls-to-the-origin)), so production trusts only loopback:
+`OPENRUNG_TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128`. The container uses **host
+networking** so the broker sees the real peer — do not switch it to bridge
+networking without reading the note in `docker-compose.yml`, or per-IP rate
+limiting and telemetry source IPs will all collapse onto the docker gateway.
+
+### End-to-end TLS to the origin
+
+For a front to reach the origin over HTTPS (so tokens like the Foundation
+registration token are never in cleartext on the edge → origin leg), terminate
+TLS on the broker box with a Let's Encrypt reverse proxy on `:443` that forwards
+to the broker on `:8080`. The deployed config is [`Caddyfile`](./Caddyfile):
+it forwards the viewer address to the broker only for requests that carry the
+per-front origin secret the Caddyfile names, and the production runbook (cert
+and renewal, firewall, the front's origin settings, verification, rollback) lives
+in the private `openrung/ops` repository. It is additive: the broker container
+and the plaintext `:8080` path are untouched.
+
+### Adding a front
+
+A candidate front must pass `go run ./cmd/frontcheck -url <https URL>` before it
+is added to the built-in discovery order: the check confirms, read-only, that a
+signed relay list arrives and verifies, and — for the SNI-less fronts — that the
+suppressed-SNI path reaches the same origin as an ordinary one. The
+provisioning steps for each front live in the private `openrung/ops` repository;
+the certificate tradeoff of the Azure Front Door front is documented in
+`brokerapi/azure_tls.go`.
+
+## Container hardening
+
+`docker-compose.yml` and the Foundation's provisioning helpers run the broker with a
+least-privilege container posture (verified 2026-07-13 by running the published
+image under the full flag set — it starts, serves `/healthz`, and enforces the
+read-only rootfs):
+
+- `--cap-drop ALL` — the broker binds `:8080` (≥ 1024) and never changes user or
+  mounts, so it needs no Linux capabilities.
+- `--security-opt no-new-privileges` — nothing in the image escalates via setuid
+  or file capabilities. (Unlike the relay runtime, which must **not** set this:
+  it binds 443 through a `cap_net_bind_service` file capability that
+  `no-new-privileges` would disable.)
+- `--read-only` root filesystem with `--tmpfs /tmp` — the only writable paths are
+  `/tmp` and the telemetry named volume (`jsonl` mode appends there; `postgres`
+  mode writes nothing to disk).
+
+These flags take effect **only** for a container created by the script or compose
+file. A broker recreated by hand — for example a manual `docker run` that adds an
+extra `-e` override — does not inherit them unless the flags are re-typed. Verify
+a running container and recreate it (with the full flag set and `--env-file`) if
+it has drifted:
+
+```sh
+docker inspect openrung-broker \
+  --format '{{.HostConfig.ReadonlyRootfs}} {{.HostConfig.CapDrop}} {{.HostConfig.SecurityOpt}}'
+# want: true [ALL] [no-new-privileges]
+```
+
+## Configuration
+
+| Variable                             | Required | Default                             | Purpose                                                        |
+| ------------------------------------ | -------- | ----------------------------------- | -------------------------------------------------------------- |
+| `OPENRUNG_VOLUNTEER_TOKEN`           | yes\*    | —                                   | Shared registration token (must match hubs/relay runtimes)     |
+| `OPENRUNG_ALLOW_ANONYMOUS_REGISTRATION` | yes\* | —                                   | Set `true` to run open when no token is set (\*one of these)   |
+| `OPENRUNG_FOUNDATION_TOKEN`          | no       | —                                   | Privileged token for `node_class=foundation` registrations; must differ from the volunteer token |
+| `OPENRUNG_RELAY_SIGNING_KEY`         | yes      | —                                   | Std-base64 32-byte Ed25519 seed; signs every relay-list response |
+| `OPENRUNG_WSS_TICKET_SIGNING_SEED`   | no       | —                                   | Dedicated std-base64 32-byte Ed25519 seed; enables relay/front-bound WSS tickets |
+| `OPENRUNG_USER_TOKEN_KEY`            | no       | —                                   | Dedicated std-base64 32-byte HMAC key; enables client user authentication (`/api/v1/users/*`) and the operational user routes; must differ from every other credential |
+| `OPENRUNG_ACCESS_TOKEN_TTL`          | no       | `24h`                               | Lifetime of client access tokens (`1m`–`168h`)                 |
+| `OPENRUNG_ENROLLMENT_BURST_LIMIT`    | no       | `3`                                 | New user identities per source address (IPv6: /64) per hour; negative disables |
+| `OPENRUNG_ENROLLMENT_DAILY_LIMIT`    | no       | `10`                                | New user identities per source address per 24 h; negative disables |
+| `OPENRUNG_SOURCE_ASN_DB`             | no       | —                                   | IP-to-ASN table (iptoasn TSV); with the list below, refuses new user identities from datacenter networks |
+| `OPENRUNG_DATACENTER_ASN_LIST`       | no       | —                                   | Datacenter/hosting ASN list, one per line; required with `OPENRUNG_SOURCE_ASN_DB` |
+| `OPENRUNG_SOURCE_ASN_MAX_AGE`        | no       | `168h`                              | Table age past which new enrollments get a retryable `503`     |
+| `OPENRUNG_ENROLLMENT_EXEMPT_CIDRS`   | no       | none                                | Source CIDRs never refused as datacenter sources               |
+| `OPENRUNG_ACCESS_LEASE_TTL`          | no       | `1h`                                | Lifetime of a per-client relay credential (access lease) without renewal (`1m`–`24h`) |
+| `OPENRUNG_MAX_LEASES_PER_USER`       | no       | `10`                                | Live access leases one user may hold across the fleet; the least recently renewed are revoked at the cap |
+| `OPENRUNG_MAX_LEASES_PER_RELAY`      | no       | `2000`                              | Live access leases one relay may hold; a relay at the cap is skipped by issuance |
+| `OPENRUNG_DASHBOARD_TOKEN`           | no       | —                                   | Enables the protected `/admin/dashboard` dashboard             |
+| `OPENRUNG_API_TOKEN`                 | no       | —                                   | Enables `/admin/api/relays/inventory` and the ranking-weight endpoints; must differ from every other credential |
+| `OPENRUNG_ADDR`                      | no       | `:8080`                             | HTTP listen address                                            |
+| `OPENRUNG_TRUSTED_PROXY_CIDRS`       | no       | none                                | Proxy CIDRs trusted for forwarded client IPs                   |
+| `OPENRUNG_RATE_LIMIT_<ENDPOINT>`     | no       | built in                            | Per-client budget `<rate>:<burst>` for `RELAY_LIST`, `WSS_TICKET`, `USER_AUTH`, `ACCESS`, `TELEMETRY`, `SPEED_TEST`, `RELAY_REGISTRATION` (see [API](../../docs/api.md#abuse-limits)) |
+| `OPENRUNG_RELAY_LIST_DEFAULT_LIMIT`  | no       | built in                            | Relay-list page size when a request names none                 |
+| `OPENRUNG_RELAY_LIST_MAX_LIMIT`      | no       | built in                            | Largest relay-list page a request may ask for; keep it at or above shipped clients' requests |
+| `OPENRUNG_WSS_TICKET_TTL`            | no       | built in                            | Lifetime of an issued WSS ticket (`2s`–`5m`)                   |
+| `OPENRUNG_WSS_TICKET_MAX_STREAMS`    | no       | built in                            | Stream budget of one WSS ticket (`1`–`1024`)                   |
+| `OPENRUNG_RELAY_STORE`               | no       | `memory`                            | Relay state backend: `memory` or `postgres`                    |
+| `OPENRUNG_RELAY_DATABASE_URL`        | if pg    | —                                   | PostgreSQL URL when `OPENRUNG_RELAY_STORE=postgres`            |
+| `OPENRUNG_GEOIP_ENDPOINT`            | no       | ipwho.is                            | IP-geolocation endpoint for relay city/country; `off` disables |
+| `OPENRUNG_TELEMETRY_STORE`           | no       | `jsonl`                             | Telemetry backend: `jsonl` or `postgres`                       |
+| `OPENRUNG_TELEMETRY_DATABASE_URL`    | no       | relay database URL                  | PostgreSQL URL when `OPENRUNG_TELEMETRY_STORE=postgres`        |
+| `OPENRUNG_TELEMETRY_FILE`            | no       | `/var/lib/openrung/telemetry.jsonl` | Telemetry JSONL path in `jsonl` mode (its dir must be writable) |
+
+\* The broker refuses to start unless either `OPENRUNG_VOLUNTEER_TOKEN` or
+`OPENRUNG_ALLOW_ANONYMOUS_REGISTRATION=true` is set.
+
+## Build the image directly
+
+```sh
+# from the repo root
+docker build -f deploy/broker/Dockerfile -t openrung-broker .
+```

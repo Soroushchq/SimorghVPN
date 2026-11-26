@@ -1,0 +1,163 @@
+on:
+  workflow_call:
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    outputs:
+      app_version: ${{ steps.get_version.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.47.6"
+          channel: "stable"
+          architecture: "x64"
+
+      - name: Verify Flutter version
+        run: |
+          flutter --version
+          dart --version
+          flutter doctor --verbose
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Get app version
+        id: get_version
+        uses: ./.github/actions/get-version
+
+      - name: Generate .env
+        uses: ./.github/actions/create-env
+        with:
+          secret_blob: ${{ toJson(secrets) }}
+          var_blob: ${{ toJson(vars) }}
+          os_name: "linux"
+
+      - name: Download Linux Framework
+        env:
+          GITHUB_TOKEN: ${{ secrets.DXCORE_PRIVATE_ACCESS_TOKEN }}
+        run: |
+          RELEASE_JSON=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            https://api.github.com/repos/UnboundTechCo/DXcore-private/releases/latest)
+
+          ASSET_ID=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name=="DXcore-linux.zip") | .id')
+
+          curl -L \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/octet-stream" \
+            "https://api.github.com/repos/UnboundTechCo/DXcore-private/releases/assets/$ASSET_ID" \
+            -o DXcore-linux.zip
+
+          unzip -o DXcore-linux.zip -d linux/runner
+          mv linux/runner/build/linux/* linux/runner/
+          rm -rf linux/runner/build
+          rm DXcore-linux.zip
+          ls -la linux/runner
+
+      - name: Enable Linux Desktop support
+        run: flutter config --enable-linux-desktop
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            cmake \
+            ninja-build \
+            pkg-config \
+            libgtk-3-dev \
+            liblzma-dev \
+            libayatana-appindicator3-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libsecret-1-dev \
+            libfuse2 \
+            plocate \
+            rpm
+
+      - name: Build locate database (needed by fastforge AppImage `include`)
+        run: sudo updatedb
+
+      - name: Install appimagetool
+        run: |
+          sudo wget -O /usr/local/bin/appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          sudo chmod +x /usr/local/bin/appimagetool
+
+      - name: Activate and Run FastForge Bundle Build
+        shell: bash
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          set -euo pipefail
+          dart pub global activate fastforge 0.6.12
+
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          cache = Path(os.environ.get("PUB_CACHE") or Path.home() / ".pub-cache")
+
+          def patch(file, changes):
+              source = file.read_text()
+              for old, new in changes:
+                  if new in source:
+                      continue
+                  if source.count(old) != 1:
+                      raise SystemExit(f"Unexpected source in {file}: {old!r}")
+                  source = source.replace(old, new, 1)
+              file.write_text(source)
+              print(f"Patched {file.name}")
+
+          patch(cache / "hosted/pub.dev/unified_distributor-0.2.13/lib/src/utils/default_shell_executor.dart", [
+              ("String? stdoutStr;", "String? stdoutStr = '';"),
+              ("String? stderrStr;", "String? stderrStr = '';"),
+              ("process.stdout.listen(", "final stdoutDone = process.stdout.forEach("),
+              ("process.stderr.listen(", "final stderrDone = process.stderr.forEach("),
+              ("int exitCode = await process.exitCode;",
+               "int exitCode = await process.exitCode;\n    await Future.wait([stdoutDone, stderrDone]);"),
+          ])
+
+          patch(cache / "hosted/pub.dev/flutter_app_packager-0.6.12/lib/src/makers/appimage/app_package_maker_appimage.dart", [
+              ("} catch (e) {", "} catch (e, stackTrace) {"),
+              ("throw MakeError(e.toString());",
+               "Error.throwWithStackTrace(MakeError(e.toString()), stackTrace);"),
+          ])
+
+          # RPM uses a per-build working directory; Fastforge stages files in BUILD.
+          patch(cache / "hosted/pub.dev/flutter_app_packager-0.6.12/lib/src/makers/rpm/make_rpm_config.dart", [
+              ("'%install': [",
+               "'%install': [\n            'cd \"%{_topdir}/BUILD\"',"),
+          ])
+          PY
+
+          task_pub_cache="${PUB_CACHE:-$HOME/.pub-cache}"
+          dart \
+            --packages="$task_pub_cache/global_packages/fastforge/.dart_tool/package_config.json" \
+            "$task_pub_cache/hosted/pub.dev/fastforge-0.6.12/bin/main.dart" \
+            release --name=production
+
+      - name: Rename Linux artifacts
+        run: |
+          shopt -s globstar nullglob
+
+          for file in build/**/*.deb build/**/*.rpm build/**/*.AppImage; do
+            dir=$(dirname "$file")
+            ext="${file##*.}"
+
+            mv "$file" "$dir/DefyxVPN-Linux.${ext}"
+          done
+
+      - name: Upload All Linux Distribution Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-release
+          path: |
+            build/**/*.AppImage
+            build/**/*.deb
+            build/**/*.rpm
+          if-no-files-found: error

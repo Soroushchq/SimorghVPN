@@ -1,0 +1,180 @@
+import type { Strings } from './en';
+
+/** Ported from `res/values-zh-rTW/strings.xml`; missing keys fall back to English. */
+export const zhTW: Partial<Strings> = {
+  appName: 'OpenRung',
+  actionConnect: '連線',
+  actionDisconnect: '中斷連線',
+  readyLog: '就緒。點選「連線」即可透過中繼路由。',
+  logLineFormat: (line: string) => `> ${line}`,
+  errorLineFormat: (error: string) => `! ${error}`,
+  settingsTitle: '設定',
+  backContentDescription: '返回',
+  languageSettingTitle: '語言',
+  languageSettingSubtitle: '使用系統語言，或為 OpenRung 選擇語言。',
+  languageSystem: '跟隨系統',
+  languageEnglish: 'English',
+  languageSimplifiedChinese: '简体中文',
+  languageTraditionalChinese: '繁體中文',
+  languagePersian: 'فارسی',
+  languageRussian: 'Русский',
+  languageArabic: 'العربية',
+  languageTurkish: 'Türkçe',
+  languageVietnamese: 'Tiếng Việt',
+  languageBurmese: 'မြန်မာ',
+  statusDisconnected: '已中斷',
+  statusPreparing: '正在準備 VPN',
+  statusConnecting: '正在連線',
+  statusConnected: '已連線',
+  statusDisconnecting: '正在中斷',
+  statusFailed: '失敗',
+
+  // Redesigned shell (tabs / about / section headers).
+  tabHome: '首頁',
+  tabSettings: '設定',
+  tabAbout: '關於我們',
+  aboutTitle: '關於我們',
+  relayAuto: '自動選擇中繼',
+  widgetStatusDisconnected: '未連線',
+  widgetName: '快速連線',
+  widgetDescription:
+    '從主畫面連線至自動選擇的中繼。',
+  relayClassOfficial: '官方',
+  relayClassVolunteer: '志願',
+  settingsGeneralHeader: '一般',
+  settingsDiagnosticsHeader: '診斷',
+
+  // Open control + speed test link.
+  openContentDescription: '開啟',
+  speedTestSettingTitle: '速度測試',
+  speedTestSettingSubtitle: '在瀏覽器中開啟 fast.com',
+  speedTestRequiresConnection: '請先連線，再測量通道速度',
+
+  // Map / list views.
+  mapContentDescription: '橫跨亞太地區的可用出口節點地圖',
+  mapLoading: '正在尋找可用的出口節點…',
+  mapFailed: '無法載入出口節點 — 點選以重試',
+  mapRelaysOnline: (count: number) => `${count} 個可用中繼`,
+  mapNoNodes: '目前沒有可用的出口節點',
+  recentsLabel: '最近使用',
+  viewToggleMap: '地圖',
+  viewToggleList: '清單',
+  listContentDescription: '可用出口節點的清單',
+  listRelayCount: (count: number) =>
+    count === 1 ? '1 個中繼' : `${count} 個中繼`,
+
+  // Debug console.
+  debugSettingTitle: '除錯',
+  debugSettingSubtitle: '連線主控台與診斷。',
+  debugTitle: '除錯主控台',
+
+  // Open-source licenses.
+  licensesSettingTitle: '開放原始碼授權',
+  licensesSettingSubtitle: '隨附軟體的授權與出處標示。',
+  licensesTitle: '開放原始碼授權',
+  licensesIntro:
+    'OpenRung 是自由軟體；由於連結了 sing-box，因此依 GPL-3.0-or-later 授權。此版本的完整對應原始碼可透過下方連結取得。',
+  licensesSourceTitle: '原始碼',
+  privacyPolicyTitle: '隱私權政策',
+  privacyPolicySubtitle: 'OpenRung 如何處理診斷資料與個人資訊。',
+  licensesFullTextTitle: '完整授權條款全文',
+  licensesFullTextSubtitle: 'GNU GPL-3.0 與第三方聲明。',
+  licensesComponentsHeader: '元件',
+  shareApkTitle: '離線分享 OpenRung',
+  shareApkSubtitle: '無需網際網路，將此 APK 傳送到附近的 Android 手機。',
+  shareApkErrorTitle: '無法分享 OpenRung',
+  shareApkErrorBody: '無法分享 APK。請保持 OpenRung 開啟並再試一次。',
+  shareApkSplitInstallError:
+    '此版本由多個 APK 檔案安裝，無法安全分享。請安裝 OpenRung 獨立 APK 後使用離線分享。',
+  shareAppStoreTitle: '分享 OpenRung',
+  shareAppStoreSubtitle:
+    '傳送 App Store 連結，供他人安裝 OpenRung。',
+  shareAppStoreMessage:
+    '在 App Store 取得 OpenRung：',
+  shareAppStoreErrorTitle: '無法分享 OpenRung',
+  shareAppStoreErrorBody:
+    '無法分享 App Store 連結。請再試一次。',
+
+  // Home tagline + about screen.
+  homeTagline: '中繼網路',
+  homeSlogan: '互聯網本非特權',
+  aboutMissionLead: '我們相信，網際網路存取是一項權利，而不是特權',
+  aboutMissionBody:
+    '更不應成為掌權者用來交易的籌碼。取得資訊的權利根植於我們身而為人的本質之中，任何防火牆都不應抹去它。然而今天，數十億人生活在高牆之後；這些牆把資訊擋在外面，把沉默困在裡面。在那裡，Google 搜尋只回傳 404，提出問題可能帶來危險，好奇心止步於遭封鎖的頁面。\n\nOpenRung 的存在就是為了改變這一切。\n\n我們正在搭建一架越過高牆的梯子。世界各地的普通人分享自己的網路連線，讓防火牆另一邊的人能夠存取開放的網際網路。\n\n資訊就是力量，這份力量屬於我們，而不屬於那些企圖從我們手中奪走它的人。',
+  aboutSupportHeader: '支持我們',
+  donateTitle: '捐款',
+  donateSubtitle: '幫助這座梯子繼續屹立。捐款將用於 OpenRung 基金會。',
+  aboutLegalHeader: '法律資訊',
+  aboutFollowHeader: '關注我們',
+
+  // --- Split tunneling (settings row + screen + Android app picker) ---
+  splitTunnelSettingTitle: '分流',
+  splitTunnelSettingSubtitleOn: '已開啟 — 選定的流量不經過中繼。',
+  splitTunnelSettingSubtitleOff: '已關閉 — 所有流量都經過中繼。',
+  splitTunnelHeader: '分流',
+  splitTunnelMasterTitle: '分流',
+  splitTunnelMasterSubtitle: '讓選定的流量繞過中繼通道。',
+  splitTunnelBypassHeader: '繞行',
+  splitTunnelLanTitle: '區域網路',
+  splitTunnelLanSubtitle: '直接連線印表機、電視等區域網路裝置。',
+  splitTunnelIranTitle: '伊朗網站與應用程式',
+  splitTunnelIranSubtitle: '將伊朗服務直連，享有全速體驗。',
+  splitTunnelChinaTitle: '中國網站與應用程式',
+  splitTunnelChinaSubtitle: '將中國服務直連，享有全速體驗。',
+  splitTunnelAppsHeader: '應用程式',
+  splitTunnelAppsTitle: '繞行的應用程式',
+  splitTunnelAppsSubtitle: (count: number) => `${count} 個應用程式不走 VPN。`,
+  splitTunnelAppPickerTitle: '繞行的應用程式',
+  splitTunnelAppPickerLoading: '正在載入已安裝的應用程式…',
+  splitTunnelAppPickerEmpty: '找不到可啟動的應用程式。',
+  splitTunnelAppPickerClose: '關閉',
+  splitTunnelApplyHint: '變更會立即生效；通道將重新連線幾秒鐘。',
+  splitTunnelResetHint: '重新啟動應用程式後，伊朗和中國預設會重設。',
+  splitTunnelResetHintWithApps:
+    '重新啟動應用程式後，伊朗和中國預設會重設；已略過的應用程式會保留。',
+
+  // --- In-app update check (manifest banner / blocking screen / broadcast notice) ---
+  updateRequiredTitle: '需要更新',
+  updateRequiredBody:
+    '此版本的 OpenRung 已無法連線至中繼網路。請安裝最新版本以繼續使用。',
+  updateVersionTransition: (current: string, latest: string) =>
+    `v${current} -> v${latest}`,
+  updateActionNow: '更新',
+  updateActionLater: '稍後',
+  updateContinueAnyway: '仍要繼續',
+  updateBannerTitle: '有可用更新',
+  updateBannerBody: (latest: string) =>
+    `${latest} 版包含重要修正。方便時更新即可。`,
+  updateSettingTitle: '有可用更新',
+  updateSettingSubtitle: (current: string, latest: string) =>
+    `你目前使用 v${current}；v${latest} 已推出。點選即可取得。`,
+  noticeDismiss: '關閉',
+  noticeLearnMore: '瞭解更多',
+  errorAccessDenied:
+    '此裝置的存取權限已被停用，無法連線。請聯絡 OpenRung 支援。',
+  errorEnrollmentRefused: '註冊失敗。請中斷其他 VPN 後重試。',
+  clockWarningTitle: '請檢查裝置的日期與時間',
+  clockWarningBody:
+    '此裝置的日期與時間似乎不正確，這可能導致 OpenRung 無法連線。請在裝置設定中開啟自動設定日期與時間，然後重試。',
+  clockWarningRetry: '重試',
+  // Desktop client only: the local proxy rows in Settings (DesktopProxySection).
+  desktopProxyHeader: '本機代理',
+  desktopProxyEndpointTitle: '端點',
+  desktopProxyEndpointConnected: (endpoint: string) => `${endpoint} · 現在可用`,
+  desktopProxyEndpointIdle: (endpoint: string) => `${endpoint} · 連線後可用`,
+  desktopProxyPreparing: '正在準備本機代理端點…',
+  desktopProxyPersistenceTitle: '端點持續性',
+  desktopShellIntegrationTitle: 'Shell 整合',
+  desktopShellEnableTitle: '在此 Shell 中啟用',
+  desktopShellEnableSubtitle: '保留現有的代理設定與未設定狀態。',
+  desktopShellEnableRequiresConnection: '請先連線 OpenRung，再於此 Shell 中啟用。',
+  desktopShellRestoreTitle: '還原此 Shell',
+  desktopShellRestoreSubtitle: '在中斷連線、失敗、結束或當機後執行。',
+  desktopTunModeTitle: 'TUN 模式',
+  desktopTunModeSubtitleOff: '已關閉。只有使用系統代理的應用程式會經過 OpenRung。',
+  desktopTunModeSubtitleOn: '已開啟。此裝置的所有流量都會經過 OpenRung。',
+  desktopTunModeRestartNote: '開啟後，OpenRung 將以系統管理員權限重新啟動。',
+  desktopTunModeRequiresDisconnect: '請先中斷連線再變更模式。',
+  actionCopy: '複製',
+  actionCopied: '已複製',
+};

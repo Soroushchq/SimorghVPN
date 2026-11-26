@@ -1,0 +1,438 @@
+#!/usr/bin/env bash
+# The Advanced mode engine on a real packet path (Linux, root): this machine is
+# the client, a router namespace in the middle holds a filter, a server
+# namespace behind it answers. The filter is iptables' string match, which
+# looks at one packet at a time, the way many DPI boxes do: any packet that
+# carries the blocked name is dropped.
+#
+#   client (root ns) 10.77.1.1 ── 10.77.1.2 router (filter) 198.51.100.1 ── 198.51.100.2 server
+#                                                          10.77.3.1    ── 10.77.3.2    the same
+#
+# The server answers on two addresses behind the same filter: 198.51.100.2 (a
+# documentation range, which the engine treats as the internet) and 10.77.3.2
+# (a private range, a machine on the local network, which the engine must
+# leave alone).
+#
+# What is checked, each against the engine actually running with NFQUEUE:
+#   - without the engine the blocked name never loads and others do (the
+#     filter works);
+#   - with the default cut, the blocked name loads over TLS and plain HTTP, in
+#     full, and the others still do;
+#   - the same with the cut sent last part first (disorder);
+#   - with the cut switched off, the decoy alone does not get past this
+#     filter (so it is the cut that does it);
+#   - on the private address the engine changes nothing: the filtered name
+#     stays stopped there while the engine runs, and the raw_stats line it
+#     writes at stop counts those packets as skipped;
+#   - a server that answers a ClientHello carrying a decoy with a TLS alert
+#     (198.51.100.3, the way a nearby server does when the decoy reaches it)
+#     gets no decoy on the next ClientHello, while another server still does:
+#     the router counts the low-TTL decoys per address. Needs the engine's
+#     inbound alert rule (the u32 match, or nft's payload match); skipped,
+#     and said so, without it;
+#   - UDP, against a voice server (198.51.100.4, UDP only): Discord's IP
+#     discovery request and a STUN Binding request each get their decoys, and
+#     the server sees the decoys arrive before the real request; a call's own
+#     datagrams (RTP) and QUIC short headers all arrive, with no decoy; a QUIC
+#     Initial is dropped; nothing is sent ahead of a request to the private
+#     address; and, where the kernel has the u32 match, the engine is never
+#     even handed the call's datagrams (its raw_stats udp_seen counts only the
+#     requests). Without u32 that last check is skipped, and said so;
+#   - DNS (the DNS gate, core/src/dnsgate.h): the network's DNS (198.51.100.5)
+#     forges every answer; the app's encrypted-DNS forwarder stands in on
+#     127.0.0.1 and knows one name. With the gate, a program asking the
+#     network's DNS itself gets the forwarder's address for that name, and
+#     the network's own answer for a name the forwarder does not know;
+#     without it, the forged one;
+#   - a network that lets only allowed names through (core/test/allow_dpi.c):
+#     the scrambled decoy is stopped like the real name, a decoy carrying an
+#     allowed name (--decoy-name) gets the real one through;
+#   - when the engine stops, none of its firewall rules are left.
+#
+#   sudo env "PATH=$PATH" bash tests/lab/advanced-lab.sh <shroudly-core-adv>
+set -uo pipefail
+
+ENGINE="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+WORK="$(mktemp -d)"
+SRV_PID=""; SRV2_PID=""; SRV3_PID=""; UDP_PID=""; UDP2_PID=""; ENG_PID=""; DNS_PID=""; FWD_PID=""; DPI_PID=""
+FAILS=0
+PUB=198.51.100.2   # the server as seen on the internet
+PRIV=10.77.3.2     # the same server on a private (local network) address
+ALERT=198.51.100.3 # a server that answers every ClientHello with a TLS alert
+VOICE=198.51.100.4 # a voice / STUN server, UDP only: no TCP goes there, so the
+                   # decoys keep the fixed TTL and reach it, in the order sent
+NETDNS=198.51.100.5 # the network's DNS, which forges every answer
+FORGED=198.51.100.66
+FWD_PORT=5399      # the app's encrypted-DNS forwarder standing in
+AT=$PUB            # where loads() connects
+
+ok()   { echo "  ok  $*"; }
+bad()  { echo "FAIL  $*"; FAILS=$((FAILS + 1)); }
+
+cleanup() {
+  [ -n "$ENG_PID" ] && { touch "$WORK/status.log.stop"; sleep 1; kill "$ENG_PID" 2>/dev/null; }
+  [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null
+  [ -n "$SRV2_PID" ] && kill "$SRV2_PID" 2>/dev/null
+  [ -n "$SRV3_PID" ] && kill "$SRV3_PID" 2>/dev/null
+  [ -n "$UDP_PID" ] && kill "$UDP_PID" 2>/dev/null
+  [ -n "$UDP2_PID" ] && kill "$UDP2_PID" 2>/dev/null
+  [ -n "$DNS_PID" ] && kill "$DNS_PID" 2>/dev/null
+  [ -n "$FWD_PID" ] && kill "$FWD_PID" 2>/dev/null
+  [ -n "$DPI_PID" ] && kill "$DPI_PID" 2>/dev/null
+  ip netns del shlab-r 2>/dev/null; ip netns del shlab-s 2>/dev/null; ip link del shlab-c 2>/dev/null
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+# ── the network ─────────────────────────────────────────────────────────────
+ip netns add shlab-r
+ip netns add shlab-s
+ip link add shlab-c type veth peer name shlab-r0
+ip link set shlab-r0 netns shlab-r
+ip -n shlab-r link add shlab-r1 type veth peer name shlab-s0
+ip -n shlab-r link set shlab-s0 netns shlab-s
+ip addr add 10.77.1.1/24 dev shlab-c && ip link set shlab-c up
+ip -n shlab-r addr add 10.77.1.2/24 dev shlab-r0 && ip -n shlab-r link set shlab-r0 up
+ip -n shlab-r addr add 198.51.100.1/24 dev shlab-r1
+ip -n shlab-r addr add 10.77.3.1/24 dev shlab-r1 && ip -n shlab-r link set shlab-r1 up
+ip -n shlab-r link set lo up
+ip -n shlab-s addr add $PUB/24 dev shlab-s0
+ip -n shlab-s addr add $PRIV/24 dev shlab-s0 && ip -n shlab-s link set shlab-s0 up
+ip -n shlab-s addr add $ALERT/24 dev shlab-s0
+ip -n shlab-s addr add $VOICE/24 dev shlab-s0
+ip -n shlab-s addr add $NETDNS/24 dev shlab-s0
+ip -n shlab-s link set lo up
+ip -n shlab-s route add default via 198.51.100.1
+ip route add 198.51.100.0/24 via 10.77.1.2
+ip route add 10.77.3.0/24 via 10.77.1.2
+ip netns exec shlab-r sysctl -qw net.ipv4.ip_forward=1
+# The filter: one packet at a time, the name anywhere in it.
+for port in 443 80; do
+  ip netns exec shlab-r iptables -A FORWARD -p tcp --dport $port -m string --algo bm --string "blocked.lab" -j DROP
+done
+
+ip netns exec shlab-s node "$HERE/lab-server.js" $PUB > "$WORK/server.log" 2>&1 &
+SRV_PID=$!
+ip netns exec shlab-s node "$HERE/lab-server.js" $PRIV > "$WORK/server2.log" 2>&1 &
+SRV2_PID=$!
+ip netns exec shlab-s node "$HERE/lab-server.js" $ALERT alert > "$WORK/server3.log" 2>&1 &
+SRV3_PID=$!
+ip netns exec shlab-s node "$HERE/lab-udp.js" serve $VOICE 443 3478 50003 > "$WORK/udp.log" 2>&1 &
+UDP_PID=$!
+ip netns exec shlab-s node "$HERE/lab-udp.js" serve $PRIV 50003 > "$WORK/udp2.log" 2>&1 &
+UDP2_PID=$!
+for _ in $(seq 50); do grep -q "lab server" "$WORK/server.log" 2>/dev/null && grep -q "lab server" "$WORK/server2.log" 2>/dev/null && grep -q "lab server" "$WORK/server3.log" 2>/dev/null \
+  && grep -q "lab udp" "$WORK/udp.log" 2>/dev/null && grep -q "lab udp" "$WORK/udp2.log" 2>/dev/null && break; sleep 0.1; done
+# The router counts the decoys going to each public address: a decoy's TTL is
+# set to run out about here, a real segment's is not. They die at the router
+# (TTL), but PREROUTING sees them first.
+DECOY_COUNT=1
+for a in $ALERT $PUB; do
+  ip netns exec shlab-r iptables -t mangle -A PREROUTING -d $a -p tcp --dport 443 -m ttl --ttl-lt 16 || DECOY_COUNT=0
+done
+# The same for UDP decoys (a real datagram leaves with TTL 64, a decoy with 4).
+for a in $VOICE $PRIV; do
+  ip netns exec shlab-r iptables -t mangle -A PREROUTING -d $a -p udp -m ttl --ttl-lt 16 || DECOY_COUNT=0
+done
+# Decoys seen so far going to address $1, or "" when the router cannot count.
+decoys_to() {
+  [ "$DECOY_COUNT" = 1 ] || return 0
+  ip netns exec shlab-r iptables-save -c -t mangle 2>/dev/null | grep -F -- "-d $1/32 " | grep -F -- "--ttl-lt" \
+    | sed -n 's/^\[\([0-9][0-9]*\):.*/\1/p' | head -1
+}
+
+loads()  { node "$HERE/lab-client.js" "$AT" "$1" "${2:-tls}" "${3:-8000}"; }
+expect_load() { local out; out=$(loads "$@"); if [ $? -eq 0 ]; then ok "$LABEL: $out"; else bad "$LABEL: $out"; fi; }
+expect_fail() { local out; out=$(loads "$@"); if [ $? -ne 0 ]; then ok "$LABEL: $out"; else bad "$LABEL: $out"; fi; }
+
+start_engine() {
+  rm -f "$WORK/status.log" "$WORK/status.log.stop" "$WORK/status.log.standby"
+  "$ENGINE" --advanced --fake-ttl 4 --status-file "$WORK/status.log" --parent-pid $$ \
+    --drop-rst 1 --autottl 1 --seqovl 0 --split "$1" --desync-mode fake --queue 200 "${@:2}" &
+  ENG_PID=$!
+  for _ in $(seq 100); do grep -q '"raw_ready"' "$WORK/status.log" 2>/dev/null && break; sleep 0.1; done
+  if grep -q '"raw_ready"' "$WORK/status.log" 2>/dev/null; then
+    ok "engine up (split $1): $(grep -m1 '"raw_ready"' "$WORK/status.log")"
+  else
+    bad "engine did not come up (split $1): $(tail -5 "$WORK/status.log" 2>/dev/null)"
+  fi
+}
+stop_engine() {
+  touch "$WORK/status.log.stop"
+  for _ in $(seq 50); do kill -0 "$ENG_PID" 2>/dev/null || break; sleep 0.1; done
+  kill "$ENG_PID" 2>/dev/null; wait "$ENG_PID" 2>/dev/null; ENG_PID=""
+}
+# The counter $1 of the raw_stats line the engine wrote at stop, or "" when
+# there is none.
+stat_of() {
+  grep '"type":"raw_stats"' "$WORK/status.log" 2>/dev/null | tail -1 | sed -n "s/.*\"$1\":\([0-9][0-9]*\).*/\1/p"
+}
+
+# ── 1. the filter, no engine ────────────────────────────────────────────────
+LABEL="no engine, an unfiltered name loads";            expect_load www.allowed.lab tls
+LABEL="no engine, the filtered name is stopped (TLS)";  expect_fail www.blocked.lab tls 5000
+LABEL="no engine, the filtered name is stopped (HTTP)"; expect_fail www.blocked.lab http 5000
+AT=$PRIV
+LABEL="no engine, private address: an unfiltered name loads";   expect_load www.allowed.lab tls
+LABEL="no engine, private address: the filtered name is stopped"; expect_fail www.blocked.lab tls 5000
+AT=$PUB
+
+# ── 2. the default: decoy, then the real first segment cut ─────────────────
+start_engine on
+LABEL="cut: the filtered name loads in full (TLS)";  expect_load www.blocked.lab tls
+LABEL="cut: the filtered name loads in full (HTTP)"; expect_load www.blocked.lab http
+LABEL="cut: a bare name loads (TLS)";                expect_load blocked.lab tls
+LABEL="cut: an unfiltered name still loads";         expect_load www.allowed.lab tls
+# The same filter in front of a machine on the local network: the engine
+# leaves that traffic alone, so the filtered name stays stopped there.
+AT=$PRIV
+LABEL="cut, private address: the filtered name is left alone (TLS)";  expect_fail www.blocked.lab tls 5000
+LABEL="cut, private address: the filtered name is left alone (HTTP)"; expect_fail www.blocked.lab http 5000
+LABEL="cut, private address: an unfiltered name loads";              expect_load www.allowed.lab tls
+AT=$PUB
+# Standby (2.6.87): the rules removed, the engine kept running as root; the
+# filtered name is stopped again, and back from standby it loads, with no
+# new start (no password asked).
+touch "$WORK/status.log.standby"
+for _ in $(seq 50); do grep -q '"raw_paused"' "$WORK/status.log" 2>/dev/null && break; sleep 0.1; done
+if grep -q '"raw_paused"' "$WORK/status.log" && kill -0 "$ENG_PID" 2>/dev/null; then ok "standby: the rules are gone, the engine still runs"; else bad "standby: no raw_paused ($(tail -2 "$WORK/status.log"))"; fi
+LABEL="standby: the filtered name is stopped again"; expect_fail www.blocked.lab tls 5000
+LABEL="standby: an unfiltered name loads";           expect_load www.allowed.lab tls
+rm -f "$WORK/status.log.standby"
+for _ in $(seq 50); do grep -q '"raw_resumed"' "$WORK/status.log" 2>/dev/null && break; sleep 0.1; done
+if grep -q '"raw_resumed"' "$WORK/status.log" && kill -0 "$ENG_PID" 2>/dev/null; then ok "back from standby, the same process: $(grep -m1 '"raw_resumed"' "$WORK/status.log")"; else bad "not back from standby ($(tail -2 "$WORK/status.log"))"; fi
+LABEL="back from standby: the filtered name loads in full (TLS)"; expect_load www.blocked.lab tls
+stop_engine
+skipped=$(stat_of skipped); desynced=$(stat_of desynced)
+if [ -z "$skipped" ]; then
+  bad "no raw_stats line at stop: $(tail -3 "$WORK/status.log" 2>/dev/null)"
+else
+  ok "at stop: $(grep '"type":"raw_stats"' "$WORK/status.log" | tail -1)"
+  if [ "$skipped" -gt 0 ]; then ok "the private address was skipped ($skipped)"; else bad "skipped is $skipped after the private address"; fi
+  if [ "${desynced:-0}" -gt 0 ]; then ok "the public address was desynced ($desynced)"; else bad "desynced is ${desynced:-none} after the public address"; fi
+fi
+
+# ── 3. the cut sent last part first ─────────────────────────────────────────
+start_engine disorder
+LABEL="disorder: the filtered name loads in full (TLS)";  expect_load www.blocked.lab tls
+LABEL="disorder: the filtered name loads in full (HTTP)"; expect_load www.blocked.lab http
+LABEL="disorder: an unfiltered name still loads";         expect_load www.allowed.lab tls
+stop_engine
+
+# ── 4. no cut: the decoy alone does not get past this filter ───────────────
+start_engine off
+LABEL="no cut: the filtered name is still stopped"; expect_fail www.blocked.lab tls 5000
+LABEL="no cut: an unfiltered name loads";            expect_load www.allowed.lab tls
+stop_engine
+
+# ── 5. a server the decoy upsets gets no decoy next time ───────────────────
+start_engine on
+watch=$(grep -m1 '"raw_ready"' "$WORK/status.log" 2>/dev/null | sed -n 's/.*"alert_watch":\([01]\).*/\1/p')
+if [ "$watch" != 1 ]; then
+  ok "alert fallback: skipped, the inbound alert rule is not available here (alert_watch=${watch:-none})"
+  stop_engine
+elif [ -z "$(decoys_to $ALERT)" ]; then
+  ok "alert fallback: skipped, the router cannot count decoys (no ttl match)"
+  stop_engine
+else
+  AT=$ALERT
+  a0=$(decoys_to $ALERT)
+  LABEL="alert server: the first ClientHello is refused"; expect_fail www.allowed.lab tls 3000
+  a1=$(decoys_to $ALERT)
+  if [ "$a1" -gt "$a0" ]; then ok "the first ClientHello carried a decoy ($a0 -> $a1)"; else bad "no decoy on the first ClientHello ($a0 -> $a1)"; fi
+  LABEL="alert server: the next ClientHello is refused too"; expect_fail www.allowed.lab tls 3000
+  a2=$(decoys_to $ALERT)
+  if [ "$a2" -eq "$a1" ]; then ok "the next ClientHello to that server carried no decoy ($a1 -> $a2)"; else bad "the next ClientHello still carried a decoy ($a1 -> $a2)"; fi
+  AT=$PUB
+  p0=$(decoys_to $PUB)
+  LABEL="alert fallback: the filtered name still loads elsewhere"; expect_load www.blocked.lab tls
+  p1=$(decoys_to $PUB)
+  if [ "$p1" -gt "$p0" ]; then ok "another server still gets its decoy ($p0 -> $p1)"; else bad "another server got no decoy ($p0 -> $p1)"; fi
+  stop_engine
+  hurt=$(stat_of decoy_hurt); nodecoy=$(stat_of nodecoy)
+  ok "at stop: $(grep '"type":"raw_stats"' "$WORK/status.log" | tail -1)"
+  if [ "${hurt:-0}" -ge 1 ]; then ok "decoy_hurt is $hurt"; else bad "decoy_hurt is ${hurt:-none}"; fi
+  if [ "${nodecoy:-0}" -ge 1 ]; then ok "nodecoy is $nodecoy"; else bad "nodecoy is ${nodecoy:-none}"; fi
+fi
+
+# ── 6. UDP: decoys ahead of a call's first datagrams, the call left alone ───
+udp_send() { node "$HERE/lab-udp.js" send "$@" > /dev/null; sleep 0.5; }
+# What the voice server saw on port $1, in order: R for the real request
+# (its first four bytes are $2), d for anything else (a decoy).
+order_on() { awk -v p="$1" -v r="$2" '$1 == p { printf "%s", ($3 == r ? "R" : "d") }' "$WORK/udp.log"; }
+# Datagrams the voice server saw on port $1, $2 bytes long, whose first byte
+# is $3 (the length keeps a decoy that happens to start the same apart).
+count_on() { awk -v p="$1" -v l="$2" -v b="$3" '$1 == p && $2 == l && substr($3, 1, 2) == b { n++ } END { print n + 0 }' "$WORK/udp.log"; }
+start_engine on
+match=$(grep -m1 '"raw_ready"' "$WORK/status.log" 2>/dev/null | sed -n 's/.*"udp_match":\([01]\).*/\1/p')
+ok "UDP payload tests in the kernel: udp_match=${match:-none}"
+
+v0=$(decoys_to $VOICE)
+udp_send $VOICE 50003 discovery
+v1=$(decoys_to $VOICE)
+o=$(order_on 50003 00010046)
+if [[ "$o" =~ ^d+R$ ]]; then ok "IP discovery: $(( ${#o} - 1 )) decoys reached the server before the real request ($o)"; else bad "IP discovery: the server saw '$o' (d: decoy, R: the request)"; fi
+if [ -z "$v0" ] || [ $((v1 - v0)) -ge 6 ]; then ok "IP discovery: the router counted ${v0:+$((v1 - v0)) }low-TTL datagrams"; else bad "IP discovery: the router counted $((v1 - v0)) low-TTL datagrams"; fi
+
+udp_send $VOICE 3478 stun
+o=$(order_on 3478 00010000)
+if [[ "$o" =~ ^d+R$ ]]; then ok "STUN Binding request: $(( ${#o} - 1 )) decoys before the real request ($o)"; else bad "STUN Binding request: the server saw '$o'"; fi
+
+v2=$(decoys_to $VOICE)
+udp_send $VOICE 50003 rtp 40
+v3=$(decoys_to $VOICE)
+n=$(count_on 50003 172 80)
+if [ "$n" -eq 40 ]; then ok "a call's own datagrams: all 40 arrived"; else bad "a call's own datagrams: $n of 40 arrived"; fi
+if [ "$v3" = "$v2" ]; then ok "and none of them got a decoy"; else bad "they got decoys ($v2 -> $v3)"; fi
+
+qa=$(node "$HERE/lab-udp.js" send $VOICE 443 quic-initial); sleep 0.5
+if [[ "$qa" == *"answered vn"* ]]; then ok "the QUIC Initial is answered with a Version Negotiation: the program takes TCP at once"; else bad "the QUIC Initial got no Version Negotiation back ($qa)"; fi
+udp_send $VOICE 443 quic-short 10
+if [ "$(count_on 443 1200 c3)" -eq 0 ]; then ok "a QUIC Initial is dropped (the browser takes TCP)"; else bad "a QUIC Initial reached the server"; fi
+n=$(count_on 443 60 41)
+if [ "$n" -eq 10 ]; then ok "QUIC short headers all arrive"; else bad "QUIC short headers: $n of 10 arrived"; fi
+
+p0=$(decoys_to $PRIV)
+udp_send $PRIV 50003 discovery
+p1=$(decoys_to $PRIV)
+if grep -q '^50003 74 00010046' "$WORK/udp2.log" && [ "$p1" = "$p0" ]; then ok "private address: the request arrives, nothing sent ahead of it"; else bad "private address: decoys $p0 -> $p1, $(cat "$WORK/udp2.log" | tail -3)"; fi
+stop_engine
+ok "at stop: $(grep '"type":"raw_stats"' "$WORK/status.log" | tail -1)"
+ud=$(stat_of udp_decoys); us=$(stat_of udp_seen); qd=$(stat_of quic_dropped)
+if [ "${ud:-0}" -ge 12 ]; then ok "udp_decoys is $ud"; else bad "udp_decoys is ${ud:-none}"; fi
+if [ "${qd:-0}" -ge 1 ]; then ok "quic_dropped is $qd"; else bad "quic_dropped is ${qd:-none}"; fi
+if [ "$match" = 1 ]; then
+  # Handed over: the discovery requests, the STUN request and the QUIC
+  # Initial; not the 40 RTP datagrams nor the 10 short headers.
+  if [ "${us:-99}" -lt 10 ]; then ok "the engine was handed only the requests ($us datagrams), never the call"; else bad "the engine was handed ${us:-none} datagrams: the call went through the queue"; fi
+else
+  ok "udp_seen is ${us:-none}: skipped, the kernel has no u32 match here, so the ports alone are queued"
+fi
+
+# ── 7. DNS: other programs' questions answered from encrypted DNS ───────────
+ip netns exec shlab-s node "$HERE/lab-dns.js" serve $NETDNS $FORGED > "$WORK/dns.log" 2>&1 &
+DNS_PID=$!
+node "$HERE/lab-dns.js" forwarder $FWD_PORT gate.lab=93.184.216.34 > "$WORK/fwd.log" 2>&1 &
+FWD_PID=$!
+for _ in $(seq 50); do [ "$(cat "$WORK/dns.log" "$WORK/fwd.log" 2>/dev/null | grep -c ready)" -ge 2 ] && break; sleep 0.1; done
+ask() { node "$HERE/lab-dns.js" ask "$@"; }
+a=$(ask $NETDNS gate.lab)
+if [ "$a" = "$FORGED" ]; then ok "no engine: the network's DNS forges the answer ($a)"; else bad "no engine: the network's DNS said '$a'"; fi
+start_engine on --dns-gate $FWD_PORT
+if grep -m1 '"raw_ready"' "$WORK/status.log" | grep -q '"dns_gate":1'; then ok "the DNS gate is on"; else bad "the DNS gate is not on: $(grep -m1 '"raw_ready"' "$WORK/status.log")"; fi
+if ! command -v resolvectl >/dev/null 2>&1 && ! command -v nscd >/dev/null 2>&1; then ok "no DNS cache service here to empty"
+elif grep -m1 '"raw_ready"' "$WORK/status.log" | grep -q '"dns_flushed":1'; then ok "the system's DNS cache was emptied as the gate came on"
+else bad "the system's DNS cache was not emptied: $(grep -m1 '"raw_ready"' "$WORK/status.log")"; fi
+a=$(ask $NETDNS gate.lab)
+if [ "$a" = "93.184.216.34" ]; then ok "a program asking the network's DNS itself gets encrypted DNS's answer ($a)"; else bad "a program asking the network's DNS got '$a'"; fi
+a=$(ask $NETDNS other.lab)
+if [ "$a" = "$FORGED" ]; then ok "a name encrypted DNS does not know: the question goes on to the network's DNS ($a)"; else bad "a name encrypted DNS does not know: '$a'"; fi
+stop_engine
+da=$(stat_of dns_answered); dp=$(stat_of dns_passed)
+if [ "${da:-0}" -ge 1 ] && [ "${dp:-0}" -ge 1 ]; then ok "dns_answered $da, dns_passed $dp"; else bad "dns_answered ${da:-none}, dns_passed ${dp:-none}"; fi
+a=$(ask $NETDNS gate.lab)
+if [ "$a" = "$FORGED" ]; then ok "after stop: the network's DNS answers again ($a)"; else bad "after stop: '$a'"; fi
+
+# ── 9. a DPI that reassembles TCP, then reads each TLS record (issue #48) ─────
+# The string filter above reads one packet at a time, so a TCP cut gets past it.
+# Türkiye's Superonline (and others) put the stream back together first, then
+# match the name inside a single TLS record: the cut does not fool them, but
+# splitting the record itself (tlsrec) does. A small reassembling censor in the
+# router proves it.
+CORE="$(cd "$HERE/../../core" && pwd)"
+if ! cc -O2 -o "$WORK/reasm_dpi" "$CORE/test/reasm_dpi.c" "$CORE/src/nfq.c" 2>"$WORK/dpi_build.log"; then
+  bad "reassembling DPI: could not build ($(tail -1 "$WORK/dpi_build.log"))"
+else
+  # Only the reassembler filters now: drop the per-packet string rules.
+  for port in 443 80; do ip netns exec shlab-r iptables -D FORWARD -p tcp --dport $port -m string --algo bm --string "blocked.lab" -j DROP 2>/dev/null; done
+  ip netns exec shlab-r iptables -A FORWARD -p tcp --dport 443 -j NFQUEUE --queue-num 201 --queue-bypass
+  ip netns exec shlab-r "$WORK/reasm_dpi" 201 blocked.lab > "$WORK/dpi.log" 2>&1 &
+  DPI_PID=$!
+  for _ in $(seq 50); do grep -q "reasm_dpi ready" "$WORK/dpi.log" 2>/dev/null && break; sleep 0.1; done
+  if ! grep -q "reasm_dpi ready" "$WORK/dpi.log" 2>/dev/null; then
+    bad "reassembling DPI: did not start ($(tail -2 "$WORK/dpi.log" 2>/dev/null))"
+  else
+    ok "reassembling DPI up: $(grep -m1 ready "$WORK/dpi.log")"
+    AT=$PUB
+    # No engine: it blocks the name (and lets another through).
+    LABEL="reasm DPI, no engine: the name is stopped"; expect_fail www.blocked.lab tls 5000
+    LABEL="reasm DPI, no engine: another name loads";   expect_load www.allowed.lab tls
+    # The TCP cut does not fool a reassembler.
+    start_engine on
+    LABEL="reasm DPI, TCP cut: the name is still stopped (the reassembler wins)"; expect_fail www.blocked.lab tls 6000
+    stop_engine
+    # Splitting the TLS record does: the name is never whole inside one record.
+    start_engine on --tlsrec 1
+    if grep -m1 '"raw_ready"' "$WORK/status.log" | grep -q '"tlsrec":1'; then ok "tlsrec is on"; else bad "tlsrec did not turn on: $(grep -m1 '"raw_ready"' "$WORK/status.log")"; fi
+    LABEL="reasm DPI, tlsrec: the name loads in full";  expect_load www.blocked.lab tls
+    # allowed.lab should load (the reassembler never blocks it); if it does not,
+    # the sequence translation is wrong, so capture the router's view of the wire.
+    TCAP=""
+    if command -v tcpdump >/dev/null 2>&1; then
+      # Bounded by a timeout so it never waits for packets that a broken
+      # connection will not send (an earlier -c count hung the whole job).
+      ip netns exec shlab-r timeout 11 tcpdump -i shlab-r1 -n -S "tcp and host $PUB and port 443" > "$WORK/tcap.txt" 2>/dev/null &
+      TCAP=$!; sleep 0.4
+    fi
+    out=$(loads www.allowed.lab tls); rc=$?
+    if [ $rc -eq 0 ]; then ok "reasm DPI, tlsrec: another name still loads: $out"; else bad "reasm DPI, tlsrec: another name still loads: $out"; fi
+    [ -n "$TCAP" ] && { kill "$TCAP" 2>/dev/null; wait "$TCAP" 2>/dev/null; if [ $rc -ne 0 ]; then echo "--- allowed.lab, router -> server view ---"; sed -n '1,40p' "$WORK/tcap.txt" | sed 's/^/    /'; fi; }
+    stop_engine
+    ok "at stop: $(grep '"type":"raw_stats"' "$WORK/status.log" | tail -1)"
+    grown=$(stat_of grown)
+    if [ "${grown:-0}" -ge 1 ]; then ok "tlsrec was applied (grown $grown)"; else bad "tlsrec was never applied (grown ${grown:-none})"; fi
+    [ -s "$WORK/dpi.log" ] && echo "    (reasm_dpi said: $(grep -m1 'blocked, name' "$WORK/dpi.log" 2>/dev/null))"
+  fi
+  kill "$DPI_PID" 2>/dev/null; wait "$DPI_PID" 2>/dev/null; DPI_PID=""
+  ip netns exec shlab-r iptables -D FORWARD -p tcp --dport 443 -j NFQUEUE --queue-num 201 --queue-bypass 2>/dev/null
+fi
+
+# ── 10. a network that lets only allowed names through (a whitelist) ───────
+# During a shutdown that keeps a few allowed sites, the first request of each
+# connection decides it: an allowed name lets the connection go, any other
+# stops it. A scrambled decoy is stopped like the real name; a decoy carrying
+# an allowed name (--decoy-name, which the app fills with the country's own
+# sites) lets the real ClientHello behind it through. The censor sits in the
+# router's PREROUTING, where the decoy (TTL running out at the router) is
+# still seen, and parses with the engine's own proto.c.
+CORE="$(cd "$HERE/../../core" && pwd)"
+if ! cc -O2 -o "$WORK/allow_dpi" "$CORE/test/allow_dpi.c" "$CORE/src/nfq.c" "$CORE/src/proto.c" 2>"$WORK/allow_build.log"; then
+  bad "whitelist DPI: could not build ($(tail -1 "$WORK/allow_build.log"))"
+else
+  for port in 443 80; do ip netns exec shlab-r iptables -D FORWARD -p tcp --dport $port -m string --algo bm --string "blocked.lab" -j DROP 2>/dev/null; done
+  ip netns exec shlab-r iptables -t mangle -I PREROUTING 1 -d $PUB -p tcp --dport 443 -j NFQUEUE --queue-num 202 --queue-bypass
+  ip netns exec shlab-r "$WORK/allow_dpi" 202 allowed.lab > "$WORK/allow.log" 2>&1 &
+  DPI_PID=$!
+  for _ in $(seq 50); do grep -q "allow_dpi ready" "$WORK/allow.log" 2>/dev/null && break; sleep 0.1; done
+  if ! grep -q "allow_dpi ready" "$WORK/allow.log" 2>/dev/null; then
+    bad "whitelist DPI: did not start ($(tail -2 "$WORK/allow.log" 2>/dev/null))"
+  else
+    ok "whitelist DPI up: $(grep -m1 ready "$WORK/allow.log")"
+    AT=$PUB
+    LABEL="whitelist, no engine: an allowed name loads";      expect_load www.allowed.lab tls
+    LABEL="whitelist, no engine: any other name is stopped";  expect_fail www.blocked.lab tls 5000
+    # The usual decoy carries a scrambled name: not on the list either.
+    start_engine on
+    LABEL="whitelist, scrambled decoy: still stopped";        expect_fail www.blocked.lab tls 6000
+    stop_engine
+    # A decoy that carries an allowed name.
+    start_engine on --decoy-name www.allowed.lab
+    if grep -m1 '"raw_ready"' "$WORK/status.log" | grep -q '"decoy_names":1'; then ok "one decoy name taken"; else bad "decoy name not taken: $(grep -m1 '"raw_ready"' "$WORK/status.log")"; fi
+    LABEL="whitelist, decoy with an allowed name: the name loads in full"; expect_load www.blocked.lab tls
+    LABEL="whitelist, decoy with an allowed name: an allowed name still loads"; expect_load www.allowed.lab tls
+    stop_engine
+    named=$(stat_of decoy_named)
+    if [ "${named:-0}" -ge 1 ]; then ok "decoys carried the allowed name ($named)"; else bad "no decoy carried the name (decoy_named ${named:-none})"; fi
+    echo "    (allow_dpi said: $(grep -c 'allowed (first' "$WORK/allow.log") allowed, $(grep -c 'stopped (first' "$WORK/allow.log") stopped; last: $(grep 'first request' "$WORK/allow.log" | tail -1))"
+  fi
+  kill "$DPI_PID" 2>/dev/null; wait "$DPI_PID" 2>/dev/null; DPI_PID=""
+  ip netns exec shlab-r iptables -t mangle -D PREROUTING -d $PUB -p tcp --dport 443 -j NFQUEUE --queue-num 202 --queue-bypass 2>/dev/null
+fi
+
+# ── 8. nothing left behind ──────────────────────────────────────────────────
+left=$( (iptables -t mangle -S 2>/dev/null; nft list ruleset 2>/dev/null) | grep -c -E 'NFQUEUE|queue num|shroudly' )
+if [ "$left" -eq 0 ]; then ok "after stopping, no firewall rule of the engine is left"; else bad "$left firewall rules left after stopping"; fi
+
+if [ "$FAILS" -eq 0 ]; then echo "advanced-lab: all passed"; exit 0; fi
+echo "advanced-lab: $FAILS failed"; exit 1

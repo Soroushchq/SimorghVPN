@@ -1,0 +1,328 @@
+import Foundation
+
+/*
+ * "Your own server" (Settings): a server the user names, which carries every
+ * connection to a name (the engine's --upstream-file). In a shutdown, a
+ * server inside the country whose own connection to the world still works is
+ * the way out. The Apple side of electron/own-server.js and OwnServer.kt,
+ * the same links:
+ *   socks5://user:password@host:port   (user and password optional)
+ *   http://user:password@host:port     (CONNECT; the same)
+ *   ss://BASE64URL(method:password)@host:port#name   (SIP002)
+ *   ss://BASE64(method:password@host:port)#name      (the older form)
+ *   host:port                          (SOCKS5)
+ * Shadowsocks goes through Shroudly's own client in the tunnel
+ * (Tunnel/Shadowsocks.swift).
+ */
+struct OwnServerLink: Equatable {
+    var kind: String          // "socks5", "http", "ss", "vless" or "trojan"
+    var host: String
+    var port: Int
+    var user = ""
+    var pass = ""
+    var method = ""
+    var password = ""
+    var name = ""
+    /* A VLESS or Trojan link's own parts (Shared/Vless.swift). */
+    var vless: VlessLink?
+
+    /* The kinds that go through a client of the tunnel's own. */
+    var localClient: Bool { kind == "ss" || vless != nil }
+}
+
+enum OwnServer {
+    /* Shadowsocks methods and their key lengths (Tunnel/Shadowsocks.swift). */
+    static let methods: [String: Int] = ["chacha20-ietf-poly1305": 32, "aes-256-gcm": 32, "aes-128-gcm": 16]
+
+    /* A link, or why it cannot be used: empty, format, method, user, or
+     * unsupported (a VLESS or Trojan link of a kind not carried: `what`
+     * names it, Vless.parse). */
+    struct Parsed: Equatable {
+        var link: OwnServerLink?
+        var error: String?
+        var method: String?
+        var what: String?
+    }
+
+    private static func match(_ pattern: String, _ text: String, _ opts: NSRegularExpression.Options = []) -> [String?]? {
+        guard let re = try? NSRegularExpression(pattern: pattern, options: opts),
+              let m = re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+              m.range.location == 0, m.range.length == (text as NSString).length else { return nil }
+        return (0..<m.numberOfRanges).map { i in
+            let r = m.range(at: i)
+            return r.location == NSNotFound ? nil : (text as NSString).substring(with: r)
+        }
+    }
+
+    private static func hostPort(_ text: String) -> (String, Int)? {
+        guard let m = match("^\\[([0-9a-fA-F:.]+)]:(\\d{1,5})$", text) ?? match("^([^\\s:/@\\[\\]]+):(\\d{1,5})$", text),
+              let host = m[1], let p = m[2], let port = Int(p), (1...65535).contains(port) else { return nil }
+        return (host, port)
+    }
+
+    private static func fromB64(_ s: String) -> String {
+        var t = s.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        while t.hasSuffix("=") { t.removeLast() }
+        while t.count % 4 != 0 { t += "=" }
+        guard let d = Data(base64Encoded: t), let str = String(data: d, encoding: .utf8) else { return "" }
+        return str
+    }
+
+    /* Percent-decoding as a URL's user part has it ("+" stays "+"). */
+    private static func decode(_ s: String) -> String? { s.removingPercentEncoding }
+
+    static func parse(_ input: String?) -> Parsed {
+        let text = (input ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.isEmpty { return Parsed(link: nil, error: "empty") }
+        if text.lowercased().hasPrefix("vless://") || text.lowercased().hasPrefix("trojan://") {
+            let v = Vless.parse(text)
+            guard let l = v.link else { return Parsed(link: nil, error: v.error, method: nil, what: v.what) }
+            return Parsed(link: OwnServerLink(kind: l.kind, host: l.host, port: l.port, name: l.name, vless: l))
+        }
+        if let m = match("^(socks5h?|socks|http)://(?:([^@/]*)@)?([^/?#]+)/?$", text, [.caseInsensitive]) {
+            guard let hp = hostPort(m[3] ?? "") else { return Parsed(link: nil, error: "format") }
+            var user = "", pass = ""
+            if let info = m[2] {
+                let parts = info.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+                guard let u = decode(parts[0]) else { return Parsed(link: nil, error: "format") }
+                user = u
+                if parts.count > 1 {
+                    guard let p = decode(parts[1]) else { return Parsed(link: nil, error: "format") }
+                    pass = p
+                }
+                if user.isEmpty || user.contains(where: { ":@\r\n".contains($0) }) || user.utf8.count > 255 || pass.utf8.count > 255
+                    || pass.contains(where: { "\r\n".contains($0) }) {
+                    return Parsed(link: nil, error: "user")
+                }
+            }
+            let kind = (m[1] ?? "").lowercased() == "http" ? "http" : "socks5"
+            return Parsed(link: OwnServerLink(kind: kind, host: hp.0, port: hp.1, user: user, pass: pass))
+        }
+        if let m = match("^ss://([^#]+)(?:#(.*))?$", text, [.caseInsensitive]) {
+            let name = m[2].flatMap { decode($0) } ?? ""
+            // Plugin options and the like ("/?plugin=…") are not used.
+            var body = m[1] ?? ""
+            if let q = body.firstIndex(of: "?") { body = String(body[..<q]) }
+            while body.hasSuffix("/") { body.removeLast() }
+            let method: String, password: String
+            let hp: (String, Int)?
+            if let at = body.lastIndex(of: "@"), at > body.startIndex {
+                let raw = String(body[..<at])
+                let info = decode(raw) ?? raw
+                let plain = info.contains(":") ? info : fromB64(info)
+                guard let i = plain.firstIndex(of: ":"), i > plain.startIndex else { return Parsed(link: nil, error: "format") }
+                method = plain[..<i].lowercased()
+                password = String(plain[plain.index(after: i)...])
+                hp = hostPort(String(body[body.index(after: at)...]))
+            } else {
+                guard let mm = match("^([^:]+):(.*)@([^@]+)$", fromB64(body)) else { return Parsed(link: nil, error: "format") }
+                method = (mm[1] ?? "").lowercased()
+                password = mm[2] ?? ""
+                hp = hostPort(mm[3] ?? "")
+            }
+            guard let hp, !password.isEmpty else { return Parsed(link: nil, error: "format") }
+            guard methods[method] != nil else { return Parsed(link: nil, error: "method", method: method) }
+            return Parsed(link: OwnServerLink(kind: "ss", host: hp.0, port: hp.1, method: method, password: password, name: name))
+        }
+        guard let hp = hostPort(text) else { return Parsed(link: nil, error: "format") }
+        return Parsed(link: OwnServerLink(kind: "socks5", host: hp.0, port: hp.1))
+    }
+
+    private static func place(_ l: OwnServerLink) -> String { l.host.contains(":") ? "[\(l.host)]:\(l.port)" : "\(l.host):\(l.port)" }
+
+    /* What the screen and the log show: never the password. */
+    static func describe(_ l: OwnServerLink) -> String {
+        if let v = l.vless { return Vless.describe(v) }
+        switch l.kind {
+        case "ss": return "Shadowsocks \(place(l))"
+        case "http": return "HTTP \(place(l))"
+        default: return "SOCKS5 \(place(l))"
+        }
+    }
+
+    /* The engine's --upstream-file line: the server, or for Shadowsocks the
+     * tunnel's own client on 127.0.0.1:localPort with its user and password. */
+    static func engineLine(_ l: OwnServerLink, localPort: Int = 0, auth: SocksAuth? = nil) -> String {
+        if l.localClient { return "socks5://\(auth.map { "\($0.user):\($0.pass)@" } ?? "")127.0.0.1:\(localPort)" }
+        let cred = l.user.isEmpty ? "" : "\(l.user)\(l.pass.isEmpty ? "" : ":\(l.pass)")@"
+        return "\(l.kind)://\(cred)\(place(l))"
+    }
+
+    /* The link as typed, its password hidden: ss://••••@host:port, or the
+     * user's password in the others (the screen shows this, never the
+     * password itself). */
+    static func masked(_ typed: String) -> String {
+        let t = typed.trimmingCharacters(in: .whitespacesAndNewlines)
+        // A VLESS link's UUID and a Trojan link's password are its whole secret.
+        if t.lowercased().hasPrefix("vless://") || t.lowercased().hasPrefix("trojan://"), let scheme = t.range(of: "://"), let at = t[scheme.upperBound...].firstIndex(of: "@") {
+            return "\(t[..<scheme.upperBound])••••\(t[at...])"
+        }
+        if let at = t.lastIndex(of: "@"), let scheme = t.range(of: "://") {
+            if t.lowercased().hasPrefix("ss://") { return "ss://••••\(t[at...])" }
+            let info = t[scheme.upperBound..<at]
+            if let colon = info.firstIndex(of: ":") { return "\(t[..<scheme.upperBound])\(info[..<colon]):••••\(t[at...])" }
+            return t
+        }
+        if t.lowercased().hasPrefix("ss://") { return "ss://••••" }
+        return t
+    }
+
+    /* The address in Cloudflare's trace page (/cdn-cgi/trace: "ip=1.2.3.4"
+     * on a line of its own), or nil: which address sites see through the
+     * user's own server (issue #66). */
+    static func traceIp(_ body: String) -> String? {
+        for raw in body.split(whereSeparator: { $0 == "\n" || $0 == "\r\n" }) {
+            let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard line.hasPrefix("ip=") else { continue }
+            let ip = String(line.dropFirst(3))
+            var v4 = in_addr()
+            var v6 = in6_addr()
+            if inet_pton(AF_INET, ip, &v4) == 1 || inet_pton(AF_INET6, ip, &v6) == 1 { return ip }
+            return nil
+        }
+        return nil
+    }
+
+    /* The country Cloudflare places that address in ("loc=IT"), or nil
+     * (issue #60). XX and T1 (Tor) are no country. */
+    static func traceLoc(_ body: String) -> String? {
+        for raw in body.split(whereSeparator: { $0 == "\n" || $0 == "\r\n" }) {
+            let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard line.hasPrefix("loc=") else { continue }
+            let cc = String(line.dropFirst(4))
+            guard cc.count == 2, cc.unicodeScalars.allSatisfy({ $0.value >= 65 && $0.value <= 90 }), cc != "XX", cc != "T1" else { return nil }
+            return cc
+        }
+        return nil
+    }
+
+    /* "80.174.118.60 · 🇮🇹 Italy": the address with its country's flag and
+     * name in the app's language; the address alone without a country. */
+    static func withPlace(_ ip: String, _ cc: String?, language: String = Bundle.main.preferredLocalizations.first ?? "en") -> String {
+        guard let cc, cc.count == 2, cc.unicodeScalars.allSatisfy({ $0.value >= 65 && $0.value <= 90 }) else { return ip }
+        var flag = ""
+        for s in cc.unicodeScalars { if let u = UnicodeScalar(0x1F1E6 + s.value - 65) { flag.unicodeScalars.append(u) } }
+        let name = Locale(identifier: language).localizedString(forRegionCode: cc) ?? cc
+        return "\(ip) · \(flag) \(name)"
+    }
+
+    /* The address sites see now, asked of Cloudflare's trace page the way any
+     * app's connection goes (through the tunnel, the engine and the server). */
+    static func exitAddress(session: URLSession = .shared, timeout: TimeInterval = 10) async -> String? {
+        var req = URLRequest(url: URL(string: "https://cloudflare.com/cdn-cgi/trace")!, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: timeout)
+        req.httpMethod = "GET"
+        guard let (data, resp) = try? await session.data(for: req), (resp as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+        let page = String(decoding: data, as: UTF8.self)
+        guard let ip = traceIp(page) else { return nil }
+        return withPlace(ip, traceLoc(page))
+    }
+
+    /* The engine's --upstream-file, readable by this process alone (0600
+     * from the start); read once at the engine's start, then deleted. */
+    static func writeFile(_ line: String, to path: String) throws {
+        unlink(path)
+        let fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0o600)
+        guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        defer { close(fd) }
+        let data = Array((line + "\n").utf8)
+        guard Darwin.write(fd, data, data.count) == data.count else { throw POSIXError(.EIO) }
+    }
+
+    /* Where the tunnel tells the app that the server failed (the app group's
+     * defaults): its reason, when, and which server. */
+    enum Down {
+        static let why = "ownServerDownWhy"
+        static let at = "ownServerDownAt"
+        static let server = "ownServerDownServer"
+        /* Shown this long after the engine last said so (as on the desktop). */
+        static let shownFor: TimeInterval = 90
+    }
+
+    /* Why a server could not be used, as the engine says it (engine.c,
+     * upstream_report); the screen translates the code. */
+    static let why: [String: String] = [
+        "does not answer": "noAnswer",
+        "refused the user name or password": "auth",
+        "asks for a user name and password": "asks",
+        "refused the connection": "refused",
+        "does not speak the protocol chosen": "protocol",
+    ]
+
+    static func whyCode(_ text: String?) -> String { text.flatMap { why[$0] } ?? "protocol" }
+
+    /* A link's address that only its own network reaches (192.168.x.x, 10.x,
+     * a provider's shared 100.64.x.x, fe80::, fc00::): a link "Share my
+     * connection" made where no way in from the internet opened, used from
+     * another country. Such a link failing says why ("local"). This device
+     * itself (127.x, ::1) is not a network. Never a lookup by name. */
+    static func localHost(_ host: String?) -> Bool {
+        var h = (host ?? "").trimmingCharacters(in: .whitespaces).lowercased()
+        if h.hasPrefix("[") && h.hasSuffix("]") { h = String(h.dropFirst().dropLast()) }
+        var v4 = in_addr()
+        if h.withCString({ inet_pton(AF_INET, $0, &v4) }) == 1 {
+            let b = withUnsafeBytes(of: &v4) { Array($0) }
+            if b[0] == 127 || (b[0] == 0 && b[1] == 0 && b[2] == 0 && b[3] == 0) { return false }
+            return b[0] == 10 || (b[0] == 172 && (b[1] & 0xf0) == 16) || (b[0] == 192 && b[1] == 168)
+                || (b[0] == 169 && b[1] == 254) || (b[0] == 100 && (b[1] & 0xc0) == 64)
+        }
+        var v6 = in6_addr()
+        if h.contains(":"), h.withCString({ inet_pton(AF_INET6, $0, &v6) }) == 1 {
+            let b = withUnsafeBytes(of: &v6) { Array($0) }
+            return (b[0] & 0xfe) == 0xfc || (b[0] == 0xfe && (b[1] & 0xc0) == 0x80)
+        }
+        return false
+    }
+
+    /* The reason, or "local" for such a link. */
+    static func localIf(_ code: String, host: String?) -> String { localHost(host) ? "local" : code }
+
+    static func whyKey(_ code: String?) -> String {
+        switch code {
+        case "noAnswer": return "ownServerWhyNoAnswer"
+        case "auth": return "ownServerWhyAuth"
+        case "asks": return "ownServerWhyAsks"
+        case "refused": return "ownServerWhyRefused"
+        case "silent": return "ownServerWhySilent"
+        case "tls": return "ownServerWhyTls"
+        case "local": return "ownServerWhyLocal"
+        case "cert": return "ownServerWhyCert"
+        default: return "ownServerWhyProtocol"
+        }
+    }
+
+    /* The reason a link cannot be used, as the screen says it. */
+    static func errorKey(_ error: String?) -> String {
+        switch error {
+        case "method": return "ownServerErrMethod"
+        case "user": return "ownServerErrUser"
+        case "unsupported": return "ownServerErrUnsupported"
+        default: return "ownServerErrFormat"
+        }
+    }
+
+    /* The texts themselves. Each key is named here as tr("…") so that
+     * scripts/gen-strings.js, which collects the keys the sources name,
+     * puts every one of them into the app. */
+    static func whyText(_ code: String?) -> String {
+        switch whyKey(code) {
+        case "ownServerWhyNoAnswer": return tr("ownServerWhyNoAnswer")
+        case "ownServerWhyAuth": return tr("ownServerWhyAuth")
+        case "ownServerWhyAsks": return tr("ownServerWhyAsks")
+        case "ownServerWhyRefused": return tr("ownServerWhyRefused")
+        case "ownServerWhySilent": return tr("ownServerWhySilent")
+        case "ownServerWhyTls": return tr("ownServerWhyTls")
+        case "ownServerWhyLocal": return tr("ownServerWhyLocal")
+        case "ownServerWhyCert": return tr("ownServerWhyCert")
+        default: return tr("ownServerWhyProtocol")
+        }
+    }
+
+    static func errorText(_ error: String?, method: String?, what: String? = nil) -> String {
+        switch errorKey(error) {
+        case "ownServerErrMethod": return tr("ownServerErrMethod", ["method": method ?? ""])
+        case "ownServerErrUser": return tr("ownServerErrUser")
+        case "ownServerErrUnsupported": return tr("ownServerErrUnsupported", ["what": Vless.unsupportedName(what)])
+        default: return tr("ownServerErrFormat")
+        }
+    }
+}

@@ -1,0 +1,547 @@
+'use client';
+
+/*
+ * The one banner under the header that says what still needs the user.
+ *
+ * Without it the app looks broken: protection is on, the badge says active,
+ * and a site or the Discord app still will not load. Whatever Shroudly can fix
+ * by itself it fixes (autopilot.js), and this says, in one line, what it did;
+ * what only the user can do (allow a permission, save their work in Studio)
+ * is asked plainly. One banner at a time, most urgent first.
+ */
+
+import { useEffect, useState } from 'react';
+import { useLanguage } from '../contexts/LanguageContext';
+import { ShieldAlertIcon, RefreshIcon, CloseIcon, InfoIcon, CopyIcon, CheckIcon } from './icons';
+import { proxyNotice, chromiumNote, PROXY_ACTIONS } from './proxyNotice';
+import ClampedText from './ClampedText';
+import { abroadHint } from './ownServerText';
+
+function Banner({ tone = 'warn', Icon, title, body, children, onClose, closeLabel }) {
+  const c = tone === 'accent'
+    ? { bg: 'var(--accent-soft)', line: 'var(--accent-line)', icon: 'var(--accent)' }
+    : { bg: 'var(--warn-soft)', line: 'var(--warn-line)', icon: 'var(--warn)' };
+  return (
+    <div role="status" className="no-drag mx-4 mb-3 rounded-[var(--radius-sm)] border px-3 py-2.5 sm:mx-5"
+         style={{ background: c.bg, borderColor: c.line }}>
+      <div className="flex items-start gap-2.5">
+        <Icon className="mt-[1px] h-4 w-4 shrink-0" style={{ color: c.icon }} />
+        <div className="min-w-0 flex-1">
+          {title && <p className="text-[13px] font-medium leading-snug wrap-anywhere" style={{ color: 'var(--text)' }}>{title}</p>}
+          {body && (
+            <ClampedText text={body} className={`${title ? 'mt-1 text-[12px]' : 'text-[12.5px]'} leading-snug`}
+                         style={{ color: title ? 'var(--text-dim)' : 'var(--text)' }} />
+          )}
+          {children}
+        </div>
+        {onClose && (
+          <button type="button" onClick={onClose} aria-label={closeLabel}
+                  className="shrink-0 rounded-md p-1 transition-opacity hover:opacity-70" style={{ color: 'var(--text-faint)' }}>
+            <CloseIcon className="h-4 w-4" />
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Actions({ children }) {
+  return <div className="mt-2 flex flex-wrap items-center gap-2">{children}</div>;
+}
+
+/* An antivirus that quarantined, refused or keeps ending a part of Shroudly
+ * (advice.security, main.js securityBlocked). One sentence on what happened,
+ * one on what to do, and one action: the folder to add as an exception,
+ * copied when the button is clicked. Nothing is opened by itself, neither
+ * the antivirus nor the folder. Where it may be something else ("may"), it
+ * says so. */
+function SecurityNotice({ info, t, onClose, closeLabel }) {
+  const body = info.part === 'engine'
+    ? t(info.certain ? 'securityEngineBody' : 'securityEngineMaybeBody')
+    : info.kind === 'driver' ? t('securityDriverBody', { code: info.win32 ?? '?' }) : t('securityAdvancedBody');
+  // A refused driver may be Windows' own doing (a virtual machine, a policy).
+  const sure = info.certain && info.kind !== 'driver';
+  return (
+    <Banner Icon={ShieldAlertIcon} title={t(sure ? 'securityTitle' : 'securityTitleMaybe')} body={body}
+            onClose={onClose} closeLabel={closeLabel}>
+      {info.folder && (
+        <Actions>
+          <CopyButton text={info.folder} label={t('securityCopyFolder')} doneLabel={t('securityFolderCopied')} tone="btn-warn" />
+        </Actions>
+      )}
+    </Banner>
+  );
+}
+
+/* Copies a short text (a folder, an address) when pressed, and says so for
+ * a moment. */
+function CopyButton({ text, label, doneLabel, tone = 'btn-ghost' }) {
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!copied) return undefined;
+    const id = setTimeout(() => setCopied(false), 2000);
+    return () => clearTimeout(id);
+  }, [copied]);
+  const copy = async () => {
+    let ok = false;
+    try { ok = !!(await window.electron?.copyText?.(text)); } catch {}
+    if (!ok) { try { await navigator.clipboard.writeText(text); ok = true; } catch {} }
+    if (ok) setCopied(true);
+  };
+  return (
+    <button type="button" onClick={copy}
+            className={`btn ${tone} inline-flex items-center gap-1.5 rounded-[8px] px-3 py-1.5 text-[12.5px] font-semibold`}>
+      {copied ? <CheckIcon className="h-3.5 w-3.5" /> : <CopyIcon className="h-3.5 w-3.5" />}
+      <span>{copied ? doneLabel : label}</span>
+    </button>
+  );
+}
+
+/* Dismissals that should survive a restart. Storage can be unavailable. */
+function remembered(key) { try { return localStorage.getItem(key) === '1'; } catch { return false; } }
+function remember(key) { try { localStorage.setItem(key, '1'); } catch {} }
+
+const ISSUES_URL = 'https://github.com/umutxyp/Shroudly/issues/new';
+
+// The lines about a Roblox Studio around Shroudly (shown from the apps state).
+const STUDIO_LINES = ['autoStudioReopen', 'autoStudioParent', 'autoStudioAgain'];
+
+/* proxyInPanel: the Protection panel is showing, and says itself, under its
+ * status, when browsers are not going through Shroudly (ControlPanel). */
+export default function BlockedNotice({ onNavigate, active = false, proxyInPanel = false }) {
+  const { t, locale, language, isRTL } = useLanguage();
+  const [host, setHost] = useState(null);
+  const [hostAsked, setHostAsked] = useState(false); // the autopilot asked for Advanced mode for it
+  const [hostAt, setHostAt] = useState(0);
+  const [advanced, setAdvanced] = useState(false);
+  const [restartApps, setRestartApps] = useState(null);
+  const [dnsAuto, setDnsAuto] = useState(null);
+  const [refused, setRefused] = useState(null);   // { host, service }: the site turns the user away itself
+  const [proxy, setProxy] = useState(null);       // what really happened to the system proxy
+  const [recovery, setRecovery] = useState(null); // macOS: settings from before a restart, still to put back
+  const [discord, setDiscord] = useState(null);
+  const [apps, setApps] = useState(null);
+  // macOS: run from its disk image or Downloads (main.js outsideApplications).
+  const [moveApp, setMoveApp] = useState(false);
+  const [moving, setMoving] = useState(false);
+  // macOS: the Mac App Store copy suggested (main.js, store-suggest.js).
+  const [storeOffer, setStoreOffer] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState(null);     // the autopilot's latest: { id, params, at }
+  const [advice, setAdvice] = useState(null);
+  const [adv, setAdv] = useState({ available: false, active: false });
+  const [hidden, setHidden] = useState({});   // banners closed this session
+  const [logSaved, setLogSaved] = useState(false);
+  const hide = (k) => setHidden((h) => ({ ...h, [k]: true }));
+  // A line of the autopilot's the user closed stays closed in the next
+  // window too (the window is closed for real when it goes to the tray).
+  const hideNotice = (n) => { hide(`auto:${n.at}`); window.electron?.autoDismiss?.(n.at); };
+
+  const refreshAdv = () => window.electron?.advancedAvailable?.()
+    .then((r) => { setAdv({ available: !!r?.available, active: !!r?.active }); setAdvanced(!!r?.available); })
+    .catch(() => {});
+  // Resolves whether Advanced mode is on now; a site that was waiting for it
+  // is then no longer a failure to show.
+  const startAdvanced = async () => {
+    setBusy(true);
+    let on = false;
+    try { const r = await window.electron?.startAdvanced?.(); on = !!(r && r.success); } catch {}
+    await refreshAdv();
+    if (on) setHost(null);
+    setBusy(false);
+    return on;
+  };
+
+  const refreshDiscord = () => window.electron?.discordStatus?.().then(setDiscord).catch(() => {});
+  const refreshApps = () => window.electron?.appsStatus?.().then(setApps).catch(() => {});
+
+  const run = async (fn) => {
+    setBusy(true);
+    try { await fn(); } catch {}
+    await Promise.all([refreshDiscord(), refreshApps()]);
+    setBusy(false);
+  };
+  const discordRetry = () => run(() => window.electron.discordSet(discord?.pendingOn !== false));
+  // A notice is shown while it is news: a quarter of an hour at most.
+  const NOTICE_MS = 15 * 60 * 1000;
+  // The lines about Roblox Studio come from the apps state (they stay while
+  // that Studio runs), so they never replace another line here.
+  const onNotice = (n) => {
+    if (!n || !n.id) return;
+    if (!STUDIO_LINES.includes(n.id)) setNotice(n);
+    // Advanced mode on: the site it was turned on for is no longer a failure.
+    if (['autoAdvancedOn', 'autoAroundOn', 'autoAroundOnAny'].includes(n.id)) setHost(null);
+    refreshAdv(); refreshApps(); refreshDiscord();
+  };
+
+  useEffect(() => {
+    window.electron?.appPlacement?.().then((p) => setMoveApp(!!(p && p.move))).catch(() => {});
+    // Asked a little after the window opens, so it is never what greets a
+    // first start; shown only when nothing else here needs saying.
+    const t = setTimeout(() => { window.electron?.storeSuggest?.().then((o) => setStoreOffer(o || null)).catch(() => {}); }, 20000);
+    return () => clearTimeout(t);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.electron?.onSiteBlocked) return undefined;
+    window.electron.onSiteBlocked(({ host: h, asked }) => { setHost(h); setLogSaved(false); setHostAsked(!!asked); setHostAt(Date.now()); refreshAdv(); });
+    const offAdv = window.electron.onAdvancedState?.(() => refreshAdv());
+    window.electron.onNeedRestart?.(({ apps }) => { setRestartApps(apps); refreshDiscord(); });
+    window.electron.onDnsAutoEnabled?.(({ host: h }) => setDnsAuto(h));
+    const offRefused = window.electron.onServiceRefused?.((p) => setRefused(p));
+    const offProxy = window.electron.onProxyStatus?.((p) => setProxy(p));
+    window.electron.proxyStatus?.().then((p) => p && setProxy(p)).catch(() => {});
+    const offRecovery = window.electron.onProxyRecovery?.((r) => setRecovery(r));
+    window.electron.proxyRecovery?.().then((r) => setRecovery(r || null)).catch(() => {});
+    const offDiscord = window.electron.onDiscordState?.(() => refreshDiscord());
+    const offApps = window.electron.onAppsState?.(() => refreshApps());
+    window.electron.onAdvice?.((a) => { setAdvice(a); refreshAdv(); });
+    const offNotice = window.electron.onAutoNotice?.(onNotice);
+    // A panel the background process asks for (the tray's Copy logs, where
+    // the desktop would not take the log from it).
+    const offNav = window.electron.onNavigate?.((tab) => {
+      if (typeof onNavigate === 'function' && ['control', 'stats', 'settings', 'logs', 'follow', 'info'].includes(tab)) onNavigate(tab);
+    });
+    window.electron.autoNotices?.().then((list) => { if (Array.isArray(list) && list[0]) onNotice(list[0]); }).catch(() => {});
+    // Listening now: notices that came while there was no window follow.
+    window.electron.uiReady?.();
+    window.electron.getAdvice?.().then((a) => a && setAdvice(a)).catch(() => {});
+    refreshAdv();
+    refreshDiscord();
+    refreshApps();
+    return () => {
+      if (typeof offNotice === 'function') offNotice();
+      if (typeof offNav === 'function') offNav();
+      if (typeof offAdv === 'function') offAdv();
+      window.electron.removeSiteBlockedListener?.();
+      window.electron.removeNeedRestartListener?.();
+      window.electron.removeDnsAutoEnabledListener?.();
+      if (typeof offDiscord === 'function') offDiscord(); else window.electron.removeDiscordStateListener?.();
+      if (typeof offApps === 'function') offApps(); else window.electron.removeAppsStateListener?.();
+      if (typeof offRefused === 'function') offRefused();
+      if (typeof offProxy === 'function') offProxy();
+      if (typeof offRecovery === 'function') offRecovery();
+      window.electron.removeAdviceListener?.();
+    };
+  }, []);
+
+
+  // Protection started or stopped (window, tray): Advanced mode may have
+  // stopped with it.
+  useEffect(() => { refreshAdv(); }, [active]);
+
+  // What the X on a notice does, as screen readers say it (was "Skip").
+  const closeLabel = t('close');
+
+  /* The engine taken or refused by an antivirus: before everything else,
+   * since nothing else here works without it. */
+  const security = advice?.security;
+  if (security && security.part === 'engine' && !hidden[`security:${security.at}`]) {
+    return <SecurityNotice info={security} t={t} onClose={() => hide(`security:${security.at}`)} closeLabel={closeLabel} />;
+  }
+
+  /* The system proxy is what routes browsers and most programs: when it is
+   * not in place, nothing else here matters, so this comes first (after the
+   * engine taken by an antivirus only): Discord's and the apps' banners
+   * hid it. Which banner, and its button, is decided in proxyNotice.js.
+   * While browsers are not going through Shroudly it stays until that is
+   * fixed: closing it left a green "Protected" with nothing to say
+   * otherwise. On the Protection panel the panel itself says it, under its
+   * status, and nothing further down here is shown until it is fixed. An
+   * address to set by hand (Linux desktops without a proxy setting) is one
+   * press from the clipboard. */
+  const pn = proxyNotice(proxy, { active, recovery, advanced: adv });
+  if (pn && pn.notRouting && proxyInPanel) return null;
+  if (pn && (pn.notRouting || !hidden[pn.id])) {
+    const a = pn.action ? PROXY_ACTIONS[pn.action] : null;
+    const go = async () => {
+      const r = await a.run(pn);
+      if (r && r.ok && pn.action === 'admin') setProxy({ ...proxy, ok: true });
+      if (r && r.ok && pn.action === 'recover') setRecovery(null);
+    };
+    return (
+      <Banner Icon={pn.icon === 'info' ? InfoIcon : ShieldAlertIcon} title={pn.title ? t(pn.title) : null} body={t(pn.body, pn.params)}
+              onClose={pn.notRouting ? null : () => hide(pn.id)} closeLabel={closeLabel}>
+        {(a || pn.params?.pac) && (
+          <Actions>
+            {a && (
+              <button type="button" disabled={busy} onClick={() => run(go)}
+                      className="btn btn-primary rounded-[8px] px-3 py-1.5 text-[12.5px] font-semibold">{t(a.label)}</button>
+            )}
+            {pn.params?.pac && pn.action !== 'copyPac' && <CopyButton text={pn.params.pac} label={t('copyAddress')} doneLabel={t('supportCopied')} />}
+          </Actions>
+        )}
+      </Banner>
+    );
+  }
+
+  /* macOS, run from its disk image or Downloads: starting at login and
+   * updates need it in Applications. One button moves it there, and it
+   * starts again from there by itself. */
+  if (moveApp && !hidden.moveApp) {
+    const move = async () => {
+      setMoving(true);
+      const r = await window.electron?.moveToApplications?.().catch(() => null);
+      if (!r || !r.ok) setMoving(false);
+    };
+    return (
+      <Banner tone="accent" Icon={InfoIcon} title={t('moveToAppsTitle')} body={t('moveToAppsBody')}
+              onClose={() => hide('moveApp')} closeLabel={closeLabel}>
+        <Actions>
+          <button type="button" onClick={move} disabled={moving}
+                  className="btn btn-primary rounded-[8px] px-3 py-1.5 text-[12.5px] font-semibold">{t('moveToAppsBtn')}</button>
+        </Actions>
+      </Banner>
+    );
+  }
+  if (dnsAuto && !restartApps) {
+    return <Banner tone="accent" Icon={ShieldAlertIcon} body={t('dnsAutoEnabledNotice', { host: dnsAuto })}
+                   onClose={() => setDnsAuto(null)} closeLabel={closeLabel} />;
+  }
+
+  /* Discord app mode, most urgent first: the change could not be made, then
+   * the change is made but the open Discord has not picked it up. */
+  if (discord?.needsPermission && !hidden.discordPermission) {
+    return (
+      <Banner Icon={ShieldAlertIcon} body={t('discordPermission')} onClose={() => hide('discordPermission')} closeLabel={closeLabel}>
+        <Actions>
+          <button type="button" onClick={discordRetry} disabled={busy}
+                  className="btn btn-warn rounded-[8px] px-3 py-1.5 text-[12.5px] font-semibold">{t('discordPermissionBtn')}</button>
+        </Actions>
+      </Banner>
+    );
+  }
+  if (discord?.locked && !hidden.discordLocked) {
+    const body = discord.lockedReason === 'running' ? t('discordLockedRunning')
+      : discord.lockedReason === 'protected' ? t('discordLockedProtected')
+        : t('discordLocked');
+    return (
+      <Banner Icon={ShieldAlertIcon} body={body} onClose={() => hide('discordLocked')} closeLabel={closeLabel}>
+        <Actions>
+          {/* The messages say "click Try again": the button says so too. */}
+          <button type="button" onClick={discordRetry} disabled={busy}
+                  className="btn btn-warn rounded-[8px] px-3 py-1.5 text-[12.5px] font-semibold">{t('discordTryAgain')}</button>
+        </Actions>
+      </Banner>
+    );
+  }
+  /* Discord's settings file could not be written (damaged, in use, a full
+   * disk): which file, and what to do in it by hand, the right way round
+   * (turning off, the line is taken out), and Try again. */
+  const edit = discord?.editFailed;
+  if (edit && typeof edit === 'object' && !hidden.discordEdit) {
+    const file = (edit.files || []).join(', ');
+    return (
+      <Banner Icon={ShieldAlertIcon}
+              body={edit.on ? t('discordEditFailed', { line: edit.line, file }) : t('discordEditFailedOff', { key: edit.key, file })}
+              onClose={() => hide('discordEdit')} closeLabel={closeLabel}>
+        <Actions>
+          <button type="button" onClick={discordRetry} disabled={busy}
+                  className="btn btn-warn rounded-[8px] px-3 py-1.5 text-[12.5px] font-semibold">{t('discordTryAgain')}</button>
+        </Actions>
+      </Banner>
+    );
+  }
+
+  /* Games and apps mode: a proxy of the user's own in the way, a change that
+   * could not be made, then a Roblox opened before the change. */
+  if (apps?.foreign && !hidden.appsForeign) {
+    return <Banner Icon={ShieldAlertIcon} body={t('appForeign')} onClose={() => hide('appsForeign')} closeLabel={closeLabel} />;
+  }
+  if (apps?.failed && !hidden.appsFailed) {
+    return <Banner Icon={ShieldAlertIcon} body={t('appFailed')} onClose={() => hide('appsFailed')} closeLabel={closeLabel} />;
+  }
+  /* Advanced mode blocked by an antivirus: everything else works, so after
+   * the system proxy's banner. */
+  if (security && security.part === 'advanced' && !hidden[`security:${security.at}`]) {
+    return <SecurityNotice info={security} t={t} onClose={() => hide(`security:${security.at}`)} closeLabel={closeLabel} />;
+  }
+
+  /* The site itself turns this user away (by country or policy): nothing a
+   * technique can change, said the same way for every site and country. */
+  if (refused && !hidden[`refused:${refused.host}`]) {
+    return (
+      <Banner Icon={ShieldAlertIcon}
+              title={t(refused.service === 'stall' ? 'probeStallTitle' : 'probeServiceTitle', { host: refused.host })}
+              body={refused.service === 'stall' ? t('probeStallBody', { host: refused.host })
+                : `${t('probeServiceBody', { host: refused.host })}${advice?.ownServerOn ? '' : ` ${abroadHint(t, isRTL)}`}`}
+              onClose={() => hide(`refused:${refused.host}`)} closeLabel={closeLabel} />
+    );
+  }
+
+  /* Roblox Studio open around Shroudly. Shroudly never closes Studio itself:
+   * it may hold work that is not saved. Said while that Studio runs; a later
+   * Studio is a new line, even if this one was closed. The first asks to
+   * reopen it; one around again says what works (autoStudioParent names the
+   * program that started it, autoStudioAgain does not). */
+  const studioAt = apps?.studioReopenAt || 0;
+  if (active && studioAt && !hidden[`studio:${studioAt}`]) {
+    const studioLine = { autoStudioParent: 'autoStudioParent', autoStudioAgain: 'autoStudioAgain' }[apps?.studioReopenId] || 'autoStudioReopen';
+    return <Banner tone="accent" Icon={RefreshIcon} body={t(studioLine, apps?.studioReopenParams || {})}
+                   onClose={() => hide(`studio:${studioAt}`)} closeLabel={closeLabel} />;
+  }
+
+  /* What the autopilot just did by itself. Advanced mode that was declined
+   * or could not start keeps its button, while it is still off: turning it
+   * on then is the user's call. Once it is on, that line has nothing to say.
+   * One an antivirus blocked comes after its banner (above), so its button
+   * is there once the user has closed that (allowed it, most likely). */
+  const advNotice = notice && ['autoAdvancedDeclined', 'autoAdvancedFailed', 'autoSecurityAdvanced'].includes(notice.id);
+  // Advanced mode needed and not asked for by itself (declined or turned off
+  // earlier, failed earlier this session, a game's anti-cheat): one line
+  // saying so and what to do, gone once Advanced mode is on.
+  const advNotAsked = notice && ['autoAdvancedOffBefore', 'autoAdvancedDeclinedBefore', 'autoAdvancedFailedBefore', 'autoAdvancedAntiCheat'].includes(notice.id);
+  // A site that failed after this line, and that the autopilot did not ask
+  // about, is newer news than the line.
+  const hostNewer = host && !hostAsked && hostAt > (notice ? notice.at : 0);
+  const noticeShown = notice && Date.now() - notice.at < NOTICE_MS && !hidden[`auto:${notice.at}`]
+    && !(advNotice && adv.active) && !(advNotAsked && adv.active) && !(['autoAdvancedAsk', 'autoAroundAsk', 'autoAroundAskAny', 'autoAroundAskHost'].includes(notice.id) && adv.active)
+    && !(['autoAdvancedOn', 'autoAroundOn', 'autoAroundOnAny'].includes(notice.id) && !adv.active) && !hostNewer;
+  if (noticeShown) {
+    const offer = advNotice && adv.available && !adv.active;
+    // Windows' leftover proxy: "Shroudly can clear it" (Windows asks for an
+    // administrator), also after "Later" in its dialog.
+    const winhttp = notice.id === 'autoWinhttpDead';
+    const clearWinHttp = () => run(async () => {
+      const r = await window.electron?.clearWinHttp?.();
+      if (r && r.ok) hideNotice(notice);
+    });
+    return (
+      <Banner tone="accent" Icon={offer || winhttp ? ShieldAlertIcon : InfoIcon} body={t(notice.id, notice.params || {})}
+              onClose={() => hideNotice(notice)} closeLabel={closeLabel}>
+        {(offer || winhttp) && (
+          <Actions>
+            <button type="button" onClick={offer ? startAdvanced : clearWinHttp} disabled={busy}
+                    className="btn btn-primary rounded-[8px] px-3 py-1.5 text-[12.5px] font-semibold">{t(offer ? 'tryAdvanced' : 'winhttpReset')}</button>
+          </Actions>
+        )}
+      </Banner>
+    );
+  }
+
+  /* Another VPN or bypass tool steering the same connections: the most
+   * common reason nothing works, and the user rarely suspects it. */
+  const conflicts = advice?.conflicts || [];
+  if (conflicts.length && !hidden.conflict) {
+    const tools = conflicts.join(', ');
+    return <Banner Icon={ShieldAlertIcon} title={t('conflictTitle', { tools })} body={t('conflictBody', { tools })}
+                   onClose={() => hide('conflict')} closeLabel={closeLabel} />;
+  }
+
+  /* A site that connects and is then cut: what a blank page looks like on a
+   * network that follows whole connections. What to say depends on what this
+   * machine can still do about it. */
+  /* Programs that were open before protection started keep using the
+   * connection they were given at launch; this is the usual reason a site
+   * loads in the browser but not in its own app. Discord needs more than a
+   * restart: its updater runs before the app and ignores the proxy. */
+  if (restartApps && restartApps.length) {
+    return (
+      <Banner Icon={RefreshIcon}
+              title={t('restartAppsTitle', { apps: restartApps.join(', ') })}
+              body={t('restartAppsBody', { apps: restartApps.join(', ') })}
+              onClose={() => setRestartApps(null)} closeLabel={closeLabel} />
+    );
+  }
+
+  /* A site no technique opened. Where the autopilot asked for Advanced mode
+   * for it, its own lines say what happened (above). Otherwise: Advanced mode
+   * one click away where it can still be turned on, else what is left. */
+  if (host && !hostAsked) {
+    const offer = advanced && !adv.active;
+    // The whole log to a file, shown in the file manager (main.js saveLogs).
+    const saveLog = () => run(async () => {
+      const r = await window.electron?.saveLogs?.();
+      if (r && r.ok) setLogSaved(true);
+    });
+    return (
+      <Banner Icon={ShieldAlertIcon} title={t('blockedNoticeTitle', { host })}
+              body={advanced ? null : t('blockedNoticeNoAdvanced')}
+              onClose={() => setHost(null)} closeLabel={closeLabel}>
+        <Actions>
+          {offer ? (
+            <button type="button" onClick={startAdvanced} disabled={busy}
+                    className="btn btn-primary rounded-[8px] px-3 py-1.5 text-[12.5px] font-semibold">{t('tryAdvanced')}</button>
+          ) : (
+            <>
+              <button type="button" onClick={saveLog} disabled={busy}
+                      className="btn btn-primary rounded-[8px] px-3 py-1.5 text-[12.5px] font-semibold">
+                {t(logSaved ? 'logsSaved' : 'saveLogs')}
+              </button>
+              <a href={ISSUES_URL} target="_blank" rel="noreferrer"
+                 className="btn btn-ghost rounded-[8px] px-3 py-1.5 text-[12.5px] font-semibold">{t('linkIssues')}</a>
+            </>
+          )}
+        </Actions>
+      </Banner>
+    );
+  }
+
+  /* XFCE, LXQt and other desktops: Chromium browsers and apps opened before
+   * Shroudly answered at its address may go around it until reopened. Said
+   * once; closing it is remembered. */
+  const cn = chromiumNote(proxy, { active });
+  if (cn && !hidden[cn.id] && !remembered('shroudly_chromium_restart')) {
+    return <Banner tone="accent" Icon={InfoIcon} body={t(cn.body)}
+                   onClose={() => { remember('shroudly_chromium_restart'); hide(cn.id); }} closeLabel={closeLabel} />;
+  }
+
+  /* Encrypted DNS blocked on every route. Rare now, and it heals itself, but
+   * while it lasts the user should know why some sites may misbehave. */
+  if (active && advice?.dnsDown && !hidden.dns) {
+    return <Banner Icon={ShieldAlertIcon} title={t('dnsDownTitle')} body={t('dnsDownBody')}
+                   onClose={() => hide('dns')} closeLabel={closeLabel} />;
+  }
+
+  /* A site that connects and is then cut. Informational and shown last, so it
+   * never hides the banners above. */
+  const cut = advice?.cut;
+  if (cut && !hidden[`cut:${cut.host}`]) {
+    // Auto mode off: one technique for every site, and nothing else is tried
+    // (issue #41); turning it on is the first thing that helps.
+    if (cut.auto === false) {
+      return (
+        <Banner Icon={ShieldAlertIcon} title={t('cutTitle', { host: cut.host })} body={t('cutBodyAutoOff')}
+                onClose={() => hide(`cut:${cut.host}`)} closeLabel={closeLabel}>
+          <Actions>
+            <button type="button" disabled={busy}
+                    onClick={() => run(async () => { await window.electron?.setSetting?.('autoMode', true); hide(`cut:${cut.host}`); })}
+                    className="btn btn-warn rounded-[8px] px-3 py-1.5 text-[12.5px] font-semibold">{t('cutTurnAutoOn')}</button>
+          </Actions>
+        </Banner>
+      );
+    }
+    const body = adv.active ? t('cutBodyAdvancedOn') : adv.available ? t('cutBodyAdvanced') : t('cutBodyNoAdvanced');
+    return (
+      <Banner Icon={ShieldAlertIcon} title={t('cutTitle', { host: cut.host })} body={body}
+              onClose={() => hide(`cut:${cut.host}`)} closeLabel={closeLabel}>
+        {adv.available && !adv.active && (
+          <Actions>
+            <button type="button" onClick={startAdvanced} disabled={busy}
+                    className="btn btn-warn rounded-[8px] px-3 py-1.5 text-[12.5px] font-semibold">{t('tryAdvanced')}</button>
+          </Actions>
+        )}
+      </Banner>
+    );
+  }
+
+
+  /* macOS, the copy from GitHub: the Mac App Store copy, once it is live in
+   * this Mac's country. Last of all: only when nothing above needs saying.
+   * "Not now" or the X: once more in 30 days at most (store-suggest.js). */
+  if (storeOffer && !hidden.storeOffer) {
+    const answer = (opened) => { hide('storeOffer'); window.electron?.storeSuggestAnswer?.(opened).catch?.(() => {}); };
+    return (
+      <Banner tone="accent" Icon={InfoIcon} title={t('masTitle')} body={t('masBody')}
+              onClose={() => answer(false)} closeLabel={closeLabel}>
+        <Actions>
+          <button type="button" onClick={() => answer(true)}
+                  className="btn btn-primary rounded-[8px] px-3 py-1.5 text-[12.5px] font-semibold">{t('masOpen')}</button>
+          <button type="button" onClick={() => answer(false)}
+                  className="btn btn-ghost rounded-[8px] px-3 py-1.5 text-[12.5px] font-medium">{t('supportBannerLater')}</button>
+        </Actions>
+      </Banner>
+    );
+  }
+  return null;
+}

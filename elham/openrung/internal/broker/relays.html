@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenRung Admin · Relays</title>
+  <link rel="stylesheet" href="/admin/dashboard/dashboard.css">
+  <style>
+    .split{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-top:14px}
+    .weight{display:flex;align-items:center;gap:5px}.weight input{width:62px;padding:4px 6px;border:1px solid #327448;background:#0a1710;color:var(--text);font:inherit;border-radius:3px}.weight input:hover,.weight input:focus{border-color:var(--green);outline:none}.weight button{padding:4px 7px;font-size:11px}.weight button[disabled]{opacity:.45;cursor:default}.weight-mark{display:inline-block;padding:1px 5px;border:1px solid currentColor;font-size:10px;letter-spacing:.04em}tr.weighted td.weight-cell,tr.weighted .weight-mark{color:var(--amber)}tr.drained td.weight-cell,tr.drained .weight-mark{color:var(--red)}tr.weighted td.truncate:first-child{box-shadow:inset 3px 0 0 var(--amber)}tr.drained td.truncate:first-child{box-shadow:inset 3px 0 0 var(--red)}td.truncate{max-width:200px}
+    @media(max-width:1100px){.split{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="brand" href="/admin/dashboard" title="OpenRung admin dashboard"><svg viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M8 3v26M24 3v26M8 9h16M8 16h16M8 23h16"/></svg><span><b>OPENRUNG</b><small>Admin</small></span></a>
+      <nav class="nav" aria-label="Sections">
+        <div class="nav-title">Monitor</div>
+        <a href="/admin/dashboard"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="1.5" y="1.5" width="5" height="5" rx="1"/><rect x="9.5" y="1.5" width="5" height="5" rx="1"/><rect x="1.5" y="9.5" width="5" height="5" rx="1"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/></svg>Overview</a>
+        <a class="current" aria-current="page" href="/admin/dashboard/relays"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="1.5" y="2" width="13" height="4.5" rx="1"/><rect x="1.5" y="9.5" width="13" height="4.5" rx="1"/><path d="M4.5 4.25h.01M4.5 11.75h.01" stroke-linecap="round" stroke-width="2"/></svg>Relays</a>
+        <a href="/admin/dashboard/users"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="5" r="2.75"/><path d="M2.5 14.5c.6-2.9 2.8-4.5 5.5-4.5s4.9 1.6 5.5 4.5" stroke-linecap="round"/></svg>Users</a>
+      </nav>
+      <div class="sidebar-foot">
+        <form class="logout" method="post" action="/admin/dashboard/logout"><button type="submit">Sign out</button></form>
+        <div class="version" title="Running broker build">broker <b>%%BROKER_VERSION%%</b><span class="rev">%%BROKER_REVISION%%</span></div>
+      </div>
+    </aside>
+    <div class="content">
+      <header class="topbar">
+        <div><h1>Relays</h1><div class="subtitle">Relay fleet — registry, reachability, ranking weights and telemetry</div></div>
+        <div class="actions">
+          <span class="updated" id="updated"></span>
+          <select id="window" aria-label="History window"><option value="1h">Last hour</option><option value="24h" selected>Last 24 hours</option><option value="7d">Last 7 days</option><option value="14d">Last 14 days</option><option value="31d">Last 31 days</option></select>
+          <select id="autoRefresh" aria-label="Auto-refresh"><option value="0">Auto-refresh off</option><option value="60">Every minute</option><option value="300">Every 5 minutes</option></select>
+          <button class="primary" id="refresh" type="button">Refresh</button>
+        </div>
+      </header>
+      <main>
+        <div id="status" class="status">Loading relays…</div>
+        <section class="cards" id="cards"></section>
+        <section class="split">
+          <article class="panel"><h2>Online by country</h2><div id="countries"></div></article>
+          <article class="panel"><h2>Relay versions</h2><div id="versions"></div></article>
+          <article class="panel"><h2>Fleet mix</h2><div id="mix"></div></article>
+        </section>
+        <section class="panel" style="margin-top:14px"><div class="panel-head"><h2>Relays</h2><div class="toolbar"><input type="search" id="filter" placeholder="Filter by name, location, endpoint, version…" aria-label="Filter relays"><select id="statusFilter" aria-label="Status filter"><option value="">All relays</option><option value="online">Online</option><option value="offline">Offline</option><option value="unreachable">Unreachable</option><option value="weighted">Weighted down</option></select><span class="hint" id="shown"></span></div></div><div class="scroll"><table><thead><tr><th>Relay</th><th>Status</th><th>Weight</th><th title="Telemetry score (0–1) the broker ranks with; hover a value for its parts">Score</th><th title="Chance this relay heads a public relay-list response: its share of the fleet's selection weight (score¹² × weight)">Lead share</th><th>Location</th><th>Endpoint</th><th>Access address</th><th>Contact</th><th>Transport</th><th>Version</th><th>Connected clients</th><th>Active sessions</th><th>Clients</th><th>Sessions</th><th>Success</th><th>Failed</th><th>Top failure</th><th>Speed</th><th>Last seen</th><th>Registered</th></tr></thead><tbody id="relays"></tbody></table></div><div class="muted" id="truncation" style="margin-top:8px"></div></section>
+        <div class="meta" id="meta"></div>
+      </main>
+    </div>
+  </div>
+  <script src="/admin/dashboard/dashboard.js"></script>
+  <script>
+    let loading=false;
+    function countRanks(rows,key){const counts=new Map();for(const row of rows){const name=key(row);if(!name)continue;counts.set(name,(counts.get(name)||0)+1)}return [...counts.entries()].map(([name,count])=>({name,count})).sort((a,b)=>b.count-a.count||a.name.localeCompare(b.name))}
+    function locationCell(x){if(!x.country&&!x.country_code&&!x.city)return '—';const country=x.country_code||x.country||'';return esc(x.city?`${x.city}, ${country}`:(x.country||x.country_code))}
+    // Online relays whose latest inbound probe failed are registered but
+    // withheld from clients; the badge says so beside the lease state.
+    function statusCell(x){const lease=`<span class="badge ${x.online?'active':'inactive'}">${x.online?'online':'offline'}</span>`;return x.online&&x.reachable===false?lease+' <span class="badge unreachable" title="endpoint failed the broker\'s inbound reachability probe; withheld from clients">unreachable</span>':lease}
+    function transportCell(x){if(!x.online)return '—';return esc([x.transport||'direct',x.punch_capable?'punch':null,x.wss_fronts?'wss':null].filter(Boolean).join(' · '))}
+    function speedCell(x){if(!x.speed_tests)return '—';return `<span title="TTFB ${(x.average_ttfb_ms||0).toFixed(0)} ms · ${number(x.speed_tests)} tests">${(x.average_mbps||0).toFixed(1)} Mbps</span>`}
+    // Last seen: the broker heartbeat for online relays, the latest telemetry
+    // event for offline ones (their registration is gone).
+    function lastSeenCell(x){const value=x.online?(x.last_heartbeat_at||x.last_seen_at):x.last_seen_at;return timeCell(value,x.online?'last broker heartbeat':'last telemetry event')}
+    // Ranking weight: the operator's multiplier on this relay's rank. 1 is the
+    // telemetry ranking untouched; below 1 the row is flagged amber (red when
+    // fully drained at 0) so shifted load is visible at a glance. Weights are
+    // stored per relay ID and outlive the lease, so offline rows show and can
+    // edit theirs too — the value applies the moment the relay re-registers.
+    const weightOf=x=>typeof x.ranking_weight==='number'?x.ranking_weight:1;
+    function rowClass(x){const w=weightOf(x);return w<=0?'drained':w<1?'weighted':''}
+    // Ranking breakdown, online rows only: the telemetry score and, as its
+    // tooltip, the parts it is built from (reliability 50%, headroom 20%,
+    // latency 20%, handshake 10%, minus any over-capacity penalty).
+    function scoreCell(x){const r=x.ranking;if(!r)return '—';const parts=`reliability ${r.reliability.toFixed(2)} · headroom ${r.headroom.toFixed(2)} · latency ${r.latency.toFixed(2)} · handshake ${r.handshake.toFixed(2)}`+(r.over_capacity_penalty>0?` · over capacity −${r.over_capacity_penalty.toFixed(3)}`:'');return `<span title="${parts}">${r.score.toFixed(3)}</span>`}
+    function leadShareCell(x){const r=x.ranking;if(!r)return '—';return `<span title="selection weight ${r.selection_weight.toPrecision(3)}">${(r.head_share*100).toFixed(1)}%</span>`}
+    function weightCell(x){const w=weightOf(x),id=esc(x.relay_id),mark=w<1?`<span class="weight-mark" title="ranking weight ${w.toFixed(2)} — load shifted away from this relay">${w<=0?'DRAINED':'×'+w.toFixed(2)}</span>`:'';return `<div class="weight" data-relay="${id}"><input type="number" min="0" max="1" step="0.05" value="${w.toFixed(2)}" aria-label="ranking weight for ${id}"><button type="button" class="weight-save" title="Save ranking weight">Save</button><button type="button" class="weight-reset" title="Restore the default weight (1.00)"${w<1?'':' disabled'}>Reset</button>${mark}</div>`}
+    function activeSessionsCell(x){const capacity=x.online&&x.max_sessions?` <span class="muted">/ ${number(x.max_sessions)}</span>`:'';return `<span title="active sessions${x.online&&x.max_sessions?' / advertised capacity':''}">${number(x.active_sessions)}${capacity}</span>`}
+    function render(data){
+      const t=data.totals,rows=data.relays||[],online=rows.filter(x=>x.online);
+      const countryCount=new Set(online.map(x=>x.country_code||x.country).filter(Boolean)).size;
+      $('cards').innerHTML=[['Relays online',t.online_relays,'good'],['Foundation',t.foundation_relays,'good'],['Volunteer',t.volunteer_relays,'volunteer'],['Offline (window)',t.offline_relays,t.offline_relays?'bad':''],['Connected clients',t.connected_clients,'good'],['Active sessions',t.active_sessions,'good'],['Session capacity',t.session_capacity,''],['Countries',countryCount,''],['Weighted down',rows.filter(x=>weightOf(x)<1).length,rows.some(x=>weightOf(x)<1)?'shifted':''],['Unreachable',t.unreachable_relays,t.unreachable_relays?'bad':'']].map(([l,v,c])=>`<article class="card"><div class="label">${l}</div><div class="value ${c}">${number(v)}</div></article>`).join('');
+      $('countries').innerHTML=donut(countRanks(online,x=>x.country||x.country_code),{empty:'No location data yet',unit:'relays'});
+      $('versions').innerHTML=donut(countRanks(online,x=>x.relay_version||'unknown'),{empty:'No online relays',unit:'relays'});
+      // Direct and tunnel split the online fleet; punch and WSS are capabilities
+      // on top of either, so they are counted beneath the donut, not sliced.
+      $('mix').innerHTML=donut([{name:'Direct',count:t.direct_relays},{name:'Tunnel (hub)',count:t.tunnel_relays}].filter(x=>x.count),{empty:'No online relays',unit:'relays',note:`${number(t.punch_capable_relays)} punch capable · ${number(t.wss_capable_relays)} WSS fronted`});
+      // The API lists every online relay but caps offline rows at the busiest
+      // few hundred; the totals still count all of them, so say when rows hid.
+      const offlineShown=rows.filter(x=>!x.online).length,offlineHidden=Math.max(0,(t.offline_relays||0)-offlineShown);
+      $('truncation').textContent=offlineHidden?`Showing the busiest ${number(offlineShown)} of ${number(t.offline_relays)} offline relays seen in this window`:'';
+      allRows=rows;renderRows();
+      $('meta').textContent='Counts cover the selected window';markUpdated(data.generated_at);
+    }
+    // The table filters client-side: free text over name, ID, location,
+    // endpoint, transport and version, plus a status pick. Unsaved weight
+    // edits are kept by relay ID in drafts, not read back from the inputs,
+    // so a row that is filtered out or re-rendered by a refresh comes back
+    // with its draft; a successful save or reset clears it.
+    let allRows=[];const drafts=new Map();
+    const STATUS_FILTERS={online:x=>x.online,offline:x=>!x.online,unreachable:x=>x.online&&x.reachable===false,weighted:x=>weightOf(x)<1};
+    function matches(x){const pick=STATUS_FILTERS[$('statusFilter').value];if(pick&&!pick(x))return false;const q=$('filter').value.trim().toLowerCase();if(!q)return true;return [x.label,x.relay_id,x.city,x.country,x.country_code,x.endpoint,x.access_host,x.transport,x.relay_version,x.node_class].filter(Boolean).join(' ').toLowerCase().includes(q)}
+    function renderRows(){
+      const rows=allRows.filter(matches),filtered=rows.length!==allRows.length;
+      $('shown').textContent=allRows.length?(filtered?`${number(rows.length)} of ${number(allRows.length)} relays`:`${number(allRows.length)} relays`):'';
+      $('relays').innerHTML=rows.length?rows.map(x=>`<tr class="${rowClass(x)}"><td class="truncate" title="${esc(x.relay_id)}${nodeTitle(x.node_class)}">${relayName(esc(x.label||x.relay_id),x.node_class)}</td><td>${statusCell(x)}</td><td class="weight-cell">${weightCell(x)}</td><td>${scoreCell(x)}</td><td>${leadShareCell(x)}</td><td>${locationCell(x)}</td><td class="truncate" title="${esc(x.endpoint||'')}">${esc(x.endpoint||'—')}</td><td class="truncate" title="${esc(x.access_host||'')}">${esc(x.access_host||'—')}${x.access_reachable===false?' (unreachable)':''}</td><td class="truncate" title="${esc(x.operator_contact||'')}">${esc(x.operator_contact||'—')}</td><td>${transportCell(x)}</td><td>${esc(x.relay_version||'—')}</td><td>${number(x.active_clients)}</td><td>${activeSessionsCell(x)}</td><td>${number(x.clients)}</td><td>${number(x.sessions)}</td><td>${number(x.successes)}</td><td>${number(x.failures)}</td><td class="truncate" title="${esc(x.top_failure_reason||'')}">${esc(x.top_failure_reason||'—')}</td><td>${speedCell(x)}</td><td>${lastSeenCell(x)}</td><td>${timeCell(x.registered_at)}</td></tr>`).join(''):`<tr><td colspan="21" class="empty">${allRows.length?'No relays match the filter':'No relays registered and no relay telemetry in this window'}</td></tr>`;
+      for(const control of document.querySelectorAll('#relays .weight'))if(drafts.has(control.dataset.relay))control.querySelector('input').value=drafts.get(control.dataset.relay);
+    }
+    $('filter').addEventListener('input',renderRows);$('statusFilter').addEventListener('change',renderRows);
+    $('relays').addEventListener('input',event=>{if(!event.target.matches('.weight input'))return;const relayID=event.target.closest('.weight').dataset.relay;if(event.target.value===event.target.defaultValue)drafts.delete(relayID);else drafts.set(relayID,event.target.value)});
+    // One delegated listener covers every row's Save/Reset: rows are re-rendered
+    // on each load, so per-button handlers would have to be re-bound each time.
+    async function setWeight(relayID,weight){const path='/admin/api/dashboard/relays/'+encodeURIComponent(relayID)+'/weight';status(weight===null?`Restoring default weight for ${relayID}…`:`Setting weight ${weight.toFixed(2)} for ${relayID}…`);try{const result=weight===null?await fetchJSON(path,{method:'DELETE'}):await fetchJSON(path,{method:'PUT',body:{weight}});status(`Relay ${result.relay_id}: weight ${result.previous_weight.toFixed(2)} → ${result.weight.toFixed(2)}`);const input=document.querySelector(`#relays .weight[data-relay="${CSS.escape(relayID)}"] input`);drafts.delete(relayID);if(input)input.defaultValue=input.value=result.weight.toFixed(2);await load()}catch(error){status('Could not update weight: '+error.message,true)}}
+    $('relays').addEventListener('click',event=>{const button=event.target.closest('button');if(!button)return;const control=button.closest('.weight');if(!control)return;const relayID=control.dataset.relay;if(button.classList.contains('weight-reset'))return setWeight(relayID,null);if(button.classList.contains('weight-save')){const value=Number(control.querySelector('input').value);if(!Number.isFinite(value)||value<0||value>1)return status('Weight must be a number between 0 and 1',true);return setWeight(relayID,value)}});
+    $('relays').addEventListener('keydown',event=>{if(event.key==='Enter'&&event.target.matches('.weight input')){event.preventDefault();event.target.closest('.weight').querySelector('.weight-save').click()}});
+    async function load({quiet=false}={}){if(loading)return;loading=true;$('refresh').disabled=true;const previous=$('status').textContent,keep=previous.startsWith('Relay ');if(!keep&&!quiet)status('Loading relays…');try{render(await fetchJSON('/admin/api/dashboard/relays?window='+encodeURIComponent($('window').value)));status(keep?previous:'')}catch(error){status('Could not load relays: '+error.message,true)}finally{loading=false;$('refresh').disabled=false}}
+    $('refresh').addEventListener('click',()=>load());setupWindow(()=>load());
+    // An automatic reload re-renders the table, so it waits while a weight is being edited.
+    setupRefresh({load,busy:()=>!!document.activeElement?.closest('.weight')});
+    load();
+  </script>
+</body>
+</html>

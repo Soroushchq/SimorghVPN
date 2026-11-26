@@ -1,0 +1,198 @@
+package com.example.nova
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffColorFilter
+
+/**
+ * Фон главного экрана в режиме «изображение».
+ *
+ * ## Что здесь было
+ *
+ * Полноэкранный `background.webp` на 810 КБ, единственный на все темы. Владелец
+ * убрал его совсем: фоном теперь служит **та же фактура**, что выбрана для
+ * экранов настроек, а «без фактуры» означает чёрный экран.
+ *
+ * Выигрыш не только в размере APK. Главный экран темы не применяет и жил со
+ * своей картинкой, не связанной ни с одной из двенадцати палитр; теперь он
+ * меняется вместе с ними и красится тем же акцентом.
+ *
+ * ## Почему растр, а не слои
+ *
+ * Отдать `ImageView` стопку «чёрная заливка + узор» было бы дешевле по памяти на
+ * один растр, но [BackdropRevealImageView] раскрывает фон кругом: он рисует
+ * **drawable** внутрь `saveLayer` и маскирует его. Фон вида в эту маску не
+ * попадает — он рисуется раньше `onDraw` и появился бы сразу и целиком, без
+ * раскрытия. Поэтому чёрный обязан быть частью самой картинки.
+ *
+ * ## Размер
+ *
+ * Узор берётся из общего кэша ([NovaTextureCache]) тем же ключом, что и у
+ * настроек, поэтому второй раз он не строится и второй копии в памяти не
+ * заводит. Сведённый растр выходит той же стороны — до 1440 точек, — и
+ * растягивается `centerCrop`; прежний `background.webp` декодировался с запасом
+ * в 1.35 экрана, то есть дороже.
+ */
+internal object NovaMainBackdrop {
+
+    /**
+     * Прозрачность фактуры на главном экране.
+     *
+     * Вдвое больше, чем 56/255 на экранах настроек, и это замерено на телефоне, а
+     * не выбрано на глаз: под фактурой здесь нет ни карточек, ни списков — только
+     * кнопка и пара надписей по центру, — и при настроечной вуали фон читался как
+     * грязь на матрице. Прежняя картинка была полноцветной и занимала экран
+     * целиком; 112/255 возвращает тот же вес, не мешая неоновым надписям.
+     */
+    private const val TEXTURE_ALPHA = 112
+
+    /**
+     * Живой дождь «Matrix» вместо растра: тот же [NovaAppearanceDrawable], что и на
+     * экранах настроек, с чёрной основой и прозрачностью главного экрана. `null` —
+     * фактура статичная, и идёт прежний путь через [request].
+     *
+     * Клок общий на процесс, поэтому пересоздание drawable (смена оформления)
+     * не сбрасывает дождь.
+     */
+    fun liveDrawable(context: Context): android.graphics.drawable.Drawable? {
+        if (NovaAppearance.texture(context) != NovaAppearance.Texture.MATRIX) return null
+        val alpha = scaledAlpha(context)
+        return NovaAppearanceDrawable(
+            NovaAppearance.Texture.MATRIX,
+            accent(context),
+            NovaAppearance.variant(context),
+            textureAlpha = alpha,
+            blackBase = true,
+            rainAlpha = alpha,
+            // Главный экран — единственный, где дождь живёт: остальные экраны рисуют кадр.
+            animated = true,
+        )
+    }
+
+    /**
+     * Готовый фон или `null`, если узор ещё строится.
+     *
+     * `onReady` зовётся **из фонового потока** — виды в нём трогать нельзя.
+     */
+    fun request(context: Context, onReady: (Bitmap) -> Unit): Bitmap? {
+        val texture = NovaAppearance.texture(context)
+        // «Без фактуры» — это чёрный экран, а не прежняя картинка: так попросил
+        // владелец, и так же ведёт себя пункт «Без фона» в самих настройках.
+        if (!texture.hasPattern) return black()
+        val accent = accent(context)
+        val alpha = scaledAlpha(context)
+        val size = displaySize(context)
+        val key = NovaTextureCache.keyFor(texture, size[0], size[1], NovaAppearance.variant(context))
+        val ready = NovaTextureCache.request(key) { mask -> onReady(compose(mask, accent, alpha)) }
+        return if (ready != null) compose(ready, accent, alpha) else null
+    }
+
+    /**
+     * Подпись текущего выбора.
+     *
+     * Главный экран сверяет её на возврате: фактуру и тему могли поменять в
+     * настройках, пока он лежал в стопке, и без сверки фон остался бы прежним до
+     * перезапуска приложения. Обход дерева видов тут ни при чём — сравниваются
+     * четыре значения.
+     */
+    /** Сколько разных узоров чередует погружение; дальше они берутся из памяти. */
+    private const val DIVE_VARIANTS = 3
+
+    /** Сведённые слои погружения: ключ — подпись оформления и вариант. */
+    private val diveLayers = LinkedHashMap<String, Bitmap>()
+
+    /**
+     * Узор для очередного цикла погружения ([BackdropRevealImageView]).
+     *
+     * Половина размера экрана: слой всё равно растягивается до двух раз, и
+     * полный размер стоил бы вчетверо больше памяти и времени построения.
+     * Вариантов [DIVE_VARIANTS], по кругу: после первого круга новые узоры не
+     * строятся вовсе. Ответ — на главном потоке.
+     */
+    fun requestDiveLayer(context: Context, cycle: Int, onReady: (Bitmap) -> Unit) {
+        val app = context.applicationContext
+        val texture = NovaAppearance.texture(app)
+        if (!texture.hasPattern) return
+        val variant = NovaAppearance.variant(app) + 1 + Math.floorMod(cycle, DIVE_VARIANTS)
+        val cacheKey = "${signature(app)}|$variant"
+        synchronized(diveLayers) { diveLayers[cacheKey] }?.let { onReady(it); return }
+        val accent = accent(context)
+        val alpha = scaledAlpha(context)
+        val size = displaySize(app)
+        val key = NovaTextureCache.keyFor(texture, size[0] / 2, size[1] / 2, variant)
+        val main = android.os.Handler(android.os.Looper.getMainLooper())
+        fun deliver(mask: Bitmap?) {
+            if (mask == null) return
+            val composed = compose(mask, accent, alpha)
+            synchronized(diveLayers) {
+                // Слои прошлого оформления больше не нужны: держим только свои.
+                diveLayers.keys.retainAll { it.startsWith(signature(app) + "|") }
+                diveLayers[cacheKey] = composed
+            }
+            main.post { onReady(composed) }
+        }
+        NovaTextureCache.request(key) { mask -> deliver(mask) }?.let { deliver(it) }
+    }
+
+    fun signature(context: Context): String =
+        "${NovaAppearance.texture(context).key}|${NovaAppearance.variant(context)}|" +
+            "${NovaAppearance.hue(context)}|${NovaAppearance.saturation(context)}|" +
+            NovaAppearance.brightness(context)
+
+    /**
+     * Размер экрана целиком, вместе с системными полосами.
+     *
+     * Не `resources.displayMetrics`: тот отдаёт окно приложения, то есть высоту
+     * **без** системных полос. Слой настроек строит узор по границам своего окна,
+     * а оно развёрнуто во весь экран (`NovaTheme.applyEdgeToEdge`), — и на Pixel
+     * 4a две мерки разошлись: 1080×2340 против 1080×2139, то есть 664×1440 против
+     * 727×1440 после урезания. Разные размеры — разные ключи, и общий кэш
+     * переставал быть общим: узор строился дважды, занимал вдвое больше памяти, а
+     * при пределе в два растра оба экрана ещё и вытесняли друг друга.
+     */
+    private fun displaySize(context: Context): IntArray {
+        val manager = context.getSystemService(android.view.WindowManager::class.java)
+            ?: return intArrayOf(1080, 2340)
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            val bounds = manager.currentWindowMetrics.bounds
+            return intArrayOf(bounds.width(), bounds.height())
+        }
+        val metrics = android.util.DisplayMetrics()
+        @Suppress("DEPRECATION")
+        manager.defaultDisplay.getRealMetrics(metrics)
+        return intArrayOf(metrics.widthPixels, metrics.heightPixels)
+    }
+
+    /**
+     * Один чёрный пиксель.
+     *
+     * `centerCrop` растянет его на весь экран, и это ровно чёрный фон — но без
+     * полноэкранного растра под него.
+     */
+    private fun black(): Bitmap =
+        Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.BLACK) }
+
+    private fun compose(mask: Bitmap?, accent: Int, alpha: Int): Bitmap {
+        if (mask == null || mask.isRecycled) return black()
+        val out = Bitmap.createBitmap(mask.width, mask.height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(out)
+        canvas.drawColor(Color.BLACK)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+        // Растр хранит только прозрачность: цвет ему даёт акцент темы.
+        paint.colorFilter = PorterDuffColorFilter(accent, PorterDuff.Mode.SRC_IN)
+        paint.alpha = alpha
+        canvas.drawBitmap(mask, 0f, 0f, paint)
+        return out
+    }
+
+    /** Прозрачность узора с учётом ползунка яркости; 60 — прежний вид. */
+    private fun scaledAlpha(context: Context): Int =
+        (TEXTURE_ALPHA * NovaAppearance.alphaFactor(context)).toInt().coerceIn(0, 255)
+
+    /** Цвет фактуры: оттенок и насыщенность из оформления. */
+    private fun accent(context: Context): Int = NovaAppearance.surfaceColor(context)
+}

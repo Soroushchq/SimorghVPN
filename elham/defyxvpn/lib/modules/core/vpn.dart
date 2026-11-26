@@ -1,0 +1,700 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:defyx_vpn/app/router/app_router.dart';
+import 'package:defyx_vpn/core/data/local/secure_storage/secure_storage.dart';
+import 'package:defyx_vpn/modules/core/desktop_tunnel/desktop_tunnel.dart';
+import 'package:defyx_vpn/modules/core/log.dart';
+import 'package:defyx_vpn/modules/core/network.dart';
+import 'package:defyx_vpn/modules/core/vpn_bridge.dart';
+import 'package:defyx_vpn/modules/main/application/main_screen_provider.dart';
+import 'package:defyx_vpn/modules/settings/providers/auth_provider.dart';
+import 'package:defyx_vpn/modules/settings/models/popular_app.dart';
+import 'package:defyx_vpn/modules/settings/models/split_tunnel_config.dart';
+import 'package:defyx_vpn/modules/settings/providers/settings_provider.dart';
+import 'package:defyx_vpn/modules/settings/providers/split_tunnel_provider.dart';
+import 'package:defyx_vpn/shared/providers/connection_state_provider.dart';
+import 'package:defyx_vpn/shared/providers/flow_line_provider.dart';
+import 'package:defyx_vpn/shared/providers/group_provider.dart';
+import 'package:defyx_vpn/shared/providers/logs_provider.dart';
+import 'package:defyx_vpn/shared/services/alert_service.dart';
+import 'package:defyx_vpn/shared/services/firebase_analytics_service.dart';
+import 'package:defyx_vpn/shared/services/crash_reporting_service.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:defyx_vpn/core/data/local/remote/api/flowline_service.dart';
+import 'package:defyx_vpn/core/data/local/vpn_data/vpn_data.dart';
+
+class VPN {
+  static final VPN _instance = VPN._internal();
+  final log = Log();
+  final analyticsService = FirebaseAnalyticsService();
+  final crashReportingService = CrashReportingService();
+  final alertService = AlertService();
+  bool _isReconnectMode = false;
+
+  factory VPN(ProviderContainer container) {
+    _instance._init(container);
+    return _instance;
+  }
+
+  VPN._internal();
+  String? _lastRoute;
+
+  final _vpnBridge = VpnBridge();
+  final _networkStatus = NetworkStatus();
+  final _eventChannel = EventChannel("com.defyx.progress_events");
+  final _crashEventChannel = EventChannel("com.defyx.crash_events");
+  DateTime? _lastTokenExpiredAt;
+
+  Stream<String> get vpnUpdates =>
+      _eventChannel.receiveBroadcastStream().map((event) => event.toString());
+
+  Stream<Map<dynamic, dynamic>> get crashUpdates =>
+      _crashEventChannel.receiveBroadcastStream().cast<Map<dynamic, dynamic>>();
+
+  bool _initialized = false;
+  ProviderContainer? _container;
+  StreamSubscription<String>? _vpnSub;
+  StreamSubscription<Map<dynamic, dynamic>>? _crashSub;
+  DateTime? _connectionStartTime;
+
+  void _init(ProviderContainer container) {
+    if (_initialized) return;
+    _initialized = true;
+    _container = container;
+
+    _container?.read(settingsProvider.notifier).saveState();
+
+    alertService.init();
+    DesktopTunnel.instance.onLog = (message) {
+      log.addLog('[TUN] $message');
+      debugPrint('[TUN] $message');
+    };
+    _loadChangeRootListener();
+    log.logAppVersion();
+    final now = DateTime.now();
+    final offset = now.timeZoneOffset;
+    final offsetInHours = offset.inMinutes / 60.0;
+    _vpnBridge.setTimezone(offsetInHours.toString());
+    vpnUpdates.listen((msg) {
+      _handleVPNUpdates(msg);
+    });
+
+    // Listen for Go crash events and report to Crashlytics.
+    // Only mobile platforms implement the crash_events channel natively,
+    // so skip it on desktop to avoid MissingPluginException noise.
+    if (Platform.isAndroid || Platform.isIOS) {
+      crashUpdates.listen((crashData) {
+        _handleCrashEvent(crashData);
+      });
+    }
+  }
+
+  void dispose() {
+    _vpnSub?.cancel();
+    _crashSub?.cancel();
+  }
+
+  Future<void> autoConnect() async {
+    final connectionState = _container?.read(connectionStateProvider);
+
+    if (connectionState?.status == ConnectionStatus.disconnected) {
+      log.addLog('[INFO] Auto-connect triggered');
+      await _connect();
+    } else {
+      log.addLog(
+        '[INFO] Auto-connect skipped - already connected or connecting',
+      );
+    }
+  }
+
+  void _loadChangeRootListener() {
+    final router = _container?.read(routerProvider);
+    router?.routeInformationProvider.addListener(() {
+      final currentRoute = _container?.read(currentRouteProvider);
+      if (currentRoute == _lastRoute) {
+        return;
+      }
+      _lastRoute = currentRoute;
+      if (currentRoute == DefyxVPNRoutes.main.route) {
+        _updatePing();
+      }
+    });
+  }
+
+  void _handleVPNUpdates(String msg) {
+    final ref = _container!;
+    final loggerNotifier = ref.read(loggerStateProvider.notifier);
+    final groupNotifier = ref.read(groupStateProvider.notifier);
+    final connectionState = ref.read(connectionStateProvider);
+
+    final connectionStateIsError =
+        connectionState.status == ConnectionStatus.error;
+
+    if (msg.startsWith("Data: Config index: ")) {
+      final configIndex = msg.replaceAll("Data: Config index: ", "");
+      final step = int.parse(configIndex);
+      _setConnectionStep(step);
+      loggerNotifier.setConnecting();
+
+      if (step > 1) {
+        alertService.heartbeat();
+      }
+    }
+
+    if (msg.startsWith("Data: Firebase ")) {
+      final message = msg.replaceAll("Data: Firebase ", "");
+      return _sendCoreFirebaseMessage(message);
+    }
+
+    if (msg.startsWith("Data: VPN connected")) {
+      _onSuccessConnect();
+    }
+    if (msg.startsWith("Data: VPN failed")) {
+      _onFailerConnect();
+    }
+    if (msg.startsWith("Data: VPN cancelled")) {
+      _closeTunnel(keepConnectionStatus: connectionStateIsError);
+    }
+    if (msg.startsWith("Data: VPN group failed")) {
+      loggerNotifier.setSwitchingMethod();
+    }
+    if (msg.startsWith("Data: VPN stopped")) {
+      _onProxyStopped(keepConnectionStatus: connectionStateIsError);
+    }
+    if (msg.startsWith("Data: VPN connecting")) {
+      _onLoading();
+    }
+    if (msg.startsWith("Data: Config label: ")) {
+      final configLabel = msg.replaceAll("Data: Config label: ", "");
+      _vpnBridge.setConnectionMethod(configLabel);
+      groupNotifier.setGroupName(configLabel);
+    }
+
+    if (msg.startsWith("Data: Config Numbers: ")) {
+      final configIndex = msg.replaceAll("Data: Config Numbers: ", "");
+      _setConnectionTotalSteps(int.parse(configIndex));
+    }
+
+    if (msg.startsWith("Data: Token expired")) {
+      // Debounce: the native engine can emit this repeatedly for one real expiry event.
+      final now = DateTime.now();
+      if (_lastTokenExpiredAt == null ||
+          now.difference(_lastTokenExpiredAt!) > const Duration(seconds: 5)) {
+        _lastTokenExpiredAt = now;
+        crashReportingService.recordError(
+          'Token expired signal received from native VPN engine',
+          null,
+          reason: 'TokenExpiredSignal',
+        );
+        ref.read(authProvider.notifier).logout();
+        ref
+            .read(flowlineServiceProvider)
+            .saveFlowline(offlineMode: false, forceUpdate: true);
+      }
+    }
+
+    if (msg.contains("VPN Service Destroyed")) {
+      _onTunnelClosed();
+    }
+
+    log.addLog(msg);
+  }
+
+  void _handleCrashEvent(Map<dynamic, dynamic> crashData) {
+    try {
+      final functionName = crashData['functionName'] as String? ?? 'unknown';
+      final errorMessage = crashData['errorMessage'] as String? ?? 'unknown';
+      final stackTrace = crashData['stackTrace'] as String? ?? '';
+      final platform = crashData['platform'] as String? ?? 'unknown';
+
+      // Log the crash
+      log.addLog('[CRASH] Go panic in $functionName: $errorMessage');
+
+      // Get current VPN state for context
+      final connectionState = _container?.read(connectionStateProvider);
+      final vpnState = connectionState?.status.toString() ?? 'unknown';
+      final currentGroup = _container?.read(groupStateProvider).groupName;
+
+      // Report to Crashlytics with VPN context
+      crashReportingService.recordGoPanic(
+        functionName,
+        errorMessage,
+        stackTrace,
+      );
+
+      // Add VPN-specific context
+      crashReportingService.setCustomKey('vpn_state', vpnState);
+      if (currentGroup != null) {
+        crashReportingService.setCustomKey('vpn_group', currentGroup);
+      }
+      crashReportingService.setCustomKey('crash_platform', platform);
+
+      debugPrint(
+        'Go panic reported to Crashlytics: $functionName - $errorMessage',
+      );
+    } catch (e) {
+      debugPrint('Error handling crash event: $e');
+    }
+  }
+
+  Future<void> _connect() async {
+    final connectionNotifier = _container?.read(
+      connectionStateProvider.notifier,
+    );
+    final loggerNotifier = _container?.read(loggerStateProvider.notifier);
+    final settings = _container?.read(settingsProvider.notifier);
+
+    _setConnectionStep(1);
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      connectionNotifier?.setLoading();
+      loggerNotifier?.setLoading();
+    });
+
+    alertService.heartbeat();
+
+    final networkIsConnected = await _networkStatus.checkConnectivity();
+    if (!networkIsConnected) {
+      connectionNotifier?.setNoInternet();
+      alertService.error();
+
+      // Report network connectivity failure
+      crashReportingService.recordVpnError(
+        Exception('Network not connected'),
+        StackTrace.current,
+        vpnState: 'connecting',
+        connectionMethod: settings?.getPattern() ?? 'auto',
+      );
+      return;
+    }
+
+    final isAccepted = await _grantVpnPermission();
+    if (!isAccepted!) {
+      connectionNotifier?.setDisconnected();
+
+      // Report VPN permission denial
+      crashReportingService.recordVpnError(
+        Exception('VPN permission denied'),
+        StackTrace.current,
+        vpnState: 'permission_required',
+      );
+      return;
+    }
+
+    final flowLineStorage =
+        await _container?.read(secureStorageProvider).read('flowLine') ?? "";
+    final pattern = settings?.getPattern() ?? "";
+
+    final isDeep =
+        _container?.read(settingsProvider.notifier).isDeepScanEnabled() ??
+        false;
+    final healthCheckEnabled =
+        _container?.read(settingsProvider.notifier).isHealthCheckEnabled() ??
+        false;
+    _connectionStartTime = DateTime.now();
+    analyticsService.logVpnConnectAttempt(pattern.isEmpty ? 'auto' : pattern);
+
+    try {
+      await _vpnBridge.startVPN(
+        flowLineStorage,
+        pattern,
+        isDeep,
+        healthCheckEnabled,
+      );
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        connectionNotifier?.setAnalyzing();
+      });
+    } catch (e, stack) {
+      // Report VPN start error
+      crashReportingService.recordVpnError(
+        e,
+        stack,
+        vpnState: 'starting',
+        connectionMethod: pattern.isEmpty ? 'auto' : pattern,
+      );
+
+      connectionNotifier?.setError();
+      alertService.error();
+      log.addLog('[ERROR] Failed to start VPN: $e');
+    }
+  }
+
+  Future<void> _onFailerConnect() async {
+    final connectionNotifier = _container?.read(
+      connectionStateProvider.notifier,
+    );
+    final settings = _container?.read(settingsProvider.notifier);
+    final currentGroup = _container?.read(groupStateProvider).groupName;
+
+    connectionNotifier?.setError();
+    await _vpnBridge.disconnectVpn();
+    alertService.error();
+
+    // Report VPN connection failure to Crashlytics
+    crashReportingService.recordVpnError(
+      Exception('VPN connection failed'),
+      StackTrace.current,
+      vpnState: 'failed',
+      server: currentGroup,
+      protocol: 'dnstt',
+      connectionMethod: settings?.getPattern() ?? 'auto',
+    );
+
+    // Log failure analytics
+    final duration = _connectionStartTime != null
+        ? DateTime.now().difference(_connectionStartTime!).inSeconds
+        : 0;
+    analyticsService.logVpnConnectionFailed(
+      settings?.getPattern() ?? 'auto',
+      currentGroup ?? 'unknown',
+      duration,
+    );
+  }
+
+  Future<void> _onSuccessConnect() async {
+    final connectionNotifier = _container?.read(
+      connectionStateProvider.notifier,
+    );
+    final connectionState = _container?.read(connectionStateProvider);
+    final vpnData = await _container?.read(vpnDataProvider.future);
+    if (connectionState?.status != ConnectionStatus.analyzing) {
+      return;
+    }
+
+    if (!_isReconnectMode) {
+      final isTunnelReady = await _createTunnel();
+      if (!isTunnelReady) {
+        await _onTunnelFailed(DesktopTunnel.instance.lastError);
+        return;
+      }
+      _isReconnectMode = true;
+    }
+    connectionNotifier?.setConnected();
+    vpnData?.enableVPN();
+    await refreshPing();
+    alertService.success();
+
+    final settings = _container?.read(settingsProvider.notifier);
+    final groupState = _container?.read(groupStateProvider);
+    final pattern = settings?.getPattern() ?? "auto";
+
+    int connectionDuration = 0;
+    if (_connectionStartTime != null) {
+      connectionDuration = DateTime.now()
+          .difference(_connectionStartTime!)
+          .inSeconds;
+      _connectionStartTime = null;
+    }
+
+    analyticsService.logVpnConnected(
+      pattern,
+      groupState?.groupName,
+      connectionDuration,
+    );
+
+    await _container
+        ?.read(flowlineServiceProvider)
+        .saveFlowline(offlineMode: false);
+  }
+
+  Future<void> _onLoading() async {
+    final connectionNotifier = _container?.read(
+      connectionStateProvider.notifier,
+    );
+    final loggerNotifier = _container?.read(loggerStateProvider.notifier);
+
+    final vpnData = await _container?.read(vpnDataProvider.future);
+
+    loggerNotifier?.setLoading();
+    connectionNotifier?.setAnalyzing();
+    await vpnData?.disableVPN();
+  }
+
+  Future<void> refreshPing() async {
+    _container?.read(flagLoadingProvider.notifier).state = true;
+    _container?.read(pingLoadingProvider.notifier).state = true;
+    _container?.read(pingProvider.notifier).state = await _networkStatus
+        .getPing();
+    _container?.read(pingLoadingProvider.notifier).state = false;
+  }
+
+  Future<void> _stopVPN(WidgetRef ref) async {
+    final connectionNotifier = ref.read(connectionStateProvider.notifier);
+    connectionNotifier.setDisconnecting();
+    await _stopDesktopTunnel();
+    await _vpnBridge.stopVPN();
+    _clearData(ref);
+    connectionNotifier.setDisconnected();
+  }
+
+  Future<void> _disconnect(WidgetRef ref) async {
+    final connectionNotifier = ref.read(connectionStateProvider.notifier);
+    final vpnData = await _container?.read(vpnDataProvider.future);
+    connectionNotifier.setDisconnecting();
+    await _stopDesktopTunnel();
+    await _vpnBridge.disconnectVpn();
+    _clearData(ref);
+    await vpnData?.disableVPN();
+    connectionNotifier.setDisconnected();
+    analyticsService.logVpnDisconnected();
+  }
+
+  Future<void> _onProxyStopped({required bool keepConnectionStatus}) async {
+    final connectionNotifier = _container?.read(
+      connectionStateProvider.notifier,
+    );
+    final status = _container?.read(connectionStateProvider).status;
+    final proxyLost = status == ConnectionStatus.connected;
+
+    if (proxyLost && _isKillSwitchEnabled()) {
+      log.addLog('[INFO] Proxy stopped, kill switch keeps the tunnel up');
+      connectionNotifier?.setError();
+      alertService.error();
+      return;
+    }
+
+    await _closeTunnel(
+      keepConnectionStatus: keepConnectionStatus,
+      proxyLost: proxyLost,
+    );
+  }
+
+  bool _isKillSwitchEnabled() =>
+      _container?.read(settingsProvider.notifier).isKillSwitchEnabled() ??
+      false;
+
+  Future<void> _closeTunnel({
+    bool keepConnectionStatus = false,
+    bool proxyLost = false,
+  }) async {
+    final connectionNotifier = _container?.read(
+      connectionStateProvider.notifier,
+    );
+    final vpnData = await _container?.read(vpnDataProvider.future);
+
+    if (!keepConnectionStatus) {
+      connectionNotifier?.setDisconnecting();
+    }
+    await _stopDesktopTunnel();
+    if (Platform.isIOS || (Platform.isAndroid && proxyLost)) {
+      await _vpnBridge.disconnectVpn();
+    }
+    await vpnData?.disableVPN();
+    if (!keepConnectionStatus) {
+      connectionNotifier?.setDisconnected();
+    }
+    analyticsService.logVpnDisconnected();
+    _isReconnectMode = false;
+  }
+
+  Future<void> _onTunnelClosed() async {
+    final connectionNotifier = _container?.read(
+      connectionStateProvider.notifier,
+    );
+    connectionNotifier?.setDisconnecting();
+    final vpnData = await _container?.read(vpnDataProvider.future);
+    await _vpnBridge.stopVPN();
+    await vpnData?.disableVPN();
+    connectionNotifier?.setDisconnected();
+  }
+
+  Future<bool?> _grantVpnPermission() async {
+    switch (Platform.operatingSystem) {
+      case 'android':
+        return await _vpnBridge.grantVpnPermission();
+      case "ios":
+        return await _vpnBridge.connectVpn();
+      case "windows":
+      case "linux":
+        return await _prepareDesktopTunnel();
+      default:
+        return false;
+    }
+  }
+
+  Future<bool> _createTunnel() async {
+    final splitTunnel =
+        await _container?.read(splitTunnelProvider.notifier).loadedConfig() ??
+        const SplitTunnelConfig();
+
+    switch (Platform.operatingSystem) {
+      case 'android':
+        await _vpnBridge.connectVpn(
+          mode: splitTunnel.mode.coreValue,
+          rules: splitTunnel.rulesPayload,
+          apps: splitTunnel.appsPayload,
+        );
+        return true;
+      case "ios":
+        return await _vpnBridge.startTunnel(
+          mode: splitTunnel.mode.coreValue,
+          rules: splitTunnel.rulesPayloadWith(
+            popularAppRules(splitTunnel.apps),
+          ),
+          apps: splitTunnel.appsPayload,
+        );
+      case "windows":
+      case "linux":
+        return await _startDesktopTunnel(splitTunnel);
+      default:
+        return true;
+    }
+  }
+
+  Future<bool> _prepareDesktopTunnel() async {
+    final granted = await _vpnBridge.grantVpnPermission() ?? false;
+    if (!granted) {
+      return false;
+    }
+    if (!await _vpnBridge.isVpnModeEnabled()) {
+      return true;
+    }
+
+    final isReady = await DesktopTunnel.instance.prepare();
+    if (!isReady) {
+      log.addLog(
+        '[ERROR] Tunnel privileges refused: ${DesktopTunnel.instance.lastError}',
+      );
+      await _onTunnelFailed(DesktopTunnel.instance.lastError);
+    }
+    return isReady;
+  }
+
+  Future<void> _onTunnelFailed(String? reason) async {
+    final connectionNotifier = _container?.read(
+      connectionStateProvider.notifier,
+    );
+
+    log.addLog('[ERROR] Tunnel not created: ${reason ?? "unknown reason"}');
+    await _vpnBridge.stopVPN();
+    _setConnectionTotalSteps(0);
+    _setConnectionStep(0);
+    connectionNotifier?.setError();
+    alertService.error();
+
+    crashReportingService.recordVpnError(
+      Exception('Tunnel not created: ${reason ?? "unknown reason"}'),
+      StackTrace.current,
+      vpnState: 'tunnel_failed',
+    );
+  }
+
+  Future<bool> _startDesktopTunnel(SplitTunnelConfig splitTunnel) async {
+    if (!await _vpnBridge.isVpnModeEnabled()) {
+      return true;
+    }
+
+    final isStarted = await DesktopTunnel.instance.start(
+      mode: splitTunnel.mode.coreValue,
+      rules: splitTunnel.rulesPayload,
+      apps: splitTunnel.appsPayload,
+    );
+    if (!isStarted) {
+      log.addLog(
+        '[ERROR] Failed to start tunnel: ${DesktopTunnel.instance.lastError}',
+      );
+    }
+    return isStarted;
+  }
+
+  Future<void> _stopDesktopTunnel() async {
+    if (!DesktopTunnel.instance.isSupported) {
+      return;
+    }
+    await DesktopTunnel.instance.stop();
+  }
+
+  void _setConnectionStep(int step) {
+    _container?.read(flowLineProvider.notifier).setStep(step);
+  }
+
+  void _setConnectionTotalSteps(int totalSteps) {
+    _container?.read(flowLineProvider.notifier).setTotalSteps(totalSteps);
+  }
+
+  void _clearData(WidgetRef ref) {
+    final groupNotifier = ref.read(groupStateProvider.notifier);
+    groupNotifier.setGroupName("");
+    _setConnectionTotalSteps(0);
+    _setConnectionStep(0);
+  }
+
+  Future<void> handleConnectionButton(WidgetRef ref) async {
+    final connectionState = ref.read(connectionStateProvider);
+    switch (connectionState.status) {
+      case ConnectionStatus.connected:
+        await _disconnect(ref);
+        return;
+      case ConnectionStatus.analyzing:
+        await _stopVPN(ref);
+        return;
+      case ConnectionStatus.disconnected:
+      case ConnectionStatus.error:
+      case ConnectionStatus.noInternet:
+        await _connect();
+        return;
+      case ConnectionStatus.loading:
+      default:
+        break;
+    }
+  }
+
+  Future<void> getVPNStatus() async {
+    final status = await _vpnBridge.getVpnStatus();
+    log.addLog("VPN status: $status");
+    final connectionNotifier = _container?.read(
+      connectionStateProvider.notifier,
+    );
+    if (status == "connected") {
+      connectionNotifier?.setConnected();
+      await refreshPing();
+    } else {
+      connectionNotifier?.setDisconnected();
+    }
+  }
+
+  Future<void> initVPN() async {
+    _container?.read(settingsLoadingProvider.notifier).state = true;
+    try {
+      await _container
+          ?.read(flowlineServiceProvider)
+          .saveFlowline(offlineMode: true);
+      _vpnBridge.setAsnName();
+      unawaited(
+        _container
+                ?.read(flowlineServiceProvider)
+                .saveFlowline(offlineMode: false) ??
+            Future.value(),
+      );
+    } catch (e) {
+      // A saveFlowline failure must not block splash navigation to the main screen.
+      debugPrint('initVPN failed: $e');
+    } finally {
+      _container?.read(settingsLoadingProvider.notifier).state = false;
+    }
+  }
+
+  Future<void> _updatePing() async {
+    final connectionState = _container?.read(connectionStateProvider);
+    if (connectionState?.status != ConnectionStatus.connected) {
+      return;
+    }
+
+    _container?.read(pingProvider.notifier).state = await _networkStatus
+        .getPing();
+  }
+
+  void _sendCoreFirebaseMessage(String message) {
+    Map<String, dynamic> jsonData = jsonDecode(message);
+    final title = jsonData["title"] ?? "Unknown";
+    jsonData.remove("title");
+    final Map<String, String> stringMap = jsonData.map(
+      (key, value) => MapEntry(key, value.toString()),
+    );
+    analyticsService.logCoreData(title, stringMap);
+  }
+}

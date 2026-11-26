@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="vpn_notification_channel">OpenRung VPN</string>
+    <string name="vpn_notification_title">OpenRung VPN</string>
+    <string name="vpn_notification_preparing">正在准备 OpenRung VPN</string>
+    <string name="vpn_notification_connected">已通过 %1$s 连接</string>
+    <string name="relay_location_unknown">未知位置</string>
+    <string name="status_disconnected">已断开</string>
+    <string name="status_preparing">正在准备 VPN</string>
+    <string name="status_connecting">正在连接</string>
+    <string name="status_connected">已连接</string>
+    <string name="status_disconnecting">正在断开</string>
+    <string name="status_failed">失败</string>
+    <string name="log_split_ruleset_missing">缺少 %1$s 的分流规则集；相关流量仍走隧道</string>
+    <string name="log_error_prefix">错误：%1$s</string>
+</resources>

@@ -1,0 +1,212 @@
+import 'dart:io';
+
+import 'package:defyx_vpn/app/ad_director_provider.dart';
+import 'package:defyx_vpn/app/router/app_router.dart';
+import 'package:defyx_vpn/core/theme/app_theme.dart';
+import 'package:defyx_vpn/modules/core/vpn.dart';
+import 'package:defyx_vpn/modules/core/vpn_bridge.dart';
+import 'package:defyx_vpn/modules/main/presentation/widgets/ump_service.dart';
+import 'package:defyx_vpn/shared/providers/language_provider.dart';
+import 'package:defyx_vpn/shared/providers/haptics_provider.dart';
+import 'package:defyx_vpn/shared/providers/ad_readiness_coordinator.dart';
+import 'package:defyx_vpn/shared/providers/connection_state_provider.dart'
+    as conn;
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_screenutil/flutter_screenutil.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:defyx_vpn/shared/services/animation_service.dart';
+import 'package:defyx_vpn/shared/services/alert_service.dart';
+import 'package:toastification/toastification.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:defyx_vpn/l10n/app_localizations.dart';
+
+final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
+
+class App extends ConsumerStatefulWidget {
+  const App({super.key});
+
+  @override
+  ConsumerState<App> createState() => _AppState();
+}
+
+class _AppState extends ConsumerState<App> {
+  bool _hasCheckedInitialization = false;
+
+  bool get _isMobilePlatform =>
+      !kIsWeb && (Platform.isAndroid || Platform.isIOS);
+
+  @override
+  Widget build(BuildContext context) {
+    // Eagerly trigger environment computation
+    final environmentAsync = ref.watch(adEnvironmentProvider);
+
+    // Keep the vibration alert backend in sync with the Haptic Feedback setting
+    ref.listen(hapticsProvider, (previous, next) {
+      if (_isMobilePlatform) {
+        AlertService().setActionEnabled(next);
+      }
+    });
+
+    // Single listener for ad readiness state changes
+    ref.listen(adReadinessCoordinatorProvider, (previous, next) {
+      if (previous == null) return;
+
+      // When canInitializeAdMob transitions to true, start the flow
+      if (next.canInitializeAdMob && !previous.canInitializeAdMob) {
+        environmentAsync.whenData((environment) {
+          if (environment.shouldInitializeAdMob) {
+            _initializeAdFlow();
+          } else {
+            debugPrint(
+              '📱 Using internal ads only (${environment.adMobIsDisabled ? "Iranian user" : "desktop platform"})',
+            );
+          }
+        });
+      }
+
+      // When consent completes and we're disconnected, retry ad load
+      if (next.canLoadAds && !previous.canLoadAds) {
+        final connectionState = ref.read(conn.connectionStateProvider).status;
+        if (connectionState == conn.ConnectionStatus.disconnected) {
+          debugPrint('Consent complete & disconnected - triggering ad load');
+          Future.delayed(const Duration(milliseconds: 100), () {
+            ref.read(adStrategyManagerProvider)?.retryGoogleAdLoad();
+          });
+        }
+      }
+    });
+
+    return FutureBuilder<void>(
+      future: _initializeApp(),
+      builder: (context, snapshot) {
+        // Check ONCE if we need to initialize ads after app startup (e.g., after migration)
+        if (snapshot.connectionState == ConnectionState.done &&
+            !_hasCheckedInitialization) {
+          _hasCheckedInitialization = true;
+
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            _checkAndInitializeAds(environmentAsync);
+          });
+        }
+        return _buildApp(context);
+      },
+    );
+  }
+
+  Future<void> _initializeApp() async {
+    // Initialize cache directory for VPN core
+    try {
+      final String vpnCacheDir = await VpnBridge().getSharedDirectory();
+      await VpnBridge().setCacheDir(vpnCacheDir);
+      debugPrint('VPN cache directory set to: $vpnCacheDir');
+    } catch (e) {
+      debugPrint('Failed to set cache directory: $e');
+    }
+
+    await VPN(ProviderScope.containerOf(context, listen: false)).getVPNStatus();
+    await AlertService().init();
+    if (_isMobilePlatform) {
+      AlertService().setActionEnabled(ref.read(hapticsProvider));
+    }
+    await AnimationService().init();
+  }
+
+  /// Check if ad initialization should happen (for migration/restart cases)
+  void _checkAndInitializeAds(AsyncValue<AdEnvironment> environmentAsync) {
+    final adReadiness = ref.read(adReadinessCoordinatorProvider);
+
+    // If canInitializeAdMob is already true (e.g., after migration), trigger flow
+    if (adReadiness.canInitializeAdMob) {
+      environmentAsync.whenData((environment) {
+        if (environment.shouldInitializeAdMob) {
+          _initializeAdFlow();
+        }
+      });
+    }
+  }
+
+  /// Initialize ad flow using the coordinator
+  void _initializeAdFlow() {
+    final coordinator = ref.read(adReadinessCoordinatorProvider.notifier);
+    final umpService = ref.read(umpServiceProvider);
+
+    coordinator.initializeAdFlow(
+      onRunUMP: (shouldRequestUMP) async {
+        if (shouldRequestUMP) {
+          await umpService.requestConsentWithATT(ref: ref, onDone: () {});
+        }
+      },
+    );
+  }
+
+  Widget _buildApp(BuildContext context) {
+    final router = ref.watch(routerProvider);
+    final languageState = ref.watch(languageProvider);
+    final designSize = _getDesignSize(context);
+
+    AppTheme.updateFontFamilyForLocale(languageState.language.locale);
+
+    return ToastificationWrapper(
+      config: ToastificationConfig(
+        maxToastLimit: 1,
+        blockBackgroundInteraction: false,
+        applyMediaQueryViewInsets: true,
+      ),
+      child: ScreenUtilInit(
+        designSize: designSize,
+        minTextAdapt: true,
+        splitScreenMode: true,
+        builder: (_, __) {
+          return MaterialApp.router(
+            title: 'Defyx',
+            theme: AppTheme.lightTheme,
+            darkTheme: AppTheme.darkTheme,
+            themeMode: ThemeMode.light,
+            routerConfig: router,
+            builder: _appBuilder,
+            debugShowCheckedModeBanner: false,
+            locale: languageState.language.locale,
+            localizationsDelegates: const [
+              AppLocalizations.delegate,
+              GlobalMaterialLocalizations.delegate,
+              GlobalWidgetsLocalizations.delegate,
+              GlobalCupertinoLocalizations.delegate,
+            ],
+            supportedLocales: const [
+              Locale('en'),
+              Locale('fa'),
+              Locale('ru'),
+              Locale('zh'),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Size _getDesignSize(BuildContext context) {
+    final size = MediaQuery.of(context).size;
+    final isTablet = size.width > 600;
+    final isLargeTablet = size.width > 900;
+    final isDesktop = size.width > 1200;
+
+    if (isDesktop) return const Size(1440, 900);
+    if (isLargeTablet) return const Size(1024, 768);
+    if (isTablet) return const Size(768, 1024);
+    return const Size(393, 852);
+  }
+
+  Widget _appBuilder(BuildContext context, Widget? child) {
+    // DISABLED: DesktopPlatformHandler overrides VPN channel handler in native code
+    // Desktop features (tray menu, etc.) are handled directly in native Linux/Windows code
+    // if (Platform.isWindows || Platform.isLinux) {
+    //   DesktopPlatformHandler.initialize();
+    // }
+
+    return MediaQuery(
+      data: MediaQuery.of(context).copyWith(textScaler: TextScaler.linear(1.0)),
+      child: child ?? const SizedBox.shrink(),
+    );
+  }
+}

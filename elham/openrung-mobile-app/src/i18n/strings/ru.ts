@@ -1,0 +1,201 @@
+import type { Strings } from './en';
+
+/** Ported from `res/values-ru/strings.xml`; missing keys fall back to English. */
+export const ru: Partial<Strings> = {
+  appName: 'OpenRung',
+  actionConnect: 'ПОДКЛЮЧИТЬ',
+  actionDisconnect: 'ОТКЛЮЧИТЬ',
+  readyLog: 'готово. нажмите «подключить», чтобы пройти через ретранслятор.',
+  logLineFormat: (line: string) => `> ${line}`,
+  errorLineFormat: (error: string) => `! ${error}`,
+  settingsTitle: 'Настройки',
+  backContentDescription: 'Назад',
+  languageSettingTitle: 'Язык',
+  languageSettingSubtitle:
+    'Используйте системный язык или выберите язык для OpenRung.',
+  languageSystem: 'Как в системе',
+  languageEnglish: 'English',
+  languageSimplifiedChinese: '简体中文',
+  languageTraditionalChinese: '繁體中文',
+  languagePersian: 'فارسی',
+  languageRussian: 'Русский',
+  languageArabic: 'العربية',
+  languageTurkish: 'Türkçe',
+  languageVietnamese: 'Tiếng Việt',
+  languageBurmese: 'မြန်မာ',
+  statusDisconnected: 'Отключено',
+  statusPreparing: 'Подготовка VPN',
+  statusConnecting: 'Подключение',
+  statusConnected: 'Подключено',
+  statusDisconnecting: 'Отключение',
+  statusFailed: 'Ошибка',
+
+  // Redesigned shell (tabs / about / section headers).
+  tabHome: 'Главная',
+  tabSettings: 'Настройки',
+  tabAbout: 'О нас',
+  aboutTitle: 'О нас',
+  relayAuto: 'автовыбор реле',
+  widgetStatusDisconnected: 'Не\nподключено',
+  widgetName: 'Быстрое подключение',
+  widgetDescription:
+    'Подключайтесь к автоматически выбранному реле с главного экрана.',
+  relayClassOfficial: 'официальный',
+  relayClassVolunteer: 'волонтёр',
+  settingsGeneralHeader: 'Основные',
+  settingsDiagnosticsHeader: 'Диагностика',
+
+  // Content description (open action).
+  openContentDescription: 'Открыть',
+
+  // Speed test link (settings).
+  speedTestSettingTitle: 'Тест скорости',
+  speedTestSettingSubtitle: 'Открывает fast.com в браузере',
+  speedTestRequiresConnection: 'Сначала подключитесь, чтобы измерить туннель',
+
+  // Map view (exit-node overview).
+  mapContentDescription:
+    'Карта доступных выходных узлов в Азиатско-Тихоокеанском регионе',
+  mapLoading: 'поиск доступных выходных узлов…',
+  mapFailed: 'не удалось загрузить выходные узлы — нажмите, чтобы повторить',
+  mapRelaysOnline: (count: number) => `${count} реле в сети`,
+  mapNoNodes: 'сейчас нет доступных выходных узлов',
+
+  // Recents, view toggle & list view.
+  recentsLabel: 'Недавние',
+  viewToggleMap: 'Карта',
+  viewToggleList: 'Список',
+  listContentDescription: 'Список доступных выходных узлов',
+  listRelayCount: (count: number) => (count === 1 ? '1 реле' : `${count} реле`),
+
+  // Debug console (diagnostics).
+  debugSettingTitle: 'Отладка',
+  debugSettingSubtitle: 'Консоль подключения и диагностика.',
+  debugTitle: 'Консоль отладки',
+
+  // Open-source licenses.
+  licensesSettingTitle: 'Лицензии с открытым исходным кодом',
+  licensesSettingSubtitle: 'Лицензии и атрибуция для включённого ПО.',
+  licensesTitle: 'Лицензии с открытым исходным кодом',
+  licensesIntro:
+    'OpenRung — свободное программное обеспечение под лицензией GPL-3.0-or-later, поскольку использует sing-box. Полный соответствующий исходный код этой сборки доступен по ссылке ниже.',
+  licensesSourceTitle: 'Исходный код',
+  privacyPolicyTitle: 'Политика конфиденциальности',
+  privacyPolicySubtitle:
+    'Как OpenRung обрабатывает диагностические данные и персональную информацию.',
+  licensesFullTextTitle: 'Полные тексты лицензий',
+  licensesFullTextSubtitle: 'GNU GPL-3.0 и уведомления третьих сторон.',
+  licensesComponentsHeader: 'Компоненты',
+  shareApkTitle: 'Поделиться OpenRung офлайн',
+  shareApkSubtitle:
+    'Отправьте этот APK на ближайший Android-телефон без интернета.',
+  shareApkErrorTitle: 'Не удалось поделиться OpenRung',
+  shareApkErrorBody:
+    'Не удалось поделиться APK. Оставьте OpenRung открытым и повторите попытку.',
+  shareApkSplitInstallError:
+    'Эта копия установлена из нескольких APK и не может быть безопасно передана. Установите отдельный APK OpenRung, чтобы использовать офлайн-обмен.',
+  shareAppStoreTitle: 'Поделиться OpenRung',
+  shareAppStoreSubtitle:
+    'Отправьте ссылку на App Store, чтобы другие могли установить OpenRung.',
+  shareAppStoreMessage:
+    'Скачайте OpenRung в App Store:',
+  shareAppStoreErrorTitle: 'Не удалось поделиться OpenRung',
+  shareAppStoreErrorBody:
+    'Не удалось поделиться ссылкой на App Store. Попробуйте ещё раз.',
+
+  // Home overlay / about screen.
+  homeTagline: 'сеть ретрансляторов',
+  homeSlogan: 'Доступ в интернет — это право,\nа не привилегия',
+  aboutMissionLead:
+    'Мы верим, что доступ в интернет — это право, а не привилегия',
+  aboutMissionBody:
+    'и не разменная монета в руках власть имущих. Право на информацию заложено в самой человеческой природе, и никакой файрвол не должен стирать его. Но сегодня миллиарды людей живут за стенами, возведёнными, чтобы не впускать информацию и не выпускать молчание; там поиск Google возвращает ошибку 404, вопрос может быть опасным, а любопытство заканчивается на заблокированной странице.\n\nOpenRung существует, чтобы изменить это.\n\nМы строим лестницу через эти стены. Обычные люди по всему миру делятся своим подключением, чтобы человек по другую сторону файрвола мог выйти в открытый интернет.\n\nИнформация — это сила, и эта сила принадлежит нам, а не тем, кто хочет её у нас отнять.',
+  aboutSupportHeader: 'Поддержите нас',
+  donateTitle: 'Пожертвовать',
+  donateSubtitle:
+    'Помогите лестнице устоять. Пожертвования идут в фонд OpenRung Foundation.',
+  aboutLegalHeader: 'Правовая информация',
+  aboutFollowHeader: 'Подписывайтесь',
+
+  // --- Split tunneling (settings row + screen + Android app picker) ---
+  splitTunnelSettingTitle: 'Раздельное туннелирование',
+  splitTunnelSettingSubtitleOn:
+    'Включено — выбранный трафик идёт мимо ретранслятора.',
+  splitTunnelSettingSubtitleOff:
+    'Выключено — весь трафик идёт через ретранслятор.',
+  splitTunnelHeader: 'Раздельное туннелирование',
+  splitTunnelMasterTitle: 'Раздельное туннелирование',
+  splitTunnelMasterSubtitle:
+    'Отправлять выбранный трафик мимо туннеля ретранслятора.',
+  splitTunnelBypassHeader: 'Обход',
+  splitTunnelLanTitle: 'Локальная сеть',
+  splitTunnelLanSubtitle:
+    'Прямой доступ к принтерам, телевизорам и другим устройствам локальной сети.',
+  splitTunnelIranTitle: 'Иранские сайты и приложения',
+  splitTunnelIranSubtitle:
+    'Направлять иранские сервисы напрямую, на полной скорости.',
+  splitTunnelChinaTitle: 'Китайские сайты и приложения',
+  splitTunnelChinaSubtitle:
+    'Направлять китайские сервисы напрямую, на полной скорости.',
+  splitTunnelAppsHeader: 'Приложения',
+  splitTunnelAppsTitle: 'Приложения в обход',
+  splitTunnelAppsSubtitle: (count: number) =>
+    `приложений в обход VPN: ${count}`,
+  splitTunnelAppPickerTitle: 'Приложения в обход',
+  splitTunnelAppPickerLoading: 'загрузка установленных приложений…',
+  splitTunnelAppPickerEmpty: 'запускаемых приложений не найдено.',
+  splitTunnelAppPickerClose: 'ЗАКРЫТЬ',
+  splitTunnelApplyHint:
+    'изменения применяются сразу; туннель переподключается на несколько секунд.',
+  splitTunnelResetHint:
+    'после перезапуска приложения наборы для Ирана и Китая сбрасываются.',
+  splitTunnelResetHintWithApps:
+    'после перезапуска приложения наборы для Ирана и Китая сбрасываются; исключённые приложения сохраняются.',
+
+  // --- In-app update check (manifest banner / blocking screen / broadcast notice) ---
+  updateRequiredTitle: 'Требуется обновление',
+  updateRequiredBody:
+    'Эта версия OpenRung больше не может подключаться к сети ретрансляторов. Установите последний выпуск, чтобы продолжить пользоваться приложением.',
+  updateVersionTransition: (current: string, latest: string) =>
+    `v${current} -> v${latest}`,
+  updateActionNow: 'ОБНОВИТЬ',
+  updateActionLater: 'Позже',
+  updateContinueAnyway: 'Всё равно продолжить',
+  updateBannerTitle: 'Доступно обновление',
+  updateBannerBody: (latest: string) =>
+    `Версия ${latest} содержит важные исправления. Обновитесь при возможности.`,
+  updateSettingTitle: 'Доступно обновление',
+  updateSettingSubtitle: (current: string, latest: string) =>
+    `У вас v${current}; вышла v${latest}. Нажмите, чтобы установить.`,
+  noticeDismiss: 'Закрыть',
+  noticeLearnMore: 'Подробнее',
+  errorAccessDenied:
+    'Доступ для этого устройства отключён, подключение невозможно. Обратитесь в поддержку OpenRung.',
+  errorEnrollmentRefused:
+    'Ошибка регистрации. Отключите другие VPN и повторите.',
+  clockWarningTitle: 'Проверьте дату и время на устройстве',
+  clockWarningBody:
+    'Дата и время на этом устройстве, похоже, установлены неверно, из-за этого OpenRung может не подключаться. Включите автоматическую установку даты и времени в настройках устройства и повторите попытку.',
+  clockWarningRetry: 'Повторить',
+  // Desktop client only: the local proxy rows in Settings (DesktopProxySection).
+  desktopProxyHeader: 'Локальный прокси',
+  desktopProxyEndpointTitle: 'Адрес',
+  desktopProxyEndpointConnected: (endpoint: string) => `${endpoint} · доступен сейчас`,
+  desktopProxyEndpointIdle: (endpoint: string) => `${endpoint} · доступен после подключения`,
+  desktopProxyPreparing: 'Подготовка адреса локального прокси…',
+  desktopProxyPersistenceTitle: 'Постоянство адреса',
+  desktopShellIntegrationTitle: 'Интеграция с оболочкой',
+  desktopShellEnableTitle: 'Включить в этой оболочке',
+  desktopShellEnableSubtitle: 'Сохраняет существующие значения прокси и их отсутствие.',
+  desktopShellEnableRequiresConnection: 'Сначала подключите OpenRung, затем включайте в этой оболочке.',
+  desktopShellRestoreTitle: 'Восстановить эту оболочку',
+  desktopShellRestoreSubtitle: 'Выполните после отключения, сбоя, выхода или аварийного завершения.',
+  desktopTunModeTitle: 'Режим TUN',
+  desktopTunModeSubtitleOff:
+    'Выключен. Через OpenRung идут только приложения, использующие системный прокси.',
+  desktopTunModeSubtitleOn: 'Включён. Весь трафик этого устройства идёт через OpenRung.',
+  desktopTunModeRestartNote: 'При включении OpenRung перезапустится с правами администратора.',
+  desktopTunModeRequiresDisconnect: 'Отключитесь, чтобы сменить режим.',
+  actionCopy: 'Копировать',
+  actionCopied: 'Скопировано',
+};

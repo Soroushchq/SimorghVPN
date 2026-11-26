@@ -1,0 +1,62 @@
+# connectcore
+
+`github.com/openrung/openrung/connectcore` is OpenRung's UI-agnostic client
+policy engine, promoted to a nested Go module (ADR-001 D3) so clients outside
+this repository — the mobile apps foremost — can pin and consume the same
+implementation the desktop app and terminal client run.
+
+The module root is the connection engine: the connect state machine, candidate
+ladder and client-side ranking, address-family fallback (a relay an access
+answer names by IPv6 is dialled at its public IPv4 endpoint when IPv6 is
+unavailable or does not answer, see `family.go`), relay-local WSS front fallback, the punch
+attempt policy, mid-session health monitoring and failover, the directory
+cache, and the internet/readiness probes. Its subpackages carry the rest of
+the client policy layer:
+
+- `client` — the sing-box config builder (TUN and proxy inbounds, mobile's
+  DoH-failover DNS shape, fake-IP DNS so the relay resolves destination
+  hostnames, split tunneling), the sing-box process runner, relay
+  selection and usability, and the thin broker-client adapters.
+- `clienttelemetry` — the closed failure-reason classifier and the telemetry
+  event model, outbox, and session manager shared with the mobile apps.
+- `discovery` — staggered multi-front relay-directory fetching over
+  `brokerapi`, decoded into the exported relay schema.
+- `proxyconfig` — the stable local proxy endpoint policy and the opt-in shell
+  integration.
+- `contract` — the embedded cross-repo contract vectors (failure
+  classification, relay decoding, broker fronts, event sequences, access
+  outcome tokens) and their Go loaders; the mobile repository vendors the JSON
+  files under `contract/vectors/`.
+
+Everything platform-specific reaches the engine through narrow interfaces
+(`interfaces.go`): event sink, persistence, OS proxy control, elevation, the
+installation key that per-user relay access (`access.go`, ADR-006) signs with,
+and the NAT punch transport (`PunchEstablisher` — implemented in the root module's
+`internal/enginepunch` over the quic-go transport in `internal/punch`, which
+deliberately stays out of this module). Hosts report their application version
+either at link time (`-X …/connectcore/client.appVersion=…`, used by the
+in-repo builds) or in code via `client.SetAppVersion` — the route for fetched
+consumers such as mobile bindings, which cannot inject a dependency's private
+symbol and would otherwise report the `dev` default in telemetry.
+
+The engine also keeps a bounded in-memory diagnostic log (`diagnostics.go`)
+for a host's "send diagnostics" action: a per-front timeline of each broker
+request it makes for discovery, per-user access and WSS tickets (DNS, TCP
+connect, TLS, request written, first response byte, body read, error), and
+the engine's own log lines covering relay attempts, transport fallback and
+failover. Tunnel-core output is not recorded. `Engine.Diagnostics` returns
+it structured; `DiagnosticsJSON` and `DiagnosticsText` return strings for
+bindings. Every export redacts relay credentials, access/lease/ticket tokens,
+UUIDs, and IP addresses other than relay, relay-hub and broker-front
+endpoints. Nothing is persisted or uploaded by the engine. Relay wire types come from `brokerapi`'s exported relay schema, and
+the WSS transport mechanics from `wsscore`; both are sibling nested modules
+this module pins by version for external consumers, while in-repo builds use
+local `replace` directives.
+
+Versioning follows the repository's nested-module convention: bump `VERSION`
+in the same PR as any change (CI enforces it), and the tag workflow publishes
+`connectcore/vX.Y.Z` on merge. Because external consumers resolve the sibling
+modules through this module's `go.mod` requirements rather than the local
+replaces, a change that relies on new `brokerapi`/`wsscore`/`punchcore` API
+must bump that sibling's VERSION and this module's `require` line together.
+See `docs/architecture.md` for the pin/upgrade procedure.

@@ -1,0 +1,61 @@
+.DS_Store
+.cache/
+.gocache/
+.build/
+__pycache__/
+*.py[cod]
+
+# Local multi-module workspaces (dev-only; module wiring is via replace directives)
+go.work
+go.work.sum
+
+# Local agent guidance
+/CLAUDE.md
+/.claude/settings.json
+
+# Build outputs
+/bin/
+/dist/
+
+# Local generated relay configs
+openrung-xray-config.json
+
+# Internal ops tooling — reveals hosting providers/fleet layout; keep out of the public repo
+/scripts/relay-usage.sh
+
+# WSS front state written by OPENRUNG_WSS_FRONT_STATE_FILE.  Front hostnames are
+# rotated when they are blocked, so committing a mapping would preserve every
+# one this project has ever used, permanently, in git history.  Derive the live
+# mapping with the front inventory tooling in the private `openrung/ops` repository instead.
+wss-fronts.json
+*-wss-front-state.json
+*.local.json
+
+# Runtime-generated broker telemetry log
+openrung-telemetry.jsonl
+
+# Environment files
+.env
+.env.*
+!.env.example
+/deploy/relay/.wss.env
+
+# Wrangler local state (R2/Workers tooling)
+.wrangler/
+
+# Claude Code local worktrees (may contain absolute paths / local branch content)
+.claude/agents/
+.claude/worktrees/
+
+# `go build ./cmd/<name>` drops the binary in the repo root under the package
+# name. Ignore every cmd/ package's binary: a Go binary embeds the builder's
+# GOMODCACHE paths (/Users/<name>/go/pkg/mod/...), so committing one leaks the
+# local username into public history.
+/broker
+/client
+/frontcheck
+/relay
+/relayhub
+/wssmatrix
+/wsssidecar
+/openrung-*

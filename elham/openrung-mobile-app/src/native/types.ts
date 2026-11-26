@@ -1,0 +1,72 @@
+// src/native/types.ts — the single source of truth for these types
+// (contract docs/CONTRACT.md §3; keep in sync with both native bridges).
+
+export type ConnectionStatus =
+  | 'disconnected'
+  | 'preparing'
+  | 'connecting'
+  | 'connected'
+  | 'disconnecting'
+  | 'failed';
+
+export interface RecentNode {
+  countryCode: string; // ISO 3166-1 alpha-2, uppercase
+  relayId?: string; // exact broker relay id; absent on legacy entries
+  label: string; // "City, Country" or country name
+  relayName?: string; // sanitized relay display name (see NativeVpnState.relayName); absent on legacy entries
+  latitude: number;
+  longitude: number;
+}
+
+/** Errors the UI presents in its own words. 'access_denied': the broker refused this
+ *  installation because an operator disabled it (ADR-006); the connect is not retried.
+ *  'enrollment_refused': the connect failed after the broker refused to enroll this new
+ *  installation from the current (hosting/datacenter) network (ADR-006). */
+export type NativeErrorCode = 'access_denied' | 'enrollment_refused' | 'clock_skew';
+
+export interface NativeVpnState {
+  status: ConnectionStatus;
+  relayLabel: string | null; // resolved geo label, never a raw IP
+  relayName: string | null; // connected relay's display name — native sanitizes the operator-supplied
+  // label (control/bidi-format chars stripped, whitespace collapsed, ≤24 code points; fallback: sanitized id minus `relay_`, ≤12 code points)
+  relayClass: 'foundation' | 'volunteer' | null; // connected relay's node class — native
+  // normalizes the descriptor's node_class (unknown/absent => 'volunteer'); null whenever
+  // not connected, mirroring relayName's lifecycle
+  lastError: string | null;
+  lastErrorCode: NativeErrorCode | null; // stable code for a lastError the UI translates itself;
+  // null for every other error (render lastError as-is) and from native builds without the field
+  logLines: string[]; // "[HH:mm:ss] message", newest last, cap 80
+  recents: RecentNode[]; // newest first, deduped by relayId, cap 8
+}
+
+export interface NativeIdentity {
+  clientId: string; // stable install UUID (native-persisted)
+  sessionId: string | null; // active telemetry session id, null when idle
+}
+
+export interface OpenRungVpnModule {
+  /** Ask for OS VPN consent (Android: VpnService.prepare dialog; also requests
+   *  POST_NOTIFICATIONS on API 33+. iOS: load-or-create the
+   *  NETunnelProviderManager and save it). Resolves true when usable. */
+  prepare(): Promise<boolean>;
+  /** Start (or switch) the tunnel. targetCountry: ISO alpha-2 or null = broker
+   *  picks. targetRelayId: connect to that exact broker relay id (takes
+   *  precedence over targetCountry) or null. Resolves once the native start
+   *  has been dispatched (NOT when connected — completion is reported via
+   *  events). */
+  connect(
+    brokerUrl: string,
+    targetCountry: string | null,
+    targetRelayId: string | null,
+  ): Promise<void>;
+  disconnect(): Promise<void>;
+  getState(): Promise<NativeVpnState>;
+  getIdentity(): Promise<NativeIdentity>;
+  /** Persist the split-tunnel config JSON (contract §3: snake_case keys
+   *  version/enabled/bypass_lan/bypass_countries/excluded_packages, serialized
+   *  in exactly that order). When the tunnel is active AND the config actually
+   *  changed (string comparison against the stored value), native reapplies by
+   *  reconnecting to the same target. Resolves after persistence + reapply
+   *  dispatch (NOT completion — progress is reported via events). */
+  setSplitTunnelConfig(configJson: string): Promise<void>;
+}

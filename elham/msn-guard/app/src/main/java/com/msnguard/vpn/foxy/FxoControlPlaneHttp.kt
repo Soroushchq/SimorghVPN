@@ -1,0 +1,269 @@
+package com.msnguard.vpn.foxy
+
+import okhttp3.Cookie
+import okhttp3.CookieJar
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.OkHttpClient
+import okhttp3.Protocol
+import okhttp3.dnsoverhttps.DnsOverHttps
+import android.webkit.CookieManager
+import okhttp3.Request
+import com.msnguard.vpn.foxy.TlsClientHelloSplitter
+import java.io.FilterOutputStream
+import java.io.OutputStream
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
+import javax.net.SocketFactory
+
+private const val TAG = "ControlPlaneHttp"
+
+const val MOZILLA_VPN_USER_AGENT = "MozillaVPN/2.24.0 (sys:android 14)"
+
+fun Request.Builder.applyMozillaVpnHeaders(): Request.Builder =
+    FirefoxAccountHeaders.apply(this).header("Accept", "application/json")
+
+class SimpleCookieJar : CookieJar {
+    private val byDomain = ConcurrentHashMap<String, MutableList<Cookie>>()
+
+    override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
+        for (cookie in cookies) {
+            val bucket = byDomain.getOrPut(cookie.domain) { mutableListOf() }
+            synchronized(bucket) {
+                bucket.removeAll { it.name == cookie.name }
+                bucket.add(cookie)
+            }
+        }
+    }
+
+    override fun loadForRequest(url: HttpUrl): List<Cookie> {
+        val now = System.currentTimeMillis()
+        val result = mutableListOf<Cookie>()
+        for ((domain, cookies) in byDomain) {
+            if (url.host == domain || url.host.endsWith(".$domain")) {
+                synchronized(cookies) {
+                    result.addAll(cookies.filter { it.expiresAt > now })
+                }
+            }
+        }
+        return result
+    }
+
+    fun set(name: String, value: String, domain: String) {
+        val bucket = byDomain.getOrPut(domain) { mutableListOf() }
+        synchronized(bucket) {
+            bucket.removeAll { it.name == name }
+            bucket.add(
+                Cookie.Builder()
+                    .name(name)
+                    .value(value)
+                    .domain(domain)
+                    .path("/")
+                    .expiresAt(Long.MAX_VALUE)
+                    .build(),
+            )
+        }
+    }
+
+    fun snapshotAll(): List<Cookie> = byDomain.values.flatten()
+
+    /** Copy cookies created by the Firefox WebView into the OkHttp flow jar. */
+    fun syncFromWebView() {
+        val manager = runCatching { CookieManager.getInstance() }.getOrNull() ?: return
+        val hosts = listOf(
+            "https://accounts.firefox.com",
+            "https://api.accounts.firefox.com",
+            "https://oauth.accounts.firefox.com",
+            "https://vpn.mozilla.org",
+        )
+        for (url in hosts) {
+            val header = runCatching { manager.getCookie(url) }.getOrNull().orEmpty()
+            val parsed = header.split(';').mapNotNull { raw ->
+                val at = raw.indexOf('=')
+                if (at <= 0) return@mapNotNull null
+                val name = raw.substring(0, at).trim()
+                val value = raw.substring(at + 1).trim()
+                runCatching {
+                    Cookie.Builder().name(name).value(value)
+                        .domain(url.substringAfter("https://").substringBefore('/'))
+                        .path("/").expiresAt(Long.MAX_VALUE).build()
+                }.getOrNull()
+            }
+            if (parsed.isNotEmpty()) saveFromResponse(url.toHttpUrl(), parsed)
+        }
+    }
+}
+
+private class SplitClientHelloSocket(
+    private val modeProvider: () -> FoxySettings.TlsSplitMode,
+) : Socket() {
+    private var splitDone = false
+
+    override fun getOutputStream(): OutputStream {
+        val realOut = super.getOutputStream()
+        return object : FilterOutputStream(realOut) {
+            override fun write(b: ByteArray, off: Int, len: Int) {
+                val mode = modeProvider()
+                if (splitDone || mode == FoxySettings.TlsSplitMode.OFF) {
+                    realOut.write(b, off, len)
+                    return
+                }
+
+                if (!TlsClientHelloSplitter.looksLikeClientHello(b, off, len)) {
+                    realOut.write(b, off, len)
+                    return
+                }
+
+                splitDone = true
+                val segments = try {
+                    TlsClientHelloSplitter.splitBytes(b, off, len, mode)
+                } catch (e: Throwable) {
+                    null
+                }
+
+                if (segments.isNullOrEmpty()) {
+                    realOut.write(b, off, len)
+                    return
+                }
+
+                runCatching { this@SplitClientHelloSocket.tcpNoDelay = true }
+                for (seg in segments) {
+                    realOut.write(seg)
+                    realOut.flush()
+                }
+            }
+
+            override fun write(b: ByteArray) {
+                write(b, 0, b.size)
+            }
+        }
+    }
+}
+
+private class ProtectingSocketFactory : SocketFactory() {
+
+    private fun createRawSocket(): Socket =
+        SplitClientHelloSocket { FoxyControlPlaneHttp.tlsSplitModeProvider?.invoke() ?: FoxySettings.TlsSplitMode.OFF }
+
+    private fun protect(socket: Socket, localAddress: InetSocketAddress?): Socket {
+        runCatching {
+            if (!socket.isBound) socket.bind(localAddress ?: InetSocketAddress(0))
+        }.onFailure {
+            FoxyLog.w(TAG, "could not bind a control-plane socket before protecting it", it)
+        }
+        val protector = FoxyControlPlaneHttp.socketProtector
+        if (protector != null) {
+            val protectedOk = runCatching { protector.invoke(socket) }.getOrDefault(false)
+            if (!protectedOk) {
+                FoxyLog.w(
+                    TAG,
+                    "VpnService.protect() refused a control-plane socket; this request would be routed " +
+                        "back into the tunnel instead of out to the network",
+                )
+            }
+        }
+        return socket
+    }
+
+    override fun createSocket(): Socket = protect(createRawSocket(), null)
+
+    override fun createSocket(host: String, port: Int): Socket =
+        protect(createRawSocket(), null).apply { connect(InetSocketAddress(host, port)) }
+
+    override fun createSocket(host: String, port: Int, localAddr: InetAddress, localPort: Int): Socket =
+        protect(createRawSocket(), InetSocketAddress(localAddr, localPort))
+            .apply { connect(InetSocketAddress(host, port)) }
+
+    override fun createSocket(host: InetAddress, port: Int): Socket =
+        protect(createRawSocket(), null).apply { connect(InetSocketAddress(host, port)) }
+
+    override fun createSocket(host: InetAddress, port: Int, localAddr: InetAddress, localPort: Int): Socket =
+        protect(createRawSocket(), InetSocketAddress(localAddr, localPort))
+            .apply { connect(InetSocketAddress(host, port)) }
+}
+
+object FoxyControlPlaneHttp {
+    val cookieJar = SimpleCookieJar()
+
+    internal val relayerInterceptor = FoxyRelayerInterceptor { defaultRelayerConfig() }
+
+    private val bootstrapClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
+            .socketFactory(ProtectingSocketFactory())
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(10, TimeUnit.SECONDS)
+            .callTimeout(10, TimeUnit.SECONDS)
+            .build()
+    }
+
+    /**
+     * The reference Foxy client does not depend on one resolver.  A single
+     * blocked DoH endpoint made every control-plane hostname look unknown on
+     * the device, including the relayer itself.  Keep the literal bootstrap
+     * addresses and try the operators in order without recursive hostname DNS.
+     */
+    private val bootstrapDohResolvers: List<DnsOverHttps> by lazy {
+        listOf(
+            "1.1.1.1" to "https://1.1.1.1/dns-query",
+            "8.8.8.8" to "https://8.8.8.8/dns-query",
+            "9.9.9.9" to "https://9.9.9.9/dns-query",
+        ).map { (address, url) ->
+            DnsOverHttps.Builder()
+                .client(bootstrapClient)
+                .url(url.toHttpUrl())
+                .post(true)
+                .includeIPv6(true)
+                .bootstrapDnsHosts(listOf(InetAddress.getByName(address)))
+                .build()
+        }
+    }
+
+    private val bootstrapDoh: okhttp3.Dns by lazy {
+        object : okhttp3.Dns {
+            override fun lookup(hostname: String): List<InetAddress> {
+                if (isIpLiteral(hostname)) return listOf(InetAddress.getByName(hostname))
+                var last: Throwable? = null
+                for (resolver in bootstrapDohResolvers) {
+                    try {
+                        val addresses = resolver.lookup(hostname)
+                        if (addresses.isNotEmpty()) return addresses
+                    } catch (failure: Throwable) {
+                        last = failure
+                    }
+                }
+                throw java.net.UnknownHostException(
+                    "No bootstrap DoH resolver answered for $hostname",
+                ).also { if (last != null) it.initCause(last) }
+            }
+        }
+    }
+
+    private fun isIpLiteral(hostname: String): Boolean =
+        runCatching { InetAddress.getByName(hostname).hostAddress == hostname }.getOrDefault(false)
+
+    @Volatile
+    var socketProtector: ((Socket) -> Boolean)? = null
+
+    @Volatile
+    var tlsSplitModeProvider: (() -> FoxySettings.TlsSplitMode)? = null
+
+    val client: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
+            .addInterceptor(relayerInterceptor)
+            .cookieJar(cookieJar)
+            .socketFactory(ProtectingSocketFactory())
+            // Reference FoxyVPN defaults to DIRECT_SYSTEM for control-plane DNS.
+            // A fixed 1.1.1.1 bootstrap made both Mozilla and relayer hosts
+            // appear as UnknownHost when that resolver was unreachable.
+            .dns(okhttp3.Dns.SYSTEM)
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .callTimeout(30, TimeUnit.SECONDS)
+            .build()
+    }
+}

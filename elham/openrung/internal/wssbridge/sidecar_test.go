@@ -1,0 +1,742 @@
+package wssbridge
+
+import (
+	"context"
+	"crypto/ed25519"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/openrung/openrung/wsscore"
+)
+
+const (
+	testOriginOld = "old-origin-token-that-is-at-least-32-bytes"
+	testOriginNew = "new-origin-token-that-is-at-least-32-bytes"
+	testOriginB   = "front-b-origin-token-at-least-32-bytes"
+)
+
+type sidecarFixture struct {
+	signer   *TicketSigner
+	verifier *TicketVerifier
+	stats    *SidecarStats
+	handler  http.Handler
+	now      time.Time
+	nextJTI  atomic.Int64
+}
+
+type blockingReplayStore struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+	calls   atomic.Int32
+}
+
+func (s *blockingReplayStore) Consume(ctx context.Context, _ string, _ time.Time) (bool, error) {
+	s.calls.Add(1)
+	s.once.Do(func() { close(s.started) })
+	select {
+	case <-s.release:
+		return true, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+}
+
+func newSidecarFixture(t *testing.T, mutate func(*SidecarOptions)) *sidecarFixture {
+	t.Helper()
+	now := time.Now().UTC().Truncate(time.Second)
+	signer, key := testSigner(t, now)
+	verifier, err := NewTicketVerifier(map[string]ed25519.PublicKey{
+		signer.KeyID(): key.Public().(ed25519.PublicKey),
+	}, "relay-a", TicketOptions{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats := &SidecarStats{}
+	opts := SidecarOptions{
+		RelayID: "relay-a", Verifier: verifier, Stats: stats,
+		ReplayStore: newMemoryReplayStore(100_000),
+		FrontOriginTokens: map[string][]string{
+			"front-a": {testOriginOld, testOriginNew},
+			"front-b": {testOriginB},
+		},
+		PingInterval: -1,
+	}
+	if mutate != nil {
+		mutate(&opts)
+	}
+	handler, err := NewSidecarHandler(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &sidecarFixture{signer: signer, verifier: verifier, stats: stats, handler: handler, now: now}
+}
+
+func (f *sidecarFixture) ticket(t *testing.T, relayID, frontID string) string {
+	t.Helper()
+	jti := fmt.Sprintf("sidecar-ticket-%08d", f.nextJTI.Add(1))
+	token, err := f.signer.Sign(validClaims(f.now, relayID, frontID, jti))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return token
+}
+
+type testEdge struct {
+	URL    string
+	server *httptest.Server
+}
+
+func (e *testEdge) Close() {
+	e.server.Close()
+}
+
+func sidecarEdge(t *testing.T, handler http.Handler, originToken, viewer string) *testEdge {
+	t.Helper()
+	edgeHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Header.Set(OriginTokenHeader, originToken)
+		r.Header.Set(DefaultViewerAddressHeader, viewer)
+		handler.ServeHTTP(w, r)
+	})
+	server := httptest.NewUnstartedServer(edgeHandler)
+	server.StartTLS()
+	edge := &testEdge{URL: "wss://example.com" + wsscore.BridgePath, server: server}
+	t.Cleanup(edge.Close)
+	return edge
+}
+
+func sidecarClientOptions(edge *testEdge, ticket string) wsscore.ClientOptions {
+	certificate := edge.server.Certificate()
+	roots := x509.NewCertPool()
+	roots.AddCert(certificate)
+	dialer := &websocket.Dialer{
+		NetDialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, edge.server.Listener.Addr().String())
+		},
+	}
+	return wsscore.ClientOptions{
+		URL: edge.URL, Ticket: ticket, PingInterval: -1, WebSocketDialer: dialer,
+		TLSConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12},
+	}
+}
+
+func dialSidecarClient(t *testing.T, edge *testEdge, ticket string) (*wsscore.Client, error) {
+	t.Helper()
+	return wsscore.DialClient(t.Context(), sidecarClientOptions(edge, ticket))
+}
+
+func waitSnapshot(t *testing.T, stats *SidecarStats, check func(SidecarSnapshot) bool) SidecarSnapshot {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		snapshot := stats.Snapshot()
+		if check(snapshot) {
+			return snapshot
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("stats condition not reached: %+v", stats.Snapshot())
+	return SidecarSnapshot{}
+}
+
+func TestSidecarRejectsWrongRelayFrontAndTicketReplay(t *testing.T) {
+	fixture := newSidecarFixture(t, nil)
+	edgeA := sidecarEdge(t, fixture.handler, testOriginOld, "198.51.100.10:443")
+	edgeB := sidecarEdge(t, fixture.handler, testOriginB, "198.51.100.10:443")
+
+	if client, err := dialSidecarClient(t, edgeA, fixture.ticket(t, "relay-b", "front-a")); err == nil {
+		_ = client.Close()
+		t.Fatal("ticket for another relay was accepted")
+	}
+	if client, err := dialSidecarClient(t, edgeB, fixture.ticket(t, "relay-a", "front-a")); err == nil {
+		_ = client.Close()
+		t.Fatal("ticket for another front was accepted")
+	}
+	replayTicket := fixture.ticket(t, "relay-a", "front-a")
+	client, err := dialSidecarClient(t, edgeA, replayTicket)
+	if err != nil {
+		t.Fatalf("first ticket use: %v", err)
+	}
+	_ = client.Close()
+	waitSnapshot(t, fixture.stats, func(s SidecarSnapshot) bool { return s.CurrentSessions == 0 })
+	if client, err := dialSidecarClient(t, edgeA, replayTicket); err == nil {
+		_ = client.Close()
+		t.Fatal("replayed ticket was accepted")
+	}
+	snapshot := fixture.stats.Snapshot()
+	if snapshot.TicketRejections != 1 || snapshot.FrontRejections != 1 || snapshot.ReplayRejections != 1 {
+		t.Fatalf("rejection counters = %+v", snapshot)
+	}
+}
+
+func TestSidecarOriginTokenRotationAndAuthBeforeViewerAddress(t *testing.T) {
+	fixture := newSidecarFixture(t, nil)
+	for _, origin := range []string{testOriginOld, testOriginNew} {
+		edge := sidecarEdge(t, fixture.handler, origin, "198.51.100.11:443")
+		client, err := dialSidecarClient(t, edge, fixture.ticket(t, "relay-a", "front-a"))
+		if err != nil {
+			t.Fatalf("rotating token rejected: %v", err)
+		}
+		_ = client.Close()
+	}
+	waitSnapshot(t, fixture.stats, func(s SidecarSnapshot) bool { return s.CurrentSessions == 0 })
+
+	req := httptest.NewRequest(http.MethodGet, BridgePath, nil)
+	req.Header.Set(OriginTokenHeader, strings.Repeat("z", 32))
+	req.Header.Set(DefaultViewerAddressHeader, "not-an-address")
+	response := httptest.NewRecorder()
+	fixture.handler.ServeHTTP(response, req)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong origin status = %d", response.Code)
+	}
+	snapshot := fixture.stats.Snapshot()
+	if snapshot.OriginAuthRejections != 1 || snapshot.ViewerAddressRejections != 0 {
+		t.Fatalf("origin/viewer counters = %+v", snapshot)
+	}
+}
+
+func TestSidecarConfigRejectsSharedTokensAndNonLoopbackTargets(t *testing.T) {
+	fixture := newSidecarFixture(t, nil)
+	for _, target := range []string{"relay.example:443", "192.0.2.1:443", "localhost:443", "127.0.0.1", "127.0.0.1:0"} {
+		opts := SidecarOptions{
+			RelayID: "relay-a", Verifier: fixture.verifier,
+			FrontOriginTokens: map[string][]string{"front-a": {testOriginOld}},
+			FixedTarget:       target,
+		}
+		if _, err := NewSidecarHandler(opts); err == nil {
+			t.Fatalf("unsafe fixed target %q accepted", target)
+		}
+	}
+	if _, err := NewSidecarHandler(SidecarOptions{
+		RelayID: "relay-a", Verifier: fixture.verifier,
+		FrontOriginTokens: map[string][]string{
+			"front-a": {testOriginOld}, "front-b": {testOriginOld},
+		},
+	}); err == nil {
+		t.Fatal("one origin token was allowed to authenticate two fronts")
+	}
+}
+
+func startEchoTarget(t *testing.T) net.Listener {
+	t.Helper()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}()
+		}
+	}()
+	return listener
+}
+
+func TestSidecarOpaqueBridgeAlwaysDialsOneFixedTargetAndCleansUp(t *testing.T) {
+	target := startEchoTarget(t)
+	var dialMu sync.Mutex
+	var dialed []string
+	fixture := newSidecarFixture(t, func(opts *SidecarOptions) {
+		opts.FixedTarget = target.Addr().String()
+		opts.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+			dialMu.Lock()
+			dialed = append(dialed, network+" "+address)
+			dialMu.Unlock()
+			if network != "tcp" || address != target.Addr().String() {
+				return nil, errors.New("unexpected dial authority")
+			}
+			return (&net.Dialer{}).DialContext(ctx, network, address)
+		}
+		opts.NoStreamIdleTimeout = time.Minute
+		opts.StreamIdleTimeout = time.Minute
+	})
+	edge := sidecarEdge(t, fixture.handler, testOriginOld, "198.51.100.12:443")
+	client, err := dialSidecarClient(t, edge, fixture.ticket(t, "relay-a", "front-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveCtx, cancelServe := context.WithCancel(context.Background())
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- client.Serve(serveCtx) }()
+	host, port := client.Endpoint()
+	local, err := net.Dial("tcp", net.JoinHostPort(host, fmt.Sprint(port)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("opaque-reality-bytes")
+	if _, err := local.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	received := make([]byte, len(payload))
+	if _, err := io.ReadFull(local, received); err != nil {
+		t.Fatal(err)
+	}
+	if string(received) != string(payload) {
+		t.Fatalf("received %q", received)
+	}
+	waitSnapshot(t, fixture.stats, func(s SidecarSnapshot) bool { return s.CurrentStreams == 1 })
+	_ = local.Close()
+	cancelServe()
+	_ = client.Close()
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("Serve cleanup: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("client Serve did not stop")
+	}
+	waitSnapshot(t, fixture.stats, func(s SidecarSnapshot) bool {
+		return s.CurrentSessions == 0 && s.CurrentStreams == 0
+	})
+	dialMu.Lock()
+	defer dialMu.Unlock()
+	if len(dialed) != 1 || dialed[0] != "tcp "+target.Addr().String() {
+		t.Fatalf("dial attempts = %v", dialed)
+	}
+}
+
+// openOneStreamSession connects a client whose ticket allows a one-stream
+// burst and serves it, returning the local endpoint and a dial counter.
+func openOneStreamSession(t *testing.T, refill float64, jti string) (*sidecarFixture, string, *atomic.Int32) {
+	t.Helper()
+	target := startEchoTarget(t)
+	dialCount := &atomic.Int32{}
+	fixture := newSidecarFixture(t, func(opts *SidecarOptions) {
+		opts.FixedTarget = target.Addr().String()
+		opts.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+			dialCount.Add(1)
+			return (&net.Dialer{}).DialContext(ctx, network, address)
+		}
+		opts.NoStreamIdleTimeout = time.Minute
+		opts.StreamRefillPerSecond = refill
+	})
+	claims := validClaims(fixture.now, "relay-a", "front-a", jti)
+	claims.MaxStreams = 1
+	ticket, err := fixture.signer.Sign(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edge := sidecarEdge(t, fixture.handler, testOriginOld, "198.51.100.12:443")
+	client, err := dialSidecarClient(t, edge, ticket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveCtx, cancelServe := context.WithCancel(context.Background())
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- client.Serve(serveCtx) }()
+	t.Cleanup(func() {
+		cancelServe()
+		_ = client.Close()
+		select {
+		case <-serveDone:
+		case <-time.After(5 * time.Second):
+			t.Error("client Serve did not stop")
+		}
+	})
+	host, port := client.Endpoint()
+	return fixture, net.JoinHostPort(host, fmt.Sprint(port)), dialCount
+}
+
+// echoOnce reports whether one stream through the session echoed its payload.
+func echoOnce(t *testing.T, endpoint, payload string) bool {
+	t.Helper()
+	conn, err := net.Dial("tcp", endpoint)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(time.Second))
+	if _, err := conn.Write([]byte(payload)); err != nil {
+		return false
+	}
+	got := make([]byte, len(payload))
+	_, err = io.ReadFull(conn, got)
+	return err == nil && string(got) == payload
+}
+
+func TestSidecarStreamBudgetRefusesExcessWithoutEndingSession(t *testing.T) {
+	fixture, endpoint, dialCount := openOneStreamSession(t, 0.001, "one-stream-ticket-00000001")
+	if !echoOnce(t, endpoint, "first") {
+		t.Fatal("first stream within the burst failed")
+	}
+	waitSnapshot(t, fixture.stats, func(s SidecarSnapshot) bool { return s.CurrentStreams == 0 })
+	if echoOnce(t, endpoint, "second") {
+		t.Fatal("stream beyond the drained budget was carried")
+	}
+	waitSnapshot(t, fixture.stats, func(s SidecarSnapshot) bool { return s.StreamLimitRejections == 1 })
+	if got := dialCount.Load(); got != 1 {
+		t.Fatalf("drained budget caused %d loopback dials", got)
+	}
+	// Refusing the excess stream must leave the session itself in place.
+	time.Sleep(100 * time.Millisecond)
+	if snapshot := fixture.stats.Snapshot(); snapshot.CurrentSessions != 1 {
+		t.Fatalf("current sessions = %d after a refused stream, want 1", snapshot.CurrentSessions)
+	}
+}
+
+func TestSidecarEndsSessionWhenRefusedStreamsAreNeverClosed(t *testing.T) {
+	fixture := newSidecarFixture(t, func(opts *SidecarOptions) {
+		opts.FixedTarget = startEchoTarget(t).Addr().String()
+		opts.NoStreamIdleTimeout = time.Minute
+		opts.StreamRefillPerSecond = 0.001
+	})
+	claims := validClaims(fixture.now, "relay-a", "front-a", "one-stream-ticket-00000003")
+	claims.MaxStreams = 1
+	ticket, err := fixture.signer.Sign(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edge := sidecarEdge(t, fixture.handler, testOriginOld, "198.51.100.14:443")
+	options := sidecarClientOptions(edge, ticket)
+	dialer := options.WebSocketDialer
+	dialer.TLSClientConfig = options.TLSConfig
+	dialer.Subprotocols = []string{Subprotocol}
+	header := http.Header{}
+	header.Set(wsscore.TicketAuthorizationHeader, wsscore.TicketBearerPrefix+ticket)
+	ws, _, err := dialer.DialContext(t.Context(), edge.URL, header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := wsscore.NewWebSocketConn(ws, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := wsscore.NewClientSession(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	waitSnapshot(t, fixture.stats, func(s SidecarSnapshot) bool { return s.CurrentSessions == 1 })
+
+	// Open refused streams and never close them, so each one stays tracked
+	// on the sidecar until its close timeout. Past the bound's allowance for a
+	// cooperating client, the sidecar must end the session.
+	for i := 0; i < 2*yamuxAcceptBacklog && !session.IsClosed(); i++ {
+		stream, err := session.Open()
+		if err != nil {
+			break
+		}
+		_, _ = stream.Write([]byte{0})
+		time.Sleep(time.Millisecond)
+	}
+	waitSnapshot(t, fixture.stats, func(s SidecarSnapshot) bool { return s.CurrentSessions == 0 })
+}
+
+func TestSidecarCooperativeBurstKeepsSession(t *testing.T) {
+	fixture, endpoint, _ := openOneStreamSession(t, 0.001, "one-stream-ticket-00000004")
+	var wg sync.WaitGroup
+	var carried atomic.Int32
+	for i := range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if echoOnce(t, endpoint, fmt.Sprintf("burst-%d", i)) {
+				carried.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if carried.Load() == 0 {
+		t.Fatal("no stream in the burst was carried")
+	}
+	time.Sleep(200 * time.Millisecond)
+	if snapshot := fixture.stats.Snapshot(); snapshot.CurrentSessions != 1 {
+		t.Fatalf("current sessions = %d after a cooperative burst, want 1", snapshot.CurrentSessions)
+	}
+}
+
+func TestSidecarStreamBudgetRefills(t *testing.T) {
+	fixture, endpoint, dialCount := openOneStreamSession(t, 50, "one-stream-ticket-00000002")
+	for i := range 3 {
+		if !echoOnce(t, endpoint, fmt.Sprintf("stream-%d", i)) {
+			t.Fatalf("stream %d after refill failed", i)
+		}
+		waitSnapshot(t, fixture.stats, func(s SidecarSnapshot) bool { return s.CurrentStreams == 0 })
+		time.Sleep(100 * time.Millisecond)
+	}
+	if got := dialCount.Load(); got != 3 {
+		t.Fatalf("loopback dials = %d, want 3", got)
+	}
+	if snapshot := fixture.stats.Snapshot(); snapshot.StreamLimitRejections != 0 || snapshot.CurrentSessions != 1 {
+		t.Fatalf("stream limit rejections = %d, current sessions = %d", snapshot.StreamLimitRejections, snapshot.CurrentSessions)
+	}
+}
+
+func TestSidecarPerSourceSessionLimitIsReleased(t *testing.T) {
+	fixture := newSidecarFixture(t, func(opts *SidecarOptions) { opts.MaxSessionsPerSource = 1 })
+	edge := sidecarEdge(t, fixture.handler, testOriginOld, "198.51.100.13:443")
+	first, err := dialSidecarClient(t, edge, fixture.ticket(t, "relay-a", "front-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitSnapshot(t, fixture.stats, func(s SidecarSnapshot) bool { return s.CurrentSessions == 1 })
+	if second, err := dialSidecarClient(t, edge, fixture.ticket(t, "relay-a", "front-a")); err == nil {
+		_ = second.Close()
+		t.Fatal("second session behind same source passed the configured limit")
+	}
+	if got := fixture.stats.Snapshot().SourceSessionRejections; got != 1 {
+		t.Fatalf("source session rejections = %d", got)
+	}
+	_ = first.Close()
+	waitSnapshot(t, fixture.stats, func(s SidecarSnapshot) bool { return s.CurrentSessions == 0 })
+	third, err := dialSidecarClient(t, edge, fixture.ticket(t, "relay-a", "front-a"))
+	if err != nil {
+		t.Fatalf("source capacity was not released: %v", err)
+	}
+	_ = third.Close()
+}
+
+func TestSidecarGlobalHandshakeRateLimitIsBounded(t *testing.T) {
+	fixture := newSidecarFixture(t, func(opts *SidecarOptions) {
+		opts.GlobalHandshakeRatePerSecond = 0.000001
+		opts.GlobalHandshakeBurst = 1
+	})
+	edge := sidecarEdge(t, fixture.handler, testOriginOld, "198.51.100.13:443")
+	first, err := dialSidecarClient(t, edge, fixture.ticket(t, "relay-a", "front-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = first.Close()
+	waitSnapshot(t, fixture.stats, func(s SidecarSnapshot) bool { return s.CurrentSessions == 0 })
+
+	if second, err := dialSidecarClient(t, edge, fixture.ticket(t, "relay-a", "front-a")); err == nil {
+		_ = second.Close()
+		t.Fatal("second handshake passed the configured global rate limit")
+	}
+	if got := fixture.stats.Snapshot().GlobalHandshakeRateRejections; got != 1 {
+		t.Fatalf("global handshake rate rejections = %d", got)
+	}
+}
+
+func TestSidecarPendingHandshakeLimitBoundsReplayStalls(t *testing.T) {
+	replay := &blockingReplayStore{started: make(chan struct{}), release: make(chan struct{})}
+	fixture := newSidecarFixture(t, func(opts *SidecarOptions) {
+		opts.ReplayStore = replay
+		opts.MaxPendingHandshakes = 1
+	})
+	edge := sidecarEdge(t, fixture.handler, testOriginOld, "198.51.100.15:443")
+	type dialResult struct {
+		client *wsscore.Client
+		err    error
+	}
+	firstResult := make(chan dialResult, 1)
+	firstTicket := fixture.ticket(t, "relay-a", "front-a")
+	go func() {
+		client, err := wsscore.DialClient(context.Background(), sidecarClientOptions(edge, firstTicket))
+		firstResult <- dialResult{client: client, err: err}
+	}()
+	waitWSS := func(signal <-chan struct{}) {
+		select {
+		case <-signal:
+		case <-time.After(5 * time.Second):
+			t.Fatal("first replay check did not start")
+		}
+	}
+	waitWSS(replay.started)
+
+	started := time.Now()
+	second, err := dialSidecarClient(t, edge, fixture.ticket(t, "relay-a", "front-a"))
+	if err == nil {
+		_ = second.Close()
+		t.Fatal("handshake beyond pending limit succeeded")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("excess handshake was not rejected promptly: %s", elapsed)
+	}
+	if got := fixture.stats.Snapshot().HandshakeConcurrencyRejections; got != 1 {
+		t.Fatalf("handshake concurrency rejections = %d", got)
+	}
+	if got := replay.calls.Load(); got != 1 {
+		t.Fatalf("pending limit allowed %d replay operations", got)
+	}
+
+	close(replay.release)
+	select {
+	case result := <-firstResult:
+		if result.err != nil {
+			t.Fatalf("first handshake after replay release: %v", result.err)
+		}
+		_ = result.client.Close()
+	case <-time.After(5 * time.Second):
+		t.Fatal("first handshake did not finish")
+	}
+}
+
+// TestSidecarKeepsSessionQuietAfterItsFirstStream pins the distinction between
+// an unused session and a quiet one. A phone with the VPN on carries no traffic
+// for hours; evicting it broke the tunnel and the client could only report that
+// as a lost path. Sessions that never carry a stream are still evicted, which
+// is what the neighbouring idle test covers.
+func TestSidecarKeepsSessionQuietAfterItsFirstStream(t *testing.T) {
+	target := startEchoTarget(t)
+	fixture := newSidecarFixture(t, func(opts *SidecarOptions) {
+		opts.FixedTarget = target.Addr().String()
+		opts.NoStreamIdleTimeout = 80 * time.Millisecond
+		opts.StreamIdleTimeout = time.Minute
+		opts.SessionLifetime = time.Minute
+	})
+	edge := sidecarEdge(t, fixture.handler, testOriginOld, "198.51.100.19:443")
+	client, err := dialSidecarClient(t, edge, fixture.ticket(t, "relay-a", "front-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	serveCtx, cancelServe := context.WithCancel(context.Background())
+	defer cancelServe()
+	go func() { _ = client.Serve(serveCtx) }()
+
+	host, port := client.Endpoint()
+	local, err := net.Dial("tcp", net.JoinHostPort(host, fmt.Sprint(port)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("opaque-reality-bytes")
+	if _, err := local.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	received := make([]byte, len(payload))
+	if _, err := io.ReadFull(local, received); err != nil {
+		t.Fatal(err)
+	}
+	waitSnapshot(t, fixture.stats, func(s SidecarSnapshot) bool { return s.CurrentStreams == 1 })
+	_ = local.Close()
+	waitSnapshot(t, fixture.stats, func(s SidecarSnapshot) bool { return s.CurrentStreams == 0 })
+
+	// Well past the no-stream idle window with no stream in flight.
+	time.Sleep(500 * time.Millisecond)
+	snapshot := fixture.stats.Snapshot()
+	if snapshot.CurrentSessions != 1 || snapshot.IdleSessionCloses != 0 {
+		t.Fatalf("a session that had carried a stream was evicted for going quiet: %+v", snapshot)
+	}
+	if end := client.SessionEnd(); end != wsscore.SessionEndNone {
+		t.Fatalf("client session ended with %v", end)
+	}
+}
+
+func TestSidecarIdleAndLifetimeControlsCloseAndReleaseSessions(t *testing.T) {
+	for name, configure := range map[string]func(*SidecarOptions){
+		"idle": func(opts *SidecarOptions) {
+			opts.NoStreamIdleTimeout = 50 * time.Millisecond
+			opts.SessionLifetime = time.Minute
+		},
+		"lifetime": func(opts *SidecarOptions) {
+			opts.NoStreamIdleTimeout = time.Minute
+			opts.SessionLifetime = 50 * time.Millisecond
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fixture := newSidecarFixture(t, configure)
+			edge := sidecarEdge(t, fixture.handler, testOriginOld, "198.51.100.14:443")
+			client, err := dialSidecarClient(t, edge, fixture.ticket(t, "relay-a", "front-a"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			waitSnapshot(t, fixture.stats, func(s SidecarSnapshot) bool { return s.CurrentSessions == 1 })
+			snapshot := waitSnapshot(t, fixture.stats, func(s SidecarSnapshot) bool {
+				return s.CurrentSessions == 0
+			})
+			if name == "idle" && snapshot.IdleSessionCloses != 1 {
+				t.Fatalf("idle close counters = %+v", snapshot)
+			}
+			if name == "lifetime" && snapshot.LifetimeSessionCloses != 1 {
+				t.Fatalf("lifetime close counters = %+v", snapshot)
+			}
+		})
+	}
+}
+
+func TestSourceUsageStreamLimit(t *testing.T) {
+	usage := newSourceUsage(100, 2)
+	if !usage.acquireStream("source") || !usage.acquireStream("source") || usage.acquireStream("source") {
+		t.Fatal("stream source limit was not enforced")
+	}
+	usage.releaseStream("source")
+	if !usage.acquireStream("source") {
+		t.Fatal("stream source capacity was not released")
+	}
+}
+
+func TestViewerSourceKey(t *testing.T) {
+	cases := []struct {
+		name   string
+		values []string
+		want   string
+		ok     bool
+	}{
+		{"ipv4", []string{"198.51.100.7:443"}, "198.51.100.7", true},
+		{"bracketed ipv6", []string{"[2001:db8::7]:51234"}, "2001:db8::/64", true},
+		{"bare ipv6", []string{"2001:db8::7:443"}, "2001:db8::/64", true},
+		{"bare full ipv6", []string{"2001:db8:1:2:3:4:5:6:443"}, "2001:db8:1:2::/64", true},
+		{"bare ipv4-mapped ipv6", []string{"::ffff:198.51.100.7:443"}, "198.51.100.7", true},
+		{"missing", nil, "", false},
+		{"empty", []string{""}, "", false},
+		{"repeated header", []string{"198.51.100.7:443", "198.51.100.8:443"}, "", false},
+		{"ipv4 without port", []string{"198.51.100.7"}, "", false},
+		{"ipv6 without port", []string{"2001:db8::7"}, "", false},
+		{"zero port", []string{"2001:db8::7:0"}, "", false},
+		{"port out of range", []string{"2001:db8::7:65536"}, "", false},
+		{"signed port", []string{"2001:db8::7:+443"}, "", false},
+		{"zoned ipv6", []string{"fe80::1%eth0:443"}, "", false},
+		{"bracketed ipv4", []string{"[198.51.100.7]:443"}, "", false},
+		{"ipv4 with two ports", []string{"198.51.100.7:443:1"}, "", false},
+		{"list", []string{"198.51.100.7:443, 198.51.100.8:443"}, "", false},
+		{"garbage", []string{"not-an-address"}, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := viewerSourceKey(tc.values)
+			if got != tc.want || ok != tc.ok {
+				t.Fatalf("viewerSourceKey(%q) = %q, %v; want %q, %v", tc.values, got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}
+
+func TestSidecarKeysIPv6ViewersByPrefix(t *testing.T) {
+	fixture := newSidecarFixture(t, func(opts *SidecarOptions) { opts.MaxSessionsPerSource = 1 })
+	bare := sidecarEdge(t, fixture.handler, testOriginOld, "2001:db8::42:443")
+	// A different address in the same /64, in the bracketed form.
+	bracketed := sidecarEdge(t, fixture.handler, testOriginOld, "[2001:db8::99]:51234")
+	otherPrefix := sidecarEdge(t, fixture.handler, testOriginOld, "2001:db8:0:1::42:443")
+	first, err := dialSidecarClient(t, bare, fixture.ticket(t, "relay-a", "front-a"))
+	if err != nil {
+		t.Fatalf("bare IPv6 viewer address was rejected: %v", err)
+	}
+	defer first.Close()
+	waitSnapshot(t, fixture.stats, func(s SidecarSnapshot) bool { return s.CurrentSessions == 1 })
+	if second, err := dialSidecarClient(t, bracketed, fixture.ticket(t, "relay-a", "front-a")); err == nil {
+		_ = second.Close()
+		t.Fatal("a second address in the same IPv6 /64 was not counted as the same source")
+	}
+	third, err := dialSidecarClient(t, otherPrefix, fixture.ticket(t, "relay-a", "front-a"))
+	if err != nil {
+		t.Fatalf("a viewer in a different IPv6 /64 was rejected: %v", err)
+	}
+	defer third.Close()
+	snapshot := fixture.stats.Snapshot()
+	if snapshot.ViewerAddressRejections != 0 || snapshot.SourceSessionRejections != 1 {
+		t.Fatalf("viewer address rejections = %d, source session rejections = %d",
+			snapshot.ViewerAddressRejections, snapshot.SourceSessionRejections)
+	}
+}

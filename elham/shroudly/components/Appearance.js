@@ -1,0 +1,183 @@
+'use client';
+
+/*
+ * Accent colour and surface style.
+ *
+ * Both are applied as attributes on <html>, which the stylesheet keys off, so
+ * changing one is a single attribute write and never a re-render of the app.
+ * Only the accent family moves; the greys, the status colours and every
+ * contrast ratio stay as designed, so no choice available here can make text
+ * hard to read.
+ */
+
+import { useEffect, useState } from 'react';
+
+export const ACCENTS = [
+  { id: 'sky',     swatch: '#38bdf8' },
+  { id: 'teal',    swatch: '#2dd4bf' },
+  { id: 'emerald', swatch: '#34d399' },
+  { id: 'lime',    swatch: '#a3e635' },
+  { id: 'amber',   swatch: '#fbbf24' },
+  { id: 'rose',    swatch: '#fb7185' },
+  { id: 'pink',    swatch: '#f472b6' },
+  { id: 'violet',  swatch: '#a78bfa' },
+  { id: 'indigo',  swatch: '#818cf8' },
+];
+
+/* The logos to choose between (electron/logos.js keeps the same list for
+ * the window's, the taskbar's and the Dock's icon; scripts/logo/variants.py
+ * draws them into public/logos). "classic" is the logo Shroudly has always
+ * had. Three groups: styles, special days, and countries where people use
+ * Shroudly against blocking. */
+export const LOGO_GROUPS = [
+  ['styles', ['classic', 'flat', 'line', 'paper', 'key', 'veil', 'terminal', 'night', 'coral']],
+  ['days', ['newyear', 'halloween', 'valentine', 'spring', 'ramadan', 'winter']],
+  ['countries', ['tr', 'ir', 'ru', 'cn', 'pk', 'az', 'kz', 'eg', 'vn']],
+];
+export const LOGO_IDS = LOGO_GROUPS.flatMap(([, ids]) => ids);
+/* The accent each logo matches, for "Colour follows the icon": the accent
+ * nearest the logo's main colour (measured from public/logos; the same
+ * table in android Accent.kt and apple Accent.swift). */
+export const LOGO_ACCENT = {
+  classic: 'sky', flat: 'sky', line: 'sky', paper: 'sky', 'key': 'amber', veil: 'violet', terminal: 'emerald', night: 'teal', coral: 'rose',
+  newyear: 'emerald', halloween: 'amber', valentine: 'rose', spring: 'emerald', ramadan: 'amber', winter: 'sky',
+  tr: 'rose', ir: 'rose', ru: 'sky', cn: 'rose', pk: 'emerald', az: 'rose', kz: 'teal', eg: 'rose', vn: 'rose',
+};
+const LOGO_ACCENT_KEY = 'shroudly_logo_accent';
+export function readLogoAccent() {
+  try { return localStorage.getItem(LOGO_ACCENT_KEY) === '1'; } catch { return false; }
+}
+/* On: the window's colour is the logo's, whatever accent is picked (kept,
+ * and back once it is off). */
+export function setLogoAccent(on) {
+  try { localStorage.setItem(LOGO_ACCENT_KEY, on ? '1' : '0'); } catch {}
+  try { window.electron?.setSetting?.('logoAccent', !!on); } catch {}
+  applyAppearance(readAppearance());
+}
+const LOGO_KEY = 'shroudly_logo';
+const LOGO_EVENT = 'shroudly:logo';
+
+/* The picture of a logo for a picker or the window's corner. Relative: the
+ * exported app is loaded from file://. */
+export function logoSrc(id) { return LOGO_IDS.includes(id) ? `./logos/${id}.png` : './logos/classic.png'; }
+
+export function readLogo() {
+  try { const v = localStorage.getItem(LOGO_KEY); return LOGO_IDS.includes(v) ? v : 'classic'; } catch { return 'classic'; }
+}
+
+/* The user's choice: kept here for the window, and told to the main process,
+ * which puts it on the window, the taskbar and the Dock (save: false when
+ * the main process is the one that said it). */
+export function chooseLogo(id, save = true) {
+  const v = LOGO_IDS.includes(id) ? id : 'classic';
+  try { localStorage.setItem(LOGO_KEY, v); } catch {}
+  try { window.dispatchEvent(new CustomEvent(LOGO_EVENT, { detail: v })); } catch {}
+  if (save) { try { window.electron?.setSetting?.('logo', v); } catch {} }
+  if (readLogoAccent()) applyAppearance(readAppearance());
+}
+
+/* The logo in use, for whatever shows it; follows a choice made anywhere in
+ * the window, and what the main process has saved (another window's choice,
+ * or the settings put back as they came). */
+export function useLogo() {
+  const [logo, setLogo] = useState('classic');
+  useEffect(() => {
+    setLogo(readLogo());
+    const on = (e) => setLogo(LOGO_IDS.includes(e.detail) ? e.detail : 'classic');
+    window.addEventListener(LOGO_EVENT, on);
+    Promise.resolve(window.electron?.getSetting?.('logo')).then((v) => {
+      const saved = LOGO_IDS.includes(v) ? v : 'classic';
+      if (saved !== readLogo()) chooseLogo(saved, false);
+    }).catch(() => {});
+    return () => window.removeEventListener(LOGO_EVENT, on);
+  }, []);
+  return logo;
+}
+
+const ACCENT_KEY = 'shroudly_accent';
+const SURFACE_KEY = 'shroudly_surface';
+
+export function readAppearance() {
+  let accent = 'sky';
+  let surface = 'solid';
+  try {
+    accent = localStorage.getItem(ACCENT_KEY) || 'sky';
+    surface = localStorage.getItem(SURFACE_KEY) || 'solid';
+  } catch {}
+  if (!ACCENTS.some((a) => a.id === accent)) accent = 'sky';
+  if (surface !== 'glass') surface = 'solid';
+  return { accent, surface };
+}
+
+export function applyAppearance({ accent, surface }) {
+  const el = document.documentElement;
+  // "Colour follows the icon": the logo's accent on screen, the one picked
+  // kept for when it is turned off.
+  const shown = readLogoAccent() ? (LOGO_ACCENT[readLogo()] || 'sky') : accent;
+  // The default needs no attribute at all, so the base tokens apply untouched.
+  if (shown && shown !== 'sky') el.setAttribute('data-accent', shown);
+  else el.removeAttribute('data-accent');
+  if (surface === 'glass') el.setAttribute('data-surface', 'glass');
+  else el.removeAttribute('data-surface');
+  try {
+    localStorage.setItem(ACCENT_KEY, accent || 'sky');
+    localStorage.setItem(SURFACE_KEY, surface || 'solid');
+  } catch {}
+
+  /* On Windows and Linux the caption buttons sit on a strip the operating
+   * system paints, which would otherwise keep its original colour while the
+   * rest of the window changed around it. macOS draws its buttons straight
+   * over ours, so it needs nothing. Under a Windows Contrast theme (forced
+   * colours) the page is painted in the theme's own colours: the strip takes
+   * them too, its symbols in the theme's text colour on its background.
+   * Before, both came back as the theme's background, and the minimise,
+   * maximise and close buttons could not be seen. */
+  try {
+    // A Windows contrast theme: the strip and its buttons in the theme's
+    // own colours. Read through the page, both came back as the forced
+    // background, and the buttons were drawn black on black.
+    const forced = window.matchMedia?.('(forced-colors: active)')?.matches;
+    const color = cssColorToHex(forced ? 'Canvas' : 'var(--titlebar)');
+    const symbolColor = cssColorToHex(forced ? 'CanvasText' : 'var(--text-dim)');
+    if (color && symbolColor && color !== symbolColor) window.electron?.setTitleBarColors?.({ color, symbolColor });
+  } catch {}
+}
+
+/* The colour a CSS value actually paints, as #rrggbb. Tokens can be written
+ * as color-mix() or oklab(), which Electron's caption strip does not accept;
+ * reading back one painted pixel resolves any of them. The probe keeps the
+ * colour it is given even under forced colours, which would paint it the
+ * theme's background whatever it asked for. */
+export function cssColorToHex(value) {
+  const probe = document.createElement('div');
+  // forced-color-adjust: a contrast theme would paint the probe its own way.
+  probe.style.cssText = `position:absolute;width:1px;height:1px;left:-9px;top:-9px;forced-color-adjust:none;background:${value}`;
+  document.body.appendChild(probe);
+  const resolved = getComputedStyle(probe).backgroundColor;
+  probe.remove();
+  const canvas = document.createElement('canvas');
+  canvas.width = 1; canvas.height = 1;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx || !resolved) return null;
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, 1, 1);
+  ctx.fillStyle = resolved;
+  ctx.fillRect(0, 0, 1, 1);
+  const [r, g, b] = ctx.getImageData(0, 0, 1, 1).data;
+  return `#${[r, g, b].map((n) => n.toString(16).padStart(2, '0')).join('')}`;
+}
+
+/* Applies the saved choice as early as the app can run script, so the window
+ * never shows the default colours for a frame before switching. */
+export default function Appearance() {
+  useEffect(() => {
+    applyAppearance(readAppearance());
+    // A contrast theme or the system's light/dark turned on or off while
+    // the window is open: the caption strip follows.
+    const again = () => applyAppearance(readAppearance());
+    const queries = ['(forced-colors: active)', '(prefers-color-scheme: dark)'].map((q) => window.matchMedia?.(q)).filter(Boolean);
+    queries.forEach((m) => m.addEventListener?.('change', again));
+    return () => queries.forEach((m) => m.removeEventListener?.('change', again));
+  }, []);
+  return null;
+}

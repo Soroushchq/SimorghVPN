@@ -1,0 +1,640 @@
+# Architecture
+
+## Goals
+
+OpenRung provides temporary relays in unrestricted regions so clients behind
+internet censorship can reach blocked public websites and apps. Relays may be
+Foundation-operated or run by community volunteers.
+
+The current version optimizes for learning:
+
+- Require each direct-mode relay to expose a publicly reachable TCP port.
+- Use Xray-core for VLESS + Reality + Vision transport.
+- Keep the broker out of the data path.
+- Let the mobile client route all device traffic through a VPN tunnel.
+
+## Components
+
+### Broker
+
+The broker is a control-plane service. It stores short-lived relay descriptors and returns candidates to clients.
+
+The broker does not:
+
+- Proxy user traffic.
+- Store browsing destinations.
+- Terminate VLESS sessions.
+- Know client traffic contents.
+
+The broker does:
+
+- Accept relay registration.
+- Track relay heartbeats.
+- Expire stale relays.
+- Return a small ranked candidate set to clients using recent relay load, success, latency, and handshake-retransmission signals.
+- Optionally persist relay state in PostgreSQL so multiple broker instances can share one relay view behind a load balancer.
+- Keep experimental relay/session/metric fields in JSONB columns until they are stable enough to promote into indexed columns.
+
+### Relay CLI
+
+The relay CLI (`cmd/relay`) runs on desktop systems. It starts an
+Xray-core inbound listener and registers the relay with the broker. It defaults
+to an IPv6 listener and auto-advertises the first global IPv6 address it can
+find unless the operator supplies `-public-host`. By default Xray owns the
+public port; the dual-family listen hosts (`::`, `dual`, `both`) bind one
+dual-stack wildcard. With `-connection-log`, the CLI instead wraps Xray with a
+local TCP observer so it can print client connect and disconnect events
+without changing the broker descriptor; the observer opens separate IPv6 and
+IPv4 public listeners for those hosts and forwards both to one loopback Xray
+listener. The desktop volunteer app always runs the observer for its live
+connection counters.
+
+The same executable serves both operator classes. Community-run relays register
+as `node_class: "volunteer"`; relays presenting the Foundation credential
+register as `node_class: "foundation"`. The broker attests this provenance in
+the signed relay directory. It is not a quality score or a trust bypass.
+
+Direct-mode relays, including the desktop relay engine, use only the canonical
+`POST /api/v1/relays/register` and `/api/v1/relays/{id}/heartbeat` routes.
+Broker errors are returned directly to the runtime, and broker redirects are
+refused.
+
+The CLI produces an Xray server config with:
+
+- VLESS inbound.
+- Reality transport.
+- Vision flow: `xtls-rprx-vision`.
+- Freedom outbound, meaning the relay is the direct exit.
+- An egress guard: routing rules send any client connection aimed at the
+  relay host's own loopback, the unspecified addresses, or private,
+  link-local and CGNAT ranges to a blackhole outbound (domain destinations
+  are resolved first so the rule sees the address that would be dialed), and
+  refuse the management port below on every address by number. A public
+  relay's clients have no legitimate business on its host or its network,
+  and the port rule is what keeps xray's management API off the data plane
+  regardless of name resolution.
+- A peer-to-peer block: BitTorrent, recognised by its sniffed handshake on any
+  port, connections to the default BitTorrent peer and tracker ports and
+  Xunlei's peer ports, and connections to Xunlei's service domains all go to
+  the same blackhole.
+
+**Rotating credentials.** The VLESS UUID in a relay's directory entry is the
+credential that admits a client, and the directory is public, so a copied
+entry would be a permanent credential if the UUID never changed. A direct-mode
+relay therefore derives a fresh UUID every hour from its identity seed
+(HKDF-SHA256, salted by `OPENRUNG_CREDENTIAL_EPOCH`), accepts the current and
+previous hour's credentials, and announces the current one to the broker in
+its heartbeat `client_id`; the broker serves it from that heartbeat on and
+echoes what it now serves, and only then does the relay retire older
+credentials — never one the broker still reports serving while the broker is
+reachable, so a broker that predates the field simply keeps the
+registration-time credential. After an hour without any successful broker
+contact (the lease and every directory snapshot have long expired by then) the
+relay retires that one too and serves only its current and previous hour, so
+an outage cannot extend a copied credential's life. Xray's
+management API (HandlerService alone, on a loopback inbound that the egress
+guard above makes unreachable from client traffic) applies each change to the
+running process through the bundled binary's `xray api adu`/`rmu`, so no
+session is interrupted and no restart is needed; an already-authenticated
+connection survives its credential's retirement because VLESS checks the
+credential once, at the handshake. A copied directory entry stops admitting
+within two hours of the last heartbeat the broker answered, while a
+legitimate snapshot (bounded by the list's 30-minute `not_after`) never holds
+a credential the relay has already retired. The wire
+is unchanged: same Reality parameters, same server name, only the UUID inside
+the encrypted request rotates. `-credential-rotation=false`
+(`OPENRUNG_CREDENTIAL_ROTATION=off`) keeps one static `-client-id`, which is
+also what tunnel mode always serves — its endpoint is published through the
+hub, which has no rotation channel.
+
+Volunteer-run relays also support a **CGNAT reverse-tunnel mode** for hosts that
+cannot expose a public port; see the Relay Hub section below. Foundation-token
+relays are forced into direct mode so their privileged credential never enters
+the hub path.
+
+**Mode auto-detection.** For volunteer-run relays, the CLI picks direct vs
+tunnel via `-mode`
+(`auto` | `direct` | `tunnel`). In `auto` (the default whenever a `-hub` is
+configured) it runs a startup **reachability probe**: it opens its listener and
+asks the hub's HTTP API to dial it back at its observed public IP with a nonce
+handshake. If the callback succeeds it registers **directly** (advertising the
+observed IP), otherwise it falls back to **tunnel** mode — so operators no longer
+have to know in advance whether a host is behind CGNAT. A probe that can't run
+(hub HTTP API down) is treated as inconclusive and defaults to tunnel. `-mode
+direct`/`tunnel` (and the legacy `-tunnel`) force a mode and skip the probe.
+
+### Relay Hub (CGNAT volunteer-run relays)
+
+Most volunteer-run relays expose a publicly reachable port. Relays behind
+**CGNAT** (carrier-grade NAT) have no inbound port and cannot. The relay hub
+(`cmd/relayhub`) is a separate, publicly reachable component that brings these
+volunteer-run relays online:
+
+- The relay runs Xray bound to **loopback** and dials the hub outbound over a
+  single TLS connection (`-tunnel -hub <addr>`), authenticating with the same
+  registration token.
+- The hub allocates one public TCP port per relay, registers the relay with
+  the broker (with `transport: "tunnel"` and `public_host`/`public_port` pointing
+  at the hub), and multiplexes inbound client connections to the relay over the
+  tunnel using yamux. The hub uses only the canonical
+  `POST /api/v1/relays/register` and `/api/v1/relays/{id}/heartbeat` routes;
+  broker errors are returned directly.
+  Clients connect to `hub:port` exactly as they would any direct relay — no client
+  changes.
+- Descriptor liveness is tied to the tunnel: the hub heartbeats while the tunnel
+  is healthy and stops when it drops, so the relay expires via the broker's normal
+  lease TTL. Stable-identity registrations also receive a per-registration lease
+  token. The hub presents it on each heartbeat, so a stale session or replay that
+  replaces the descriptor cannot be kept alive by the current tunnel; its next
+  heartbeat fails and drives a genuine re-registration.
+
+The hub is a **data-plane** component, deliberately distinct from the control-plane
+broker — the broker stays out of the data path (see Goals). The hub only copies
+**opaque bytes**; it never holds the Reality private key and cannot decrypt the
+end-to-end traffic, so the relay-as-untrusted-network trust boundary is
+preserved across the hub too.
+
+Because all CGNAT relay traffic transits the hub, the relay path is opt-in
+(public-IP/IPv6 volunteer-run relays stay direct and never touch the hub), and
+hubs should run where bandwidth is cheap rather than on metered cloud egress (see
+`deploy/relayhub/README.md`). To keep the hub out of the hot path when possible,
+CGNAT relays also support **direct NAT hole punching** (below); the hub tunnel
+remains as the always-available fallback. Per-relay/per-hub bandwidth caps are
+still future work.
+
+### Direct NAT Hole Punching (client ↔ CGNAT volunteer-run relay)
+
+When both the client and a CGNAT volunteer-run relay are behind NAT, they can
+still reach each other **directly** by punching a UDP hole, taking the hub out
+of the data path. The hub coordinates but never carries the bytes.
+
+- **Rendezvous + reflector = the hub.** The hub already holds the only live,
+  authenticated control connection to each CGNAT relay (the yamux tunnel), so
+  it is the one component that can push a punch request to the relay. It also
+  runs a small UDP **reflector** (STUN-like) so each peer learns its
+  server-reflexive `ip:port`. The broker is untouched; it only gains an additive
+  `punch_capable` descriptor flag so clients know to try.
+- **Discovery + NAT classification.** Each peer probes the reflector from the same
+  UDP socket it will punch and carry QUIC on. Binding the reflector on **two
+  distinct public IPs** lets the hub classify the peer's NAT mapping: a stable
+  reflexive port across both IPs is endpoint-independent (punchable); a differing
+  port is symmetric (skipped). With a single reflector IP the class degrades to
+  "unknown" and the client attempts anyway, then falls back.
+- **Signalling.** The client asks the hub over a dedicated HTTP endpoint
+  (`POST /api/v1/punch/request`, on the hub's own listener, not the broker and not
+  Cloudflare-fronted, so it is separately rate-limited). The hub relays a
+  `PunchDirective` to the relay over the yamux control connection, using a
+  one-byte stream-type discriminator that is only emitted when both ends negotiate
+  it in the HELLO/HELLO_ACK handshake — so the tunnel control-protocol version is
+  unchanged and older relay runtimes/hubs keep working.
+- **Transport.** After a token-authenticated simultaneous-open UDP punch, the two
+  peers run **QUIC** (quic-go) over the punched socket: it gives the reliable,
+  ordered, multiplexed byte stream that VLESS/Reality-over-TCP needs. The client
+  exposes a loopback TCP bridge that sing-box dials in place of the relay; the
+  relay bridges each QUIC stream to its loopback Xray. Reality still terminates
+  only at client and relay — the QUIC layer carries opaque bytes,
+  so the E2E trust boundary is preserved (QUIC's TLS is a transport/pinning layer,
+  not a new decryption point).
+- **Authentication.** The hub issues a per-session HMAC token (delivered over the
+  authenticated HTTP and control channels); the UDP probes and the first QUIC
+  stream carry it, verified in constant time. The QUIC certificate is pinned by a
+  fingerprint the relay reports through the hub.
+- **Fallback is invisible and fail-closed.** If the relay is not punch-capable,
+  both NATs are symmetric, the relay id is stale, or any step times out within the
+  budget, the client silently uses today's path (sing-box dials the hub's public
+  TCP port). QUIC's bidirectional handshake means a half-open hole can never
+  false-succeed.
+
+Honest scope: this reliably serves endpoint-independent-mapping (home-broadband /
+full-cone) volunteer-run relays; **double-symmetric CGNAT is deliberately not
+solved** and stays on the hub relay. The shared protocol core (wire format,
+discovery, punch mechanics, reflector, policies) lives in the nested
+`punchcore/` Go module
+(`github.com/openrung/openrung/punchcore`) — the single source of truth with no
+hand-mirrored copies. The servers and the desktop client consume it in-repo via
+`internal/punch` (the quic-go session/transport/bridge layer). The Android and
+iOS native bindings in `openrung-mobile-app` consume the same punchcore module
+at a pinned, tagged version. Both mobile platforms try the direct punched path
+for an eligible signed descriptor and retain the Relay Hub as the same-relay
+fallback when punching is unavailable, fails, or becomes unstable.
+
+#### punchcore pin/upgrade procedure (wire changes)
+
+1. Edit `punchcore/` in an openrung PR — the hub, relay runtimes, and desktop
+   clients consume it via the in-repo `replace`, so servers and desktop stay
+   atomically consistent.
+2. Bump `punchcore/VERSION` in the same PR — the `go-checks` workflow fails
+   any PR that changes `punchcore/` without a fresh, untagged version.
+3. Merge. The `punchcore-tag.yml` workflow tags `punchcore/v$(VERSION)` on the
+   merge commit automatically (the nested-module tag makes it fetchable
+   through the Go proxy); no manual tagging.
+4. Dependabot in the mobile repo (scoped to punchcore) opens the
+   `android/punchbridge/go.mod` (+`go.sum`) bump PR when it sees the new tag,
+   which automatically busts the Android AAR and iOS XCFramework CI caches
+   (their hash keys include go.mod/go.sum). Manual fallback: `go get` the new
+   version directly.
+5. Rebuild the AAR via `android/build-libbox-release.sh` and the XCFramework via
+   `ios/build-libbox-release.sh`, run both platform VPN suites, and ship the
+   corresponding app releases.
+
+Local cross-repo development uses
+`PUNCHCORE_SRC=/path/to/openrung/punchcore` with either mobile platform's
+`build-libbox-release.sh` and/or an uncommitted `go.work` — never in releases
+(GPL §6 pins the module version).
+
+```mermaid
+sequenceDiagram
+    participant C as Client (behind NAT)
+    participant H as Relay Hub (reflector + coordinator)
+    participant V as CGNAT volunteer-run relay
+
+    C->>H: STUN to reflector (2 IPs) → learn reflexive ip:port
+    C->>H: POST /punch/request (relay_id, candidates)
+    H->>V: PunchDirective over yamux control stream
+    V->>H: STUN to reflector → PunchAck (reflexive, cert fp)
+    H-->>C: PunchResponse (relay candidates, token, cert fp)
+    par simultaneous open
+        C->>V: token-authed UDP probes
+        V->>C: token-authed UDP probes
+    end
+    C->>V: QUIC over punched socket (VLESS/Reality inside)
+    V->>V: Reality terminates at relay → Xray exits
+    Note over C,V: hub carries no data, falls back to hub relay on failure
+```
+
+```mermaid
+sequenceDiagram
+    participant V as CGNAT volunteer-run relay
+    participant H as Relay Hub
+    participant B as Broker
+    participant C as Mobile Client
+
+    V->>V: Start Xray VLESS Reality on loopback
+    V->>H: Dial outbound (TLS) + authenticate + announce relay metadata
+    H->>B: Register relay (public_host=hub, public_port=P, transport=tunnel)
+    H-->>V: Allocated public endpoint, tunnel established
+    C->>B: Request relay candidates
+    B-->>C: Ranked descriptors incl. hub:P
+    C->>H: Connect using VLESS Reality Vision
+    H->>V: Forward opaque bytes over tunnel
+    V->>V: Xray exits to destination
+```
+
+### Relay-local WSS fallback (client ↔ Foundation relay)
+
+Eligible direct-mode Foundation relays can expose a CDN-fronted WebSocket
+fallback when a client network blocks the relay's raw IP. This is not the Relay
+Hub and does not introduce a gateway fleet: every advertised front has that
+same relay as its CDN origin, and the relay-local sidecar can dial only its
+fixed loopback Reality listener. Every WSS-capable client tries direct Reality
+first, and Reality still authenticates and encrypts the complete inner
+connection end to end. See [`wss-fallback.md`](wss-fallback.md) for the full
+protocol, failure-classification, and rollout contract.
+
+The nested `wsscore/` Go module
+(`github.com/openrung/openrung/wsscore`) is the single reusable implementation
+of the WSS data-plane mechanics. The desktop client, Android and iOS native
+bindings, and relay-local sidecar consume it. It owns the protocol constants,
+strict advertised-front URL validation, binary-only WebSocket byte-stream
+adapter, shared bounded yamux configuration, opaque bidirectional copying,
+lifecycle limits, Android's `VpnService.protect` socket-control hook, and the
+Apple constructor for PacketTunnel-owned sockets.
+
+The module deliberately does not own system policy or authority. Broker ticket
+issuance, relay-local ticket verification and replay persistence, CDN origin
+authentication, per-source admission policy, relay capability signing,
+CloudFront/deployment configuration, platform direct-first and health/telemetry
+orchestration, and every platform UI remain in their surrounding packages and
+applications. A ticket is only an opaque bearer value to the shared transport;
+`wsscore` never selects a relay or destination.
+
+#### wsscore pin/upgrade procedure
+
+1. Edit `wsscore/` in an openrung PR. The root and desktop Go modules consume
+   the in-tree source through local `replace` directives, keeping the desktop
+   client and relay sidecar on one implementation in this repository.
+2. Bump `wsscore/VERSION` in the same PR. Except for a `README.md`-only edit,
+   the Go checks reject a module change without a fresh, previously untagged
+   semantic version.
+3. Merge. The tag workflow creates `wsscore/v$(VERSION)` on the merge commit,
+   making that nested-module version fetchable without copying its code into a
+   consumer repository. Golden and live interoperability tests guard its public
+   protocol and transport behavior.
+4. External clients explicitly update their pinned module version, verify their
+   platform socket-routing and fallback-policy integration, run their own tests,
+   and publish their own application release. Updating or tagging `wsscore`
+   does not release a mobile app.
+
+Local cross-repository development may use an uncommitted `go.work` or local
+module replacement. Released consumers pin a `wsscore/vX.Y.Z` tag.
+
+### Shared Broker Client
+
+The nested `brokerapi/` Go module
+(`github.com/openrung/openrung/brokerapi`) is the client-side source of truth
+for end-user connection and session broker exchanges implemented by the
+module. The desktop CLI and GUI consume the in-tree module, and the mobile
+repository exposes the same implementation through its Android and iOS
+gomobile bindings instead of maintaining parallel request code. The broker
+server and its authorization policy remain in
+`internal/broker`; extracting the client does not move the broker or add it to
+the relay data path.
+
+`brokerapi` owns the end-user relay-directory HTTP exchange and returns its exact
+verified JSON bytes for platform-owned decoding. It also owns raw-body
+relay-list signature verification and pinned keys, WSS-ticket requests, broker
+URL and redirect hardening, identity and no-store request headers, telemetry
+posting, and the shared HTTP transport. Cleartext broker URLs remain valid only
+for loopback development endpoints. Certificate validation, signed-directory
+verification, and redirect refusal are not caller-selectable compatibility
+options.
+
+`brokerapi/relay_schema.go` additionally exports the client-facing relay
+schema — the decoded descriptor and list-response models, the shared wire
+constants (protocol, transport, channel, node class), and the read-side
+`EffectiveNodeClass` rule — so every fetchable client decodes the verified
+bytes into one Go model instead of a root-internal one. The broker's
+server-side relay model (registration requests, identity and WSS-capability
+proofs, and the never-serialized lease/exit fields) stays in the root module's
+`internal/relay`, which aliases the shared constants; the cross-repo
+`relay_decode` contract vectors pin that both models keep decoding the same
+directory bytes the same way.
+
+Connections to the exact Cloudflare broker front opportunistically use
+Encrypted Client Hello. The initial ECH configuration is compiled into the
+module rather than fetched through DNS; an authenticated server retry
+configuration can refresh it after a successful retry. ECH failure is never a
+hard failure: the attempt is tightly bounded and starts a fresh ordinary-TLS
+connection so networks that drop Cloudflare ECH retain the existing behavior.
+CloudFront and custom broker URLs do not receive ECH. CloudFront keeps exact
+hostname verification on its suppressed-SNI path, custom URLs keep ordinary
+hostname verification, and Azure's deliberately weaker exception is isolated
+below.
+
+CloudFront cannot serve this deployment's ECH config, so connections to a
+native `*.cloudfront.net` distribution omit the ClientHello server name and let
+the encrypted HTTP `Host` header select the distribution, exactly as the WSS
+data path already does. Certificate verification is unchanged in strength —
+chain, validity, server authentication, and the exact distribution hostname,
+against the transport's own roots and clock — only its input moves from the
+TLS server name to the dialed host. A suppressed server name is never combined
+with an ECH config, and there is no plain-SNI fallback: retrying with the name
+would hand a censor what the omission hides, so the front fails closed and
+front racing covers reachability. The one certificate check that cannot move
+out of crypto/tls is FIPS chain filtering, so in FIPS 140-3 mode this front is
+refused instead of dialed. Custom broker URLs remain fully standard, and DNS
+resolution of the distribution name still exposes it.
+
+Azure Front Door endpoints (`*.azurefd.net`) first use normal SNI and standard
+TLS verification of the exact endpoint hostname. Their separate last-resort
+retry suppresses SNI, uses no ECH, and refuses FIPS mode. That retry cannot make
+the same certificate promise. Without a server name the Azure edge serves a shared default
+certificate whose only SAN is `*.azureedge.net`; that does not cover the
+`*.azurefd.net` endpoint being dialed, and no configuration changes it — a
+custom domain still receives the shared certificate on this path, and the
+`*.azureedge.net` name that would match belongs to a retiring product. The
+client therefore pins that SAN instead of the endpoint hostname. An impersonator
+must present a publicly-trusted certificate for a name under `azureedge.net`,
+so the connection proves *an Azure edge*, not *our endpoint*.
+
+That is a real reduction against the other two fronts, and it is acceptable for
+relay discovery only because TLS is not where the directory's authenticity
+rests. The relay list is
+Ed25519-signed by the origin and verified against keys pinned in the module, and
+the signed envelope binds the channel, the echoed limit, and a `not_after`
+freshness bound — so a front that is not ours can neither forge a list nor replay
+an expired one. That protection does not extend to every broker exchange: an
+impersonator still obtains client identity headers and telemetry payloads, and a
+WSS session ticket is a short-lived bearer whose confidentiality depends on
+exact endpoint authentication. Ticket requests therefore exclude Azure even
+when Azure served the directory.
+
+Discovery races three endpoint-bound attempts in order: CloudFront without
+SNI, Azure with normal SNI, then the Cloudflare Worker (`broker.openrung.org`).
+Each starts on its stagger tick unless an earlier success cancels the race.
+Azure's normal-SNI attempt therefore can start while CloudFront is still
+pending, and authenticates the exact Azure endpoint. A fast CloudFront success
+avoids sending Azure's SNI; a later winner cannot undo a ClientHello already sent.
+
+Only Azure's no-SNI retry belongs to the separate endpoint-unbound phase. It
+starts after every first-phase attempt fails, and uses a separate connection
+pool so a normal-SNI request cannot reuse a shared-edge-only connection. An
+active censor can still force this fallback by making the stronger attempts
+fail, but a merely slow response cannot trigger the authentication downgrade.
+
+Phasing adds latency before the no-SNI retry. With three blackholed first-phase
+attempts and a full relay-list timeout for each, that retry starts after roughly
+one timeout plus two staggers. Azure with normal SNI has already been attempted
+on the first stagger tick. This delay preserves the requirement that every
+endpoint-bound attempt fail before a weaker connection can win.
+
+Because the SNI-less behaviour is undocumented, carries no SLA, and is a
+property of the edge fleet an endpoint lands on rather than of Front Door as a
+product, an endpoint must pass `cmd/frontcheck` before it is advertised. The
+recognizers match name *shapes* rather than this deployment's own endpoints, so
+rotating a front cannot silently enable SNI on its no-SNI retry; adding an endpoint
+to the built-in order is a separate, deliberate step.
+
+Relay registration/heartbeat clients and the relay data path remain outside
+`brokerapi`.
+
+#### brokerapi pin/upgrade procedure
+
+1. Change `brokerapi/` in an OpenRung pull request. Root and desktop consumers
+   use local `replace` directives so their tests exercise the same source.
+2. Bump `brokerapi/VERSION` in the same pull request. Except for a
+   `README.md`-only edit, CI rejects a module change without a fresh semantic
+   version.
+3. Merge. The tag workflow creates `brokerapi/v$(VERSION)` on the merge commit,
+   making that nested module fetchable without copying its implementation.
+4. Mobile repositories explicitly update the pinned tag, rebuild their native
+   binding, run platform VPN tests, and publish their own application release.
+   A module tag alone does not update a mobile binary.
+
+### Client Policy Engine
+
+The nested `connectcore/` Go module
+(`github.com/openrung/openrung/connectcore`) is the UI-agnostic client policy
+engine (ADR-001, promoted out of root `internal/` by D3 so mobile can fetch
+it). The terminal client and the desktop app drive the in-tree module through
+local `replace` directives; the mobile repository pins released tags. The
+module root owns the connection engine — the connect state machine, candidate
+ladder and client-side latency ranking, relay-local WSS front fallback, the
+punch-attempt policy, mid-session health monitoring and automatic failover,
+the directory cache, and the internet/readiness probes — with the state
+machine mirroring the mobile native bridge contract, so every client that
+drives it behaves like the mobile reference implementation.
+
+Its subpackages carry the rest of the client policy layer: `client` (the
+sing-box config builder for both capture modes, mobile's DNS shape and the
+split-tunnel rules, the sing-box process runner, relay usability and selection, and thin
+broker-client adapters), `clienttelemetry` (the closed failure-reason
+classifier and the telemetry event model, outbox, and session manager),
+`discovery` (staggered multi-front directory fetching over `brokerapi`,
+decoded into the exported relay schema), `proxyconfig` (the stable local
+proxy endpoint and shell integration), and `contract` (the embedded cross-repo
+contract vectors and their Go loaders — the JSON files under
+`connectcore/contract/vectors/` are what the mobile repository vendors).
+
+The module deliberately does not own platform authority or heavyweight
+transports. Everything platform-specific reaches the engine through narrow
+interfaces: event sink, persistence, OS proxy control, elevation, and the NAT
+punch transport (`PunchEstablisher`), implemented in the root module's
+`internal/enginepunch` over `internal/punch`'s quic-go transport and wired in
+by each host. Relay wire
+types come from `brokerapi`'s exported relay schema and WSS transport
+mechanics from `wsscore`, both pinned by version in the module's `go.mod` for
+external consumers while in-repo builds resolve them through local `replace`
+directives.
+
+#### connectcore pin/upgrade procedure
+
+1. Change `connectcore/` in an OpenRung pull request. The root module and the
+   desktop app consume the in-tree source through local `replace` directives,
+   so the terminal client, desktop app, and this module's own tests all
+   exercise the same source.
+2. Bump `connectcore/VERSION` in the same pull request. Except for a
+   `README.md`-only edit, CI rejects a module change without a fresh semantic
+   version, and builds the module standalone (`go build ./...` inside it) —
+   the build a fetching consumer sees.
+3. Keep `connectcore/go.mod`'s sibling `require` lines equal to the
+   `brokerapi`, `wsscore`, and `punchcore` VERSION files — CI enforces the
+   equality on every pull request. External consumers resolve the siblings
+   through those requirements, not the local replaces, and in-repo builds only
+   ever test in-tree sibling source, so the pins must track the versions being
+   tested: a sibling VERSION bump therefore also updates connectcore's
+   `require` (and, being a module change, `connectcore/VERSION`) in the same
+   pull request.
+4. Merge. The tag workflow creates `connectcore/v$(VERSION)` on the merge
+   commit, making the module fetchable at that version. Sibling tags publish
+   from independent workflows on that same commit; if one fails while another
+   succeeds, the module is unfetchable (its require names an untagged sibling
+   version) until the failed job is re-run — the tag jobs are idempotent, so
+   re-running the failed workflow on the merge commit is the whole recovery.
+   Editing a contract vector file additionally requires its own version bump
+   and re-vendoring in the mobile repository (see
+   `connectcore/contract/README.md`).
+5. Mobile repositories explicitly update the pinned tag, rebuild their native
+   bindings, run platform VPN tests, and publish their own application
+   release. A module tag alone does not update a mobile binary.
+
+### Mobile Client
+
+The mobile client is an iOS/Android app using VPN mode. It asks the broker for
+relay candidates, configures a compatible VLESS Reality client, and routes
+device traffic through the selected relay.
+
+Android and iOS are maintained outside this repository, with their own native
+VPN integration, tests, version pins, and release processes:
+
+- Android uses `VpnService` plus the embedded tunnel engine.
+- iOS uses a `NetworkExtension` packet tunnel provider.
+
+Both platforms implement NAT-punch-first access for eligible Relay Hub relays
+through their pinned `punchcore` binding, with the hub path as the same-relay
+fallback. They also implement direct-first WSS/CDN fallback for eligible
+Foundation relays through pinned `brokerapi` and `wsscore` bindings.
+
+Mobile broker requests consume a pinned `brokerapi` release through the
+platform's native binding. This removes the TypeScript TLS limitation and gives
+mobile the same opportunistic ECH, signature verification, identity headers,
+cache policy, and URL hardening as desktop. Publishing a new module tag does
+not by itself update either separately released app.
+
+Native mobile discovery delegates candidate construction and racing to
+`BrokerCandidates` and `FirstReachable`, so platform `AppConfig` must not
+duplicate the discovery URL list or its trust phases. Swift and Kotlin still
+own WSS-ticket ordering, deadlines, and retries, but every individual attempt
+calls `RequestWSSTicket`; rebuilding against `brokerapi/v0.4.0` therefore
+inherits the hard pre-HTTP refusal for endpoint-unbound fronts. The platform
+ticket-front builders should filter such a winning front too as defense in
+depth and to avoid a request that is guaranteed to fail locally.
+
+The mobile app's update-manifest checker remains a separate signed-content
+client with its own keys, freshness and rollback rules, and GitHub fallback.
+Its exact Cloudflare and CloudFront candidates run through the native
+`brokerapi` transport; signature verification and candidate selection remain in
+the application layer, and the exact redirecting GitHub release asset is the
+narrow JavaScript-fetch exception. Cloudflare's ordinary-TLS fallback still
+sends its hostname wherever ECH is blocked, while the native CloudFront front
+is unconditionally SNI-less.
+
+Android wires WSS socket protection to `VpnService.protect` before connect;
+iOS uses the Apple constructor for PacketTunnel-owned sockets. Swift and Kotlin
+own the corresponding direct-first classification, ticket ordering, lifecycle,
+recovery, and telemetry policy, while the pinned shared modules own their
+common transport and broker mechanics.
+
+### Future Dedicated Exit Mode
+
+In a later phase, volunteer operators should be able to choose one of two modes:
+
+- Direct exit mode: the volunteer-run relay connects directly to destination
+  websites.
+- Entry relay mode: the volunteer-run relay accepts client traffic and routes
+  it to a dedicated exit server.
+
+Entry relay mode protects volunteers from being the destination-visible exit IP. The broker descriptor should therefore keep `exit_mode` as an explicit field from the start.
+
+## Current Data Flow
+
+```mermaid
+sequenceDiagram
+    participant V as Relay CLI
+    participant B as Broker
+    participant C as Mobile Client
+    participant W as Public Website/App
+
+    V->>V: Start Xray VLESS Reality listener
+    V->>B: Register relay descriptor
+    loop Every heartbeat interval
+        V->>B: Heartbeat
+    end
+    C->>B: Request relay candidates
+    B-->>C: Ranked short-lived VLESS Reality descriptors
+    C->>V: Connect using VLESS Reality Vision
+    V->>W: Direct exit traffic
+    W-->>V: Response
+    V-->>C: Proxied response
+```
+
+## Trust Boundaries
+
+Relays are not inherently trusted. The client should treat each relay operator
+as a network provider. A broker-attested `node_class` identifies operator
+provenance; it does not relax any transport, signature, or destination-security
+requirement:
+
+- Use HTTPS/TLS to destination sites whenever possible.
+- Avoid sending broker credentials to relay operators.
+- Rotate relay credentials frequently.
+- Prefer short-lived relay descriptors.
+
+The broker should treat relay registrations as untrusted input:
+
+- Require authentication for relay operators outside local development.
+- Validate ports, hostnames, protocol fields, and advertised capabilities.
+- Expire inactive relays aggressively.
+- Relay identity continuity (spec `openrung-relay-identity-v1`, see the API
+  doc) is proven, never asserted: the relay ID is derived from an Ed25519 key
+  the registrant demonstrates possession of, so identity-bound history (labels,
+  ranking, dashboard attribution) cannot be claimed from the public relay list.
+  The identity carries no authority beyond ID continuity — classes and
+  endpoint protections are enforced exactly as for anonymous registrations.
+
+Direct-mode relays rotate their VLESS credential hourly (see the Relay CLI
+section), so a copied directory entry stops admitting within two hours of the
+last broker-confirmed rotation. The
+credential is still shared by every client of a relay; per-client credentials
+that could be revoked individually remain future work, to be built if abuse
+persists across rotations.
+
+## Open Design Decisions
+
+- Public reachability probing: the broker should eventually verify the
+  advertised endpoint from outside the relay operator's network, especially for
+  IPv6 hosts where residential firewalls may block inbound connections even
+  without CGNAT.
+- Relay selection: global score is implemented; later add country/ASN-specific scoring and reputation.
+- Abuse controls: add per-relay limits, destination policy, reporting, and blocklists before public rollout.
+- Mobile engine: choose whether to embed a maintained Xray-compatible engine or call into a separate core.

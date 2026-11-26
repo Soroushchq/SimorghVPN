@@ -1,0 +1,7 @@
+flutter/ephemeral
+
+
+# Remove Core
+runner/libdxcore_amd64.so
+runner/dxcore_linux_amd64.h
+runner/LINUX_KEY.txt

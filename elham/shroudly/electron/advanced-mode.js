@@ -1,0 +1,892 @@
+'use strict';
+
+/*
+ * AdvancedMode — the optional packet-layer backend for STATEFUL DPI (Iran/China).
+ *
+ * The default engine (userspace proxy, split/disorder) defeats stateless DPI and
+ * needs no privileges. When a probe reports a site stays blocked ("suggest":
+ * "advanced"), the UI offers this mode. It is privileged and platform-specific:
+ *
+ *   Windows x64: WinDivert driver, bundled next to shroudly-core-adv.exe.
+ *                Started through a UAC prompt, once: after that through a
+ *                task that keeps the permission (advanced-task.js), with
+ *                the prompt again only when an update changed the engine.
+ *   Linux      : NFQUEUE (over netlink: no library needed) + raw sockets. Started
+ *                through pkexec; the engine installs and removes its own
+ *                iptables/nftables rule.
+ *   macOS      : not possible — pf has no divert-to rule and the kernel no
+ *                divert sockets; it would need a signed Network Extension.
+ *
+ * The elevated engine can't be piped or signalled by this unprivileged process,
+ * so it talks through files (see core/src/supervise.h): it writes JSON lines to
+ * a status file, exits when a ".stop" file appears, and also exits by itself
+ * when this process dies. Its packet hook is released whenever it exits.
+ *
+ * An antivirus is what most often stands in the way here (WinDivert is a
+ * packet driver, and many of them flag it): it removes Advanced mode's
+ * files, refuses to start the engine, refuses the driver, or ends the engine
+ * without a word. Each is told as what it is (codes 'files_missing' and
+ * 'security_blocked', with the details security-block.js and main.js use),
+ * not as "did not respond in time" after two minutes. On Windows the engine
+ * is no child of ours, so the launcher hands back its process id, and a
+ * check that the process is still there notices one ended from outside,
+ * while it starts (in about a second) and while it runs.
+ */
+
+const { spawn, execFile } = require('child_process');
+const { envFor } = require('./win-powershell');
+const SecurityBlock = require('./security-block');
+const AdvTask = require('./advanced-task');
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
+
+const QUEUE_NUM = 200;
+const READY_TIMEOUT_MS = 120000; // includes the time the user spends on the prompt
+const STOP_TIMEOUT_MS = 4000;
+// While it runs, whether its process is still there is looked at this often:
+// each look asks Windows for a handle to an elevated process (refused, which
+// is the answer), and a security program watching such requests should not
+// see one every second for hours.
+const ALIVE_CHECK_MS = 5000;
+// The permission prompt may stay on screen this long (nobody at the
+// computer when it starts); after that it counts as not answered.
+const PROMPT_TIMEOUT_MS = 180000;
+// Started by its task, the engine says its process id within a second;
+// waited for this long (a slow disk, an antivirus reading the file first)
+// before the prompt is used instead.
+const TASK_WAIT_MS = 10000;
+
+function archKey() { return process.arch === 'arm64' ? 'arm64' : process.arch === 'ia32' ? 'ia32' : process.arch === 'arm' ? 'armv7l' : 'x64'; }
+
+/* The 32-bit Shroudly on a 64-bit Intel/AMD Windows (WOW64 says so in
+ * PROCESSOR_ARCHITEW6432): the 64-bit one runs there and has Advanced mode,
+ * which this one cannot have (a TTNet report: Windows 11, the 32-bit build). */
+function wrongBuild({ platform = process.platform, arch = process.arch, env = process.env } = {}) {
+  return platform === 'win32' && arch === 'ia32' && String(env.PROCESSOR_ARCHITEW6432 || '').toUpperCase() === 'AMD64';
+}
+
+/* The machine's own processor, not this build's: the x64 build runs on
+ * Windows on ARM too (emulated), where process.arch says x64 but the WinDivert
+ * driver, a kernel driver, cannot load. Windows records the real one for the
+ * whole system. */
+let hostArmCache = null;
+function windowsHostIsArm() {
+  if (process.platform !== 'win32') return false;
+  if (process.arch === 'arm64') return true;
+  if (hostArmCache !== null) return hostArmCache;
+  hostArmCache = false;
+  try {
+    const out = require('child_process').execFileSync('reg', ['query',
+      'HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment', '/v', 'PROCESSOR_ARCHITECTURE'],
+    { encoding: 'utf8', windowsHide: true, timeout: 5000 });
+    hostArmCache = /PROCESSOR_ARCHITECTURE\s+REG_SZ\s+ARM64/i.test(out);
+  } catch {}
+  return hostArmCache;
+}
+
+function advBinaryPath() {
+  const plat = process.platform;
+  const name = plat === 'win32' ? 'shroudly-core-adv.exe' : 'shroudly-core-adv';
+  const rel = path.join('electron', 'tools', 'core', `${plat}-${archKey()}`, name);
+  const packaged = __dirname.includes('app.asar');
+  if (packaged) {
+    const res = process.resourcesPath || path.join(__dirname, '..', '..', '..');
+    return path.join(res, 'app.asar.unpacked', rel);
+  }
+  return path.join(__dirname, 'tools', 'core', `${process.platform}-${archKey()}`, name);
+}
+
+/* Where the status file (and an AppImage's copy of the engine) is kept: on
+ * Linux the user's own runtime folder (/run/user/<uid>, 0700), not /tmp,
+ * where a program asking for administrator permission looks like anything
+ * but Shroudly. /tmp when there is none that is this user's, or when it is
+ * mounted noexec (the copy could not run from it). */
+function workBase(platform = process.platform, env = process.env, mounts = null) {
+  const run = env.XDG_RUNTIME_DIR;
+  if (platform === 'linux' && run && path.isAbsolute(run)) {
+    try {
+      const st = fs.statSync(run);
+      if (st.isDirectory() && (typeof process.getuid !== 'function' || st.uid === process.getuid()) && !noexec(run, mounts)) return run;
+    } catch {}
+  }
+  return os.tmpdir();
+}
+
+/* Is the folder on a filesystem mounted noexec? From /proc/self/mounts (or
+ * the text given): the longest mount point it is under decides. */
+function noexec(dir, mounts = null) {
+  let text = mounts;
+  if (text == null) { try { text = fs.readFileSync('/proc/self/mounts', 'utf8'); } catch { return false; } }
+  let best = null;
+  for (const line of String(text).split('\n')) {
+    const f = line.split(' ');
+    if (f.length < 4) continue;
+    const mp = f[1].replace(/\\(\d{3})/g, (m, o) => String.fromCharCode(parseInt(o, 8)));
+    const under = mp === '/' || dir === mp || dir.startsWith(`${mp}/`);
+    if (under && (!best || mp.length >= best.mp.length)) best = { mp, opts: f[3].split(',') };
+  }
+  return !!(best && best.opts.includes('noexec'));
+}
+
+const REASONS = {
+  mac_unsupported: 'Advanced mode is not available on macOS: the system offers no packet-divert interface without a signed Network Extension. The default engine still works.',
+  wrong_build: 'This is the 32-bit Shroudly on a 64-bit Windows: Advanced mode needs the 64-bit one (Shroudly-<version>-Windows-x64-Setup.exe). Install it over this one; your settings stay.',
+  arch_unsupported: 'Advanced mode is not available on this processor (Windows: the WinDivert driver is 64-bit Intel/AMD only; Linux: 64-bit processors only).',
+  platform_unsupported: `Advanced mode is not available on ${process.platform}.`,
+  not_built: 'The advanced engine is not included in this build. Run: npm run build:core:advanced',
+  windivert_missing: 'WinDivert.dll / WinDivert64.sys are missing next to the advanced engine. Reinstall Shroudly.',
+  files_missing: "Advanced mode's files are missing or cannot be read; an antivirus may have removed them. Restore them from its quarantine, or install Shroudly again.",
+};
+
+/* info: for 'security_blocked' and 'files_missing', what main.js tells
+ * (security-block.js). */
+class AdvError extends Error {
+  constructor(code, message, info = null) { super(message); this.code = code; this.info = info; }
+}
+
+/* Is the process still there? Windows refuses an unelevated process a
+ * handle to an elevated one (EPERM): that one is there too. */
+function alive(pid) {
+  try { process.kill(pid, 0); return true; } catch (e) { return !!e && e.code === 'EPERM'; }
+}
+
+/*
+ * The packet-layer options, passed to the engine the same way the fake TTL is.
+ * Sensible defaults: the strictly-additive, always-safe protections are on
+ * (drop the forged RSTs a censor injects to tear a blocked connection down,
+ * set the decoy's TTL from the measured hop distance to the server, and cut
+ * the real first segment after the decoy, which every TCP receiver puts back
+ * together); the decoy itself stays the proven low-TTL/bad-checksum fake,
+ * with sequence overlap off. Each is a flag, so a future UI (or a probe
+ * result) can switch them per network.
+ */
+const ADV_DEFAULTS = { dropRst: true, autottl: true, seqovl: 0, desyncMode: 'fake', split: 'on', tlsrec: false };
+const DESYNC_MODES = ['fake', 'fakedsplit', 'fakeddisorder'];
+/* After the decoy the real first segment is cut so no part carries the whole
+ * name ('on'), or cut and sent last part first ('disorder'): what programs
+ * that ignore the proxy get instead of its techniques (core/src/tcpdpi.h). */
+const SPLIT_MODES = ['off', 'on', 'disorder'];
+
+function resolveAdvOpts(opts) {
+  const o = { ...ADV_DEFAULTS, ...(opts || {}) };
+  o.dropRst = !!o.dropRst;
+  o.autottl = !!o.autottl;
+  o.seqovl = Math.max(0, Math.floor(Number(o.seqovl) || 0));
+  o.desyncMode = DESYNC_MODES.includes(o.desyncMode) ? o.desyncMode : 'fake';
+  o.split = o.split === false ? 'off' : SPLIT_MODES.includes(o.split) ? o.split : 'on';
+  o.tlsrec = !!o.tlsrec;
+  return o;
+}
+
+/* The command line for the elevated engine. QUIC forced to TCP and decoys for
+ * Discord voice UDP are on by default in Advanced mode; their opt-out flags are
+ * passed only when a caller explicitly turns a feature off. The TCP options
+ * (opts) always go, resolved against ADV_DEFAULTS. Pure so it can be tested
+ * without elevating anything (tests/net/advanced.test.js). */
+function buildArgs(o) {
+  const t = resolveAdvOpts(o.opts);
+  const ttl = Number(o.ttl) > 0 ? Number(o.ttl) : 4;
+  const args = ['--advanced', '--fake-ttl', String(ttl),
+    '--status-file', String(o.statusFile), '--parent-pid', String(o.parentPid),
+    '--drop-rst', t.dropRst ? '1' : '0',
+    '--autottl', t.autottl ? '1' : '0',
+    '--seqovl', String(t.seqovl),
+    '--split', t.split,
+    '--desync-mode', t.desyncMode];
+  // Split the ClientHello's TLS record for a network that reassembles the
+  // stream before it inspects (#48, Superonline and the like). On by default
+  // in Advanced mode — it is the technique that actually gets through such
+  // networks, and the stronger one (it also does what the TCP cut does). It
+  // costs a little more (every 443 packet of a connection passes through, to
+  // keep its sequence numbers in step); a user can turn it off with
+  // advancedTlsRec:false.
+  if (t.tlsrec) args.push('--tlsrec', '1');
+  // Windows: another program uses the WinDivert driver too (rivals.js), so
+  // the engine leaves it loaded at stop instead of unloading it (#56).
+  if (o.platform === 'win32' && o.opts && o.opts.keepDriver) args.push('--keep-driver', '1');
+  if (o.platform === 'linux') args.push('--queue', String(o.queueNum != null ? o.queueNum : QUEUE_NUM));
+  if (o.quicBlock === false) args.push('--no-quic-block');
+  if (o.udpFake === false) args.push('--no-udp-fake');
+  if (Number(o.fakeRepeats) > 0) args.push('--fake-repeats', String(Math.floor(Number(o.fakeRepeats))));
+  // Other programs' DNS answered from the app's encrypted-DNS forwarder
+  // (core/src/dnsgate.h), when there is one.
+  const gate = Math.floor(Number(o.dnsGate));
+  if (gate > 0 && gate < 65536) args.push('--dns-gate', String(gate));
+  // The names the decoys carry: large sites of the user's country, which a
+  // network that lets only allowed sites through keeps open (national-net.js).
+  // Host names only, at most eight (the engine leaves out any other).
+  for (const n of (Array.isArray(o.decoyNames) ? o.decoyNames : []).slice(0, 8)) {
+    if (/^[a-z0-9.-]{4,253}$/i.test(String(n))) args.push('--decoy-name', String(n));
+  }
+  return args;
+}
+
+/* One argument as Windows reads it back (CommandLineToArgvW, the C runtime):
+ * left alone when it has no space, tab or quote; otherwise quoted, with the
+ * backslashes before a quote doubled and the quote escaped, and backslashes
+ * at the end doubled so they do not escape the closing quote. The engine is
+ * started elevated from these, so they must arrive exactly as given. */
+function winQuoteArg(a) {
+  const s = String(a);
+  if (s && !/[\s"]/.test(s)) return s;
+  let out = '"';
+  let bs = 0;
+  for (const ch of s) {
+    if (ch === '\\') { bs++; continue; }
+    if (ch === '"') { out += `${'\\'.repeat(bs * 2 + 1)}"`; bs = 0; continue; }
+    out += '\\'.repeat(bs) + ch;
+    bs = 0;
+  }
+  return `${out}${'\\'.repeat(bs * 2)}"`;
+}
+
+/* Windows: PowerShell's arguments that start the engine elevated (a UAC
+ * prompt). Start-Process passes a single ArgumentList string through
+ * verbatim, so each argument is quoted here. -PassThru gives the elevated
+ * engine's process id, written out for the checks that it is still there
+ * (on its own, so that a process id that cannot be read never fails an
+ * engine that did start). Exit 2: 1223 = ERROR_CANCELLED (UAC declined).
+ * Exit 3: Windows or an antivirus refused to start it (5 = access denied,
+ * 225/226 = "contains a virus"). Exit 4: its file is not there (2, 3). The
+ * script stays encoded (-EncodedCommand): a user folder with letters outside
+ * the console's code page (C:\Users\Ümit) would not survive any other way
+ * in. */
+function launcherArgs(bin, args) {
+  const argLine = args.map(winQuoteArg).join(' ');
+  const q = (s) => `'${String(s).replace(/'/g, "''")}'`;
+  // $ProgressPreference: PowerShell writes its "preparing modules" progress
+  // to the error stream as CLIXML when nobody reads it live, which then was
+  // all a failure said ("Advanced mode failed: #< CLIXML").
+  const script =
+    "$ProgressPreference = 'SilentlyContinue'; " +
+    `try { $p = Start-Process -FilePath ${q(bin)} -ArgumentList ${q(argLine)} -Verb RunAs -WindowStyle Hidden -PassThru -ErrorAction Stop } ` +
+    'catch { $e = $_.Exception; while ($e) { $c = $e.NativeErrorCode; if ($c -eq 1223) { exit 2 }; ' +
+    'if ($c -eq 5 -or $c -eq 225 -or $c -eq 226) { exit 3 }; if ($c -eq 2 -or $c -eq 3) { exit 4 }; $e = $e.InnerException }; ' +
+    '[Console]::Error.WriteLine($_.Exception.Message); exit 1 }; ' +
+    'try { if ($p) { [Console]::Out.WriteLine($p.Id) } } catch {}';
+  const encoded = Buffer.from(script, 'utf16le').toString('base64');
+  return ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded];
+}
+
+/* PowerShell's error stream without its CLIXML records (progress, mostly):
+ * they are no message for a person. */
+function plainErr(s) {
+  return String(s || '').replace(/#< CLIXML[\s\S]*?(<\/Objs>|$)/g, '').trim();
+}
+
+/* A program that could not be started at all (ENOENT...) or ran out of
+ * time says so in stderr: "PowerShell exited with -1" alone told nobody why.
+ * timedOut: it was ended for taking longer than `timeout`. */
+function run(cmd, args, timeout) {
+  return new Promise((resolve) => {
+    execFile(cmd, args, { timeout, windowsHide: true, env: envFor(cmd) }, (err, stdout, stderr) => {
+      if (!err) { resolve({ code: 0, stdout: String(stdout || ''), stderr: plainErr(stderr) }); return; }
+      if (typeof err.code === 'number') { resolve({ code: err.code, stdout: String(stdout || ''), stderr: plainErr(stderr) }); return; }
+      const why = err.killed ? `${path.basename(cmd)} did not finish in time` : `${path.basename(cmd)} could not be started (${err.code || err.message})`;
+      resolve({ code: -1, stdout: '', stderr: plainErr(stderr) || why, timedOut: !!err.killed });
+    });
+  });
+}
+
+class AdvancedMode {
+  constructor(log) {
+    this.log = log || (() => {});
+    this.platform = process.platform;
+    // Windows' version (os.release()): error 577 means another thing on 7.
+    this.osRelease = require('os').release();
+    this.active = false;
+    this.dir = null;
+    this.statusFile = null;
+    this.child = null;      // pkexec / direct child on Linux; none on Windows
+    this.childExit = null;  // exit code of that child, once it has exited
+    this.pid = null;        // Windows: the elevated engine's process, from the launcher (or said by the engine: its task)
+    // The files the engine is controlled by are named after this (.stop,
+    // .standby, .escalate): the status file, or, for an engine started by
+    // its task, a name in the user's own folder (advanced-task.js).
+    this.ctl = null;
+    this.viaTask = false;   // Windows: this engine was started by its task, without a prompt
+    this.taskWaitMs = TASK_WAIT_MS;
+    this.runTool = run;     // the tests bring their own
+    this.env = process.env;
+    this.bundledDir = () => path.dirname(advBinaryPath());
+    this.alive = alive;     // the tests bring their own
+    this.aliveCheckMs = ALIVE_CHECK_MS;
+    this.monitor = null;
+    // Standby: the engine runs, elevated, with its packet hook let go (pause,
+    // resume); active is false meanwhile.
+    this.standby = false;
+    this.standbyWaitMs = 10000;
+    // An installed Shroudly: Advanced mode's files are always part of it
+    // where it has Advanced mode (release.yml builds them for Windows x64
+    // and Linux), so one gone was taken, most likely by an antivirus.
+    this.packaged = __dirname.includes('app.asar');
+    // A block found while it runs (main.js securityBlocked).
+    this.onSecurityBlock = null;
+  }
+
+  /* Advanced mode's own files here: the engine, and WinDivert's on Windows. */
+  _files() {
+    const bin = advBinaryPath();
+    if (this.platform !== 'win32') return [bin];
+    const dir = path.dirname(bin);
+    return [bin, path.join(dir, 'WinDivert.dll'), path.join(dir, 'WinDivert64.sys')];
+  }
+
+  /* The first of them that is gone (SecurityBlock.fileState): { file, state }, or null. */
+  _badFile() {
+    for (const file of this._files()) {
+      const state = SecurityBlock.fileState(file, { platform: this.platform });
+      if (SecurityBlock.isGone(state)) return { file, state };
+    }
+    return null;
+  }
+
+  /* What main.js tells about a block of Advanced mode (security-block.js). */
+  _info(kind, { file = null, certain = true, detail = null, win32 = null } = {}) {
+    const folder = this.packaged ? SecurityBlock.installFolder({ platform: this.platform }) : path.dirname(advBinaryPath());
+    return { part: 'advanced', kind, certain, file: file || path.basename(advBinaryPath()), folder, detail, win32 };
+  }
+
+  _blockError(code, kind, opts = {}) {
+    const info = this._info(kind, opts);
+    const message = code === 'files_missing' ? REASONS.files_missing : SecurityBlock.logLine(info).replace(/^Security software: /, 'Blocked by security software: ');
+    return new AdvError(code, message, info);
+  }
+
+  reasonCode() {
+    if (this.platform === 'darwin') return 'mac_unsupported';
+    if (this.platform !== 'win32' && this.platform !== 'linux') return 'platform_unsupported';
+    if (this.platform === 'win32' && wrongBuild()) return 'wrong_build';
+    if (this.platform === 'win32' && (archKey() !== 'x64' || windowsHostIsArm())) return 'arch_unsupported';
+    // Linux: its packet engine is built for 64-bit processors (x64, ARM64).
+    if (this.platform === 'linux' && archKey() !== 'x64' && archKey() !== 'arm64') return 'arch_unsupported';
+    if (this.packaged) return this._badFile() ? 'files_missing' : null;
+    if (!fs.existsSync(advBinaryPath())) return 'not_built';
+    if (this.platform === 'win32') {
+      const dir = path.dirname(advBinaryPath());
+      if (!fs.existsSync(path.join(dir, 'WinDivert.dll')) || !fs.existsSync(path.join(dir, 'WinDivert64.sys'))) {
+        return 'windivert_missing';
+      }
+    }
+    return null;
+  }
+
+  reason() {
+    const code = this.reasonCode();
+    return code ? REASONS[code] : null;
+  }
+
+  available() { return this.reasonCode() === null; }
+
+  _readStatus() {
+    let text = '';
+    try { text = fs.readFileSync(this.statusFile, 'utf8'); } catch { return { ready: null, stopped: false, errors: [] }; }
+    let ready = null;
+    let stopped = false;
+    const errors = [];
+    // The last error that carries Windows' own code (core/src/raw_windows.c):
+    // what SecurityBlock.classifyWinDivert reads.
+    let fault = null;
+    // A "WinDivert" service another program left behind (raw_windows.c
+    // repair_stale_service): 1 removed, 0 none to remove, null not looked at.
+    let stale = null;
+    // The driver started from its copy in Common Files\Shroudly (use_system_copy):
+    // 1 it did, 0 it could not, null not tried.
+    let copy = null;
+    // Standby (supervise.h): how many times the hook was let go, taken again,
+    // or could not be taken again.
+    let paused = 0, resumed = 0, resumeFailed = 0;
+    for (const raw of text.split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line) continue;
+      try {
+        const m = JSON.parse(line);
+        if (m.type === 'raw_ready') ready = m;
+        else if (m.type === 'raw_paused') paused++;
+        else if (m.type === 'raw_resumed') resumed++;
+        else if (m.type === 'raw_resume_failed') resumeFailed++;
+        else if (m.type === 'stopped') stopped = true;
+        else if (m.type === 'driver' && m.stale != null) stale = Math.max(stale || 0, Number(m.stale) === 1 ? 1 : 0);
+        else if (m.type === 'driver' && m.copy != null) copy = Number(m.copy) === 1 ? 1 : 0;
+        else if (m.type === 'error') {
+          if (m.msg) errors.push(m.msg);
+          if (m.code && Number.isFinite(Number(m.win32))) fault = { code: String(m.code), win32: Number(m.win32) };
+        }
+      } catch { errors.push(line); }
+    }
+    return { ready, stopped, errors, fault, stale, copy, paused, resumed, resumeFailed };
+  }
+
+  /* The engine ended before it was ready: why, as an AdvError. A WinDivert
+   * error with Windows' code says whether a file is missing or Windows or
+   * an antivirus refused the driver; anything else is 'start_failed' with
+   * the engine's own last lines. */
+  _failure(s, fallback) {
+    const said = (s.errors || []).slice(-3).join(' | ');
+    const c = SecurityBlock.classifyWinDivert(s.fault, { release: this.osRelease });
+    // "Not found" from Windows while every file is there is no antivirus
+    // taking them (#69): said as what it is, with Windows' code.
+    if (c && c.code === 'files_missing' && !this._badFile()) return this._notFound(s.fault, s.stale, s.copy);
+    if (c && (c.code === 'security_blocked' || c.code === 'files_missing')) {
+      const load = s.fault.code === 'windivert_load';
+      return this._blockError(c.code, c.kind, {
+        file: load ? 'WinDivert.dll' : 'WinDivert64.sys', win32: s.fault.win32,
+        detail: `${load ? 'loading WinDivert.dll' : 'WinDivertOpen'}: error ${s.fault.win32}`,
+      });
+    }
+    if (c && c.code === 'rival') return new AdvError('start_failed', 'Another program has a different version of the WinDivert driver loaded (error 654). Close it (GoodbyeDPI, zapret and the like), or restart Windows.');
+    if (c && c.code === 'needs_sha2') return new AdvError('needs_sha2', "Windows 7 cannot check the WinDivert driver's signature (error 577): it needs Microsoft's SHA-2 code signing update, KB4474419. Install it from Windows Update or the Microsoft Update Catalog, restart Windows, then turn Advanced mode on again.");
+    if (c && c.code === 'bfe_off') return new AdvError('start_failed', "Windows' Base Filtering Engine service is off (error 1753); Advanced mode needs it.");
+    return new AdvError('start_failed', said || fallback);
+  }
+
+  /* Windows said "not found" (2, 3, 126) or "not a program" (193) about
+   * WinDivert while its files are all in place and readable. */
+  _notFound(fault, stale = null, copy = null) {
+    const load = fault.code === 'windivert_load';
+    const what = load ? 'load WinDivert.dll' : 'start the WinDivert driver';
+    const tried = [];
+    if (stale === 1) tried.push('a WinDivert service left behind was removed');
+    else if (stale === 0) tried.push('no WinDivert service left behind was found');
+    if (copy === 1) tried.push("the driver was copied to Common Files\\Shroudly and started from there");
+    else if (copy === 0) tried.push('the driver could not be copied to Common Files\\Shroudly');
+    const left = tried.length ? ` (${tried.join('; ')})` : '';
+    return new AdvError('start_failed', `Windows could not ${what} (error ${fault.win32}) although Advanced mode's files are all in place${left}. Restart Windows, then try again; if it stays so, please send the log (Logs → Save logs).`);
+  }
+
+  async _launchWindows(bin, args) {
+    this._launched(await this.runTool('powershell.exe', launcherArgs(bin, args), PROMPT_TIMEOUT_MS));
+  }
+
+  /* Windows: where the kept permission lives for this user, or null where
+   * it cannot be used (advanced-task.js). */
+  _task() {
+    if (this.platform !== 'win32' || this.taskOff) return null;
+    const admin = AdvTask.adminDir(this.env);
+    const userDir = AdvTask.userDir(this.env);
+    const user = AdvTask.userName(undefined, this.env);
+    if (!admin || !userDir || !user) return null;
+    return { admin, userDir, user, name: AdvTask.taskName(user) };
+  }
+
+  /* Windows: the engine started by its task, with the permission given
+   * before: no prompt. true when it runs and said its process id; false
+   * when this way is not there (never allowed yet, an update changed the
+   * engine, the task gone or not allowed to run) and the prompt is to be
+   * used. argsFor(statusFile): the engine's arguments. */
+  async _launchByTask(argsFor) {
+    const t = this._task();
+    if (!t) return false;
+    if (!AdvTask.current(this.bundledDir(), t.admin)) return false;
+    const args = AdvTask.requestArgs(argsFor(''));
+    if (!args) return false;
+    const id = AdvTask.newId();
+    const statusFile = path.join(t.admin, 'run', `${id}.log`);
+    try {
+      fs.rmSync(t.userDir, { recursive: true, force: true });
+      fs.mkdirSync(t.userDir, { recursive: true });
+      fs.writeFileSync(path.join(t.userDir, 'request'), AdvTask.requestText(id, args));
+    } catch { return false; }
+    const r = await this.runTool(AdvTask.schtasks(this.env), ['/Run', '/TN', t.name], 15000);
+    if (r.code !== 0) {
+      try { fs.rmSync(t.userDir, { recursive: true, force: true }); } catch {}
+      return false;
+    }
+    const deadline = Date.now() + this.taskWaitMs;
+    let pid = null;
+    while (!pid && Date.now() < deadline) {
+      pid = AdvTask.pidLine(statusFile);
+      if (!pid) await new Promise((res) => setTimeout(res, 150));
+    }
+    if (!pid) {
+      // Should it still come up, it ends at once.
+      try { fs.writeFileSync(path.join(t.userDir, `${id}.stop`), ''); } catch {}
+      this.log('info', 'Advanced mode: the permission given before could not be used this time, so it is asked for again');
+      return false;
+    }
+    this.dir = t.userDir;
+    this.statusFile = statusFile;
+    this.ctl = path.join(t.userDir, id);
+    this.pid = pid;
+    this.viaTask = true;
+    return true;
+  }
+
+  /* Windows: the engine started through the prompt also keeps the
+   * permission for the next starts (--task-install, core/src/advtask.h). */
+  _withInstall(args) {
+    const t = this._task();
+    return t ? [...args, '--task-install', t.user] : args;
+  }
+
+  /* Said once, a moment after a start through the prompt: whether the
+   * permission is kept now. Looked at a few times (the installer is a
+   * process of its own, and an antivirus may hold it up). */
+  _noteInstall(waits = [this.installNoteMs || 6000, 15000, 45000]) {
+    const t = this._task();
+    if (!t || this._installTold || !waits.length) return;
+    const timer = setTimeout(() => {
+      if (this._installTold) return;
+      const res = AdvTask.installResult(t.admin);
+      if (res && res.ok && AdvTask.current(this.bundledDir(), t.admin)) {
+        this._installTold = true;
+        this.log('info', 'Advanced mode: the permission is kept from now on: it turns on without asking again (asked once more only after an update that changes its engine)');
+      } else if (res && !res.ok) {
+        this._installTold = true;
+        this.log('info', `Advanced mode: the permission could not be kept for the next start (${res.why}${res.hr && res.hr !== '0x00000000' ? `, ${res.hr}` : ''}); it will be asked for again`);
+      } else this._noteInstall(waits.slice(1));
+    }, waits[0]);
+    if (timer.unref) timer.unref();
+  }
+
+  /* What the launcher's exit says (launcherArgs): the engine's process id
+   * kept, or the AdvError it stands for. */
+  _launched(r) {
+    if (r.code === 2) throw new AdvError('declined', 'Administrator permission was not granted.');
+    // Nobody answered the prompt (the computer started with no one at it):
+    // not a "no", and nothing went wrong.
+    if (r.timedOut) throw new AdvError('unanswered', 'The administrator permission prompt was not answered.');
+    if (r.code === 3) throw this._blockError('security_blocked', 'denied', { detail: 'elevated start' });
+    if (r.code === 4) {
+      const bad = this._badFile();
+      if (bad) throw this._blockError('files_missing', bad.state, { file: path.basename(bad.file) });
+      // Windows found nothing to start while the file is there and readable
+      // (#69): no antivirus at work, so none is named.
+      throw new AdvError('start_failed', `Windows could not find the advanced engine to start it (error 2) although it is in place: ${advBinaryPath()}. Please send the log (Logs → Save logs).`);
+    }
+    if (r.code !== 0) throw new AdvError('start_failed', r.stderr.trim() || `PowerShell exited with ${r.code}`);
+    const pid = Number(String(r.stdout || '').trim().split(/\s+/).pop());
+    this.pid = Number.isInteger(pid) && pid > 0 ? pid : null;
+  }
+
+  _launchLinux(bin, args) {
+    let exe = bin;
+    if (process.env.APPIMAGE) {
+      // Root cannot read the user's FUSE mount of the AppImage, so run a copy
+      // from our private (0700) temp dir instead.
+      exe = path.join(this.dir, path.basename(bin));
+      fs.copyFileSync(bin, exe);
+      fs.chmodSync(exe, 0o755);
+    }
+    const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+    const [cmd, argv] = isRoot ? [exe, args] : ['pkexec', [exe, ...args]];
+    return new Promise((resolve, reject) => {
+      // pkexec's own words tell its endings apart (_pkexecEnd).
+      const child = spawn(cmd, argv, { stdio: ['ignore', 'ignore', isRoot ? 'ignore' : 'pipe'] });
+      this.childErr = '';
+      this.viaPkexec = !isRoot;
+      if (child.stderr) child.stderr.on('data', (d) => { this.childErr = (this.childErr + d).slice(-2000); });
+      child.once('error', (e) => {
+        if (e.code === 'ENOENT' && !isRoot) reject(new AdvError('elevation_unavailable', 'pkexec (polkit) was not found. Install the polkit package (pkexec), then try again.'));
+        else reject(new AdvError('start_failed', e.message));
+      });
+      child.once('spawn', () => {
+        this.child = child;
+        this.childExit = null;
+        child.once('exit', (code) => { this.childExit = code === null ? -1 : code; });
+        resolve();
+      });
+    });
+  }
+
+  /* What pkexec's ending means. 126: the password window was dismissed, the
+   * user's no. 127: not allowed (also the user's no), or no window could be
+   * shown at all (no polkit agent in the session: Sway, Hyprland, i3, a
+   * minimal desktop), or the program could not be started (/tmp mounted
+   * noexec): those were taken for a no too, and the autopilot kept quiet
+   * for two weeks about a question nobody was asked. */
+  _pkexecEnd(code, stderr = '') {
+    const why = String(stderr || '');
+    if (code === 126) return new AdvError('declined', 'Administrator permission was not granted.');
+    if (code !== 127) return null;
+    if (/no authentication agent|textual authentication agent/i.test(why)) {
+      return new AdvError('no_agent', 'No password window could be shown: no polkit authentication agent runs in this session.');
+    }
+    if (/not authori[sz]ed|request dismissed/i.test(why) || !why.trim()) return new AdvError('declined', 'Administrator permission was not granted.');
+    return new AdvError('start_failed', `The advanced engine could not be started as administrator: ${why.trim().split('\n').pop().slice(0, 200)}`);
+  }
+
+  /* The time limit counts only time the computer was awake: the prompt may
+   * be on screen when the lid closes, and its answer after the wake is no
+   * timeout. A step much longer than the poll (asleep, frozen, a clock
+   * change) counts as one second. */
+  async _waitReady() {
+    const limit = this.readyTimeoutMs || READY_TIMEOUT_MS;
+    let waited = 0;
+    let last = Date.now();
+    while (waited < limit) {
+      const s = this._readStatus();
+      if (s.ready) return s.ready;
+      if (s.stopped) throw this._failure(s, 'The advanced engine exited.');
+      if (this.childExit !== null) {
+        const end = this.viaPkexec ? this._pkexecEnd(this.childExit, this.childErr) : null;
+        if (end) throw end;
+        throw this._failure(s, `The advanced engine exited with code ${this.childExit}.`);
+      }
+      // Windows: its process is gone, and it said nothing (an engine that
+      // fails writes why, then "stopped"): ended from outside. An
+      // antivirus, for certain when it took a file too.
+      if (this.pid && !this.alive(this.pid)) {
+        const last = this._readStatus();
+        if (last.ready) return last.ready;
+        if (last.stopped || last.errors.length) throw this._failure(last, 'The advanced engine exited.');
+        const bad = this._badFile();
+        throw this._blockError('security_blocked', bad ? bad.state : 'killed', { certain: !!bad, file: bad ? path.basename(bad.file) : null });
+      }
+      await new Promise((r) => setTimeout(r, 250));
+      const now = Date.now();
+      waited += Math.min(Math.max(now - last, 0), 1000);
+      last = now;
+    }
+    throw new AdvError('timeout', 'The advanced engine did not respond in time.');
+  }
+
+  /* One start at a time: a second one while the first is still waiting for
+   * the permission prompt (the autopilot's, then a click in Settings) gets
+   * the first one's answer instead of a second prompt that would undo it. */
+  start(fakeTtl, opts) {
+    if (this.active) return Promise.resolve({ success: true, alreadyActive: true });
+    if (this.standby && !this._starting) this._starting = this._resumeOrStart(fakeTtl, opts).finally(() => { this._starting = null; });
+    if (!this._starting) this._starting = this._start(fakeTtl, opts).finally(() => { this._starting = null; });
+    return this._starting;
+  }
+
+  async _start(fakeTtl, opts) {
+    if (this.active) return { success: true, alreadyActive: true };
+    const code = this.reasonCode();
+    if (code === 'files_missing') {
+      const bad = this._badFile();
+      throw this._blockError(code, bad ? bad.state : 'missing', { file: bad ? path.basename(bad.file) : null });
+    }
+    if (code) throw new AdvError(code, REASONS[code]);
+    const ttl = Number(fakeTtl) > 0 ? Number(fakeTtl) : 4;
+    const o = opts || {};
+
+    this._removeDir();
+    this._escalated = new Map();
+    this._escalateTold = new Set();
+    const argsFor = (statusFile) => buildArgs({
+      ttl, statusFile, parentPid: process.pid, platform: this.platform,
+      queueNum: QUEUE_NUM, quicBlock: o.quicBlock, udpFake: o.udpFake, fakeRepeats: o.fakeRepeats, dnsGate: o.dnsGate, decoyNames: o.decoyNames, opts: o,
+    });
+
+    try {
+      // Windows: with the permission given before, when there is one.
+      let byTask = false;
+      try { byTask = this.platform === 'win32' && await this._launchByTask(argsFor); } catch { byTask = false; }
+      if (byTask) {
+        this.log('info', 'Advanced mode: starting with the administrator permission given before (no prompt)');
+      } else {
+        this.viaTask = false;
+        this.dir = fs.mkdtempSync(path.join(workBase(this.platform), 'shroudly-adv-'));
+        this.statusFile = path.join(this.dir, 'status.log');
+        this.ctl = this.statusFile;
+        const args = argsFor(this.statusFile);
+        this.log('info', 'Advanced mode: asking for administrator permission');
+        if (this.platform === 'win32') await this._launchWindows(advBinaryPath(), this._withInstall(args));
+        else await this._launchLinux(advBinaryPath(), args);
+      }
+      const ready = await this._waitReady();
+      this.active = true;
+      if (this.platform === 'win32' && !byTask) this._noteInstall();
+      const fixedBy = this._readStatus();
+      if (fixedBy.stale === 1) this.log('info', 'Advanced mode: a WinDivert service that could not start (left behind by another program, or by an earlier try) was removed, so Shroudly\'s own driver could start');
+      if (fixedBy.copy === 1) this.log('info', 'Advanced mode: Windows could not load the driver from Shroudly\'s folder, so it now starts from a copy in Common Files\\Shroudly');
+      this.log('success', `Advanced backend active (fake TTL ${ready.ttl})`);
+      // The engine takes only the first datagrams of a call where the
+      // system's packet filter can look inside them (udpdpi.h); where it
+      // cannot, every datagram on the voice ports passes through the engine.
+      if (ready.udp_match === 0 && (ready.udp_fake || ready.quic_block)) {
+        this.log('info', 'Advanced mode: the packet filter here cannot look inside UDP datagrams, so calls on the voice ports pass through the engine');
+      }
+      if (o.dropRst && o.autottl) this.log('info', 'Advanced mode also drops injected resets and measures the decoy TTL');
+      if (ready.dns_gate === 1) this.log('info', 'Advanced mode also answers the DNS of programs that ignore the proxy with encrypted DNS');
+      // Windows: TCP timestamps on (as Linux and macOS have them), so the
+      // stronger way's decoys are kept from servers by them (raw_windows.c).
+      if (ready.tcp_ts === 1) this.log('info', 'Advanced mode: TCP timestamps are on, as on Linux and macOS, so its decoys never reach the servers');
+      this._startMonitor();
+      return { success: true };
+    } catch (e) {
+      // main.js logs the failure ("Advanced mode failed: ...")
+      await this._requestStop();
+      this._removeDir();
+      throw e;
+    }
+  }
+
+  _startMonitor() {
+    clearInterval(this.monitor);
+    let looked = Date.now();
+    this.monitor = setInterval(() => {
+      if (!this.active && !this.standby) return;
+      const s = this._readStatus();
+      // Windows: ended from outside while it ran leaves no "stopped" line,
+      // and would otherwise be taken for on for the rest of the session.
+      const look = !!this.pid && Date.now() - looked >= this.aliveCheckMs;
+      if (look) looked = Date.now();
+      const gone = look && !s.stopped && this.childExit === null && !this.alive(this.pid);
+      if (s.stopped || this.childExit !== null || gone) {
+        this.active = false;
+        this.standby = false;
+        clearInterval(this.monitor);
+        this.log('warning', gone ? 'Advanced backend was ended from outside (no stop was asked)' : 'Advanced backend exited');
+        if (typeof this.onExit === 'function') { try { this.onExit(); } catch {} }
+        if (s.errors.length) this.log('warning', s.errors[s.errors.length - 1]);
+        // Its files gone with it: an antivirus took them (main.js tells it).
+        const bad = gone ? this._badFile() : null;
+        if (bad && typeof this.onSecurityBlock === 'function') {
+          try { this.onSecurityBlock(this._info('vanished', { file: path.basename(bad.file) })); } catch {}
+        }
+        this._removeDir();
+      }
+    }, 1000);
+  }
+
+  async _requestStop() {
+    if (!this.statusFile) return;
+    try { fs.writeFileSync(`${this.ctl || this.statusFile}.stop`, ''); } catch {}
+    const deadline = Date.now() + STOP_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      if (this._readStatus().stopped || this.childExit !== null) return;
+      if (this.pid && !this.alive(this.pid)) return; // ended already
+      if (!fs.existsSync(this.statusFile)) return; // never started
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    this.log('warning', 'Advanced backend did not confirm stop; it exits on its own when Shroudly quits');
+  }
+
+  _removeDir() {
+    if (!this.dir) return;
+    try { fs.rmSync(this.dir, { recursive: true, force: true }); } catch {}
+    this.dir = null;
+    this.statusFile = null;
+    this.ctl = null;
+    this.child = null;
+    this.pid = null;
+  }
+
+  /* Standby: the packet hook let go and its driver unloaded (a game's
+   * anti-cheat sees none), the engine kept running, elevated, so coming back
+   * asks for no permission again (supervise.h, F.standby). Until 2.6.86 a
+   * game or a Stop ended it, and the way back was a new prompt each time.
+   * true once the engine says so; otherwise it is stopped for good. */
+  async pause() {
+    if (!this.active || !this.statusFile) return false;
+    const before = this._readStatus().paused;
+    try { fs.writeFileSync(`${this.ctl || this.statusFile}.standby`, ''); } catch { await this.stop(); return false; }
+    const deadline = Date.now() + this.standbyWaitMs;
+    while (Date.now() < deadline) {
+      const st = this._readStatus();
+      if (st.paused > before) {
+        this.active = false;
+        this.standby = true;
+        this.log('info', 'Advanced mode on standby: its driver is unloaded, and it comes back without asking for permission again');
+        return true;
+      }
+      if (st.stopped || this.childExit !== null) break;
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    await this.stop();
+    return false;
+  }
+
+  /* Out of standby (see pause): the hook taken again, no prompt. Falls back
+   * to a full stop and a new start (one prompt) if the engine cannot. */
+  async _resumeOrStart(fakeTtl, opts) {
+    const before = this._readStatus();
+    try { fs.rmSync(`${this.ctl || this.statusFile}.standby`, { force: true }); } catch {}
+    const deadline = Date.now() + this.standbyWaitMs;
+    while (Date.now() < deadline) {
+      const st = this._readStatus();
+      if (st.resumed > before.resumed) {
+        this.standby = false;
+        this.active = true;
+        this.log('success', 'Advanced mode back on (no new permission prompt)');
+        return { success: true };
+      }
+      if (st.resumeFailed > before.resumeFailed || st.stopped || this.childExit !== null) break;
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    this.log('info', 'Advanced mode could not come back from standby; starting it again');
+    await this.stop();
+    return this._start(fakeTtl, opts);
+  }
+
+  async stop() {
+    clearInterval(this.monitor);
+    await this._requestStop();
+    this.active = false;
+    this.standby = false;
+    this._removeDir();
+    this.log('success', 'Advanced mode stopped');
+    return { success: true };
+  }
+
+  /* A server (IPv4) that cut a connection after its handshake was answered
+   * (engine-manager.js, cut_addr): told to the running engine through
+   * status.log.escalate, one address a line (supervise.h), so its next
+   * connections go the stronger way (rawscope.h). Once a minute per address
+   * at most, and only addresses of the internet; nothing when off. */
+  escalate(addr, host) {
+    if (!this.active || !this.statusFile) return false;
+    const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(String(addr));
+    if (!m) return false;
+    const o = m.slice(1).map(Number);
+    if (o.some((x) => x > 255) || o[0] === 0 || o[0] === 10 || o[0] === 127 || o[0] >= 224 ||
+        (o[0] === 169 && o[1] === 254) || (o[0] === 172 && o[1] >= 16 && o[1] <= 31) ||
+        (o[0] === 192 && o[1] === 168) || (o[0] === 100 && o[1] >= 64 && o[1] <= 127)) return false;
+    const now = Date.now();
+    this._escalated = this._escalated || new Map();
+    if (now - (this._escalated.get(addr) || 0) < 60000) return false;
+    if (this._escalated.size > 512) this._escalated.clear();
+    this._escalated.set(addr, now);
+    try { fs.appendFileSync(`${this.ctl || this.statusFile}.escalate`, `${addr}\n`); } catch { return false; }
+    // Said once per address a session, so a report shows what was done.
+    this._escalateTold = this._escalateTold || new Set();
+    if (!this._escalateTold.has(addr) && this._escalateTold.size < 64) {
+      this._escalateTold.add(addr);
+      const name = typeof host === 'string' && /^[a-z0-9.-]{1,253}$/i.test(host) ? `${host} (${addr})` : addr;
+      this.log('info', `Advanced mode: ${name} cut the connection after it opened; its next connections go the stronger way`);
+    }
+    return true;
+  }
+
+  /* The packet engine's last raw_stats line (rawscope.h): what it did, for a
+   * report. null when there is none yet. */
+  stats() {
+    if (!this.statusFile) return null;
+    let text = '';
+    try { text = fs.readFileSync(this.statusFile, 'utf8'); } catch { return null; }
+    const lines = text.split(/\r?\n/);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (!lines[i].includes('"raw_stats"')) continue;
+      try {
+        const m = JSON.parse(lines[i]);
+        const keep = ['desynced', 'nodecoy', 'decoy_hurt', 'escalated', 'strong', 'strong_ts', 'cut_asked'];
+        const out = {};
+        for (const k of keep) if (Number.isFinite(Number(m[k]))) out[k] = Number(m[k]);
+        return out;
+      } catch { return null; }
+    }
+    return null;
+  }
+
+  cleanupSync() {
+    // The engine also exits on its own once this process is gone.
+    clearInterval(this.monitor);
+    if (this.statusFile) { try { fs.writeFileSync(`${this.ctl || this.statusFile}.stop`, ''); } catch {} }
+  }
+}
+
+module.exports = AdvancedMode;
+module.exports.buildArgs = buildArgs;
+module.exports.winQuoteArg = winQuoteArg;
+/* The TCP options' own name for the same argv (fakeTtl, opts). */
+module.exports.buildAdvancedArgs = ({ fakeTtl, opts, ...rest }) => buildArgs({ ...rest, ttl: fakeTtl, opts });
+module.exports.ADV_DEFAULTS = ADV_DEFAULTS;
+module.exports.AdvError = AdvError;
+module.exports.wrongBuild = wrongBuild;
+module.exports.launcherArgs = launcherArgs;
+module.exports.workBase = workBase;
+module.exports.plainErr = plainErr;

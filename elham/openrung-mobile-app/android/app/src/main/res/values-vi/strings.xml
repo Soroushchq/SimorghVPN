@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="vpn_notification_channel">OpenRung VPN</string>
+    <string name="vpn_notification_title">OpenRung VPN</string>
+    <string name="vpn_notification_preparing">Đang chuẩn bị OpenRung VPN</string>
+    <string name="vpn_notification_connected">Đã kết nối qua %1$s</string>
+    <string name="relay_location_unknown">Vị trí không xác định</string>
+    <string name="status_disconnected">Đã ngắt kết nối</string>
+    <string name="status_preparing">Đang chuẩn bị VPN</string>
+    <string name="status_connecting">Đang kết nối</string>
+    <string name="status_connected">Đã kết nối</string>
+    <string name="status_disconnecting">Đang ngắt kết nối</string>
+    <string name="status_failed">Thất bại</string>
+    <string name="log_split_ruleset_missing">thiếu bộ quy tắc chia đường hầm cho %1$s; lưu lượng đó vẫn đi qua đường hầm</string>
+    <string name="log_error_prefix">lỗi: %1$s</string>
+</resources>

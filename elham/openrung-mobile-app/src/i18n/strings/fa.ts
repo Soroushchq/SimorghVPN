@@ -1,0 +1,201 @@
+import type { Strings } from './en';
+
+/** Ported from `res/values-fa/strings.xml`; missing keys fall back to English. */
+export const fa: Partial<Strings> = {
+  appName: 'OpenRung',
+  actionConnect: 'اتصال',
+  actionDisconnect: 'قطع اتصال',
+  readyLog: 'آماده است. برای عبور از رله، روی اتصال ضربه بزنید.',
+  logLineFormat: (line: string) => `> ${line}`,
+  errorLineFormat: (error: string) => `! ${error}`,
+  settingsTitle: 'تنظیمات',
+  backContentDescription: 'بازگشت',
+  languageSettingTitle: 'زبان',
+  languageSettingSubtitle:
+    'از زبان سیستم استفاده کنید یا زبانی برای OpenRung انتخاب کنید.',
+  languageSystem: 'پیش‌فرض سیستم',
+  languageEnglish: 'English',
+  languageSimplifiedChinese: '简体中文',
+  languageTraditionalChinese: '繁體中文',
+  languagePersian: 'فارسی',
+  languageRussian: 'Русский',
+  languageArabic: 'العربية',
+  languageTurkish: 'Türkçe',
+  languageVietnamese: 'Tiếng Việt',
+  languageBurmese: 'မြန်မာ',
+  statusDisconnected: 'قطع شده',
+  statusPreparing: 'در حال آماده‌سازی VPN',
+  statusConnecting: 'در حال اتصال',
+  statusConnected: 'متصل',
+  statusDisconnecting: 'در حال قطع اتصال',
+  statusFailed: 'ناموفق',
+
+  // Redesigned shell (tabs / about / section headers).
+  tabHome: 'خانه',
+  tabSettings: 'تنظیمات',
+  tabAbout: 'درباره ما',
+  aboutTitle: 'درباره ما',
+  relayAuto: 'انتخاب خودکار رله',
+  widgetStatusDisconnected: 'متصل\nنیست',
+  widgetName: 'اتصال سریع',
+  widgetDescription:
+    'از صفحهٔ اصلی به رله‌ای که به‌طور خودکار انتخاب می‌شود متصل شوید.',
+  relayClassOfficial: 'رسمی',
+  relayClassVolunteer: 'داوطلب',
+  settingsGeneralHeader: 'عمومی',
+  settingsDiagnosticsHeader: 'عیب‌یابی',
+
+  // Content descriptions.
+  openContentDescription: 'باز کردن',
+
+  // Speed test link (settings).
+  speedTestSettingTitle: 'تست سرعت',
+  speedTestSettingSubtitle: 'fast.com را در مرورگر شما باز می‌کند',
+  speedTestRequiresConnection: 'برای سنجش تونل، ابتدا متصل شوید',
+
+  // Map view (exit nodes).
+  mapContentDescription:
+    'نقشهٔ گره‌های خروجی موجود در سراسر منطقهٔ آسیا-اقیانوسیه',
+  mapLoading: 'در حال یافتن گره‌های خروجی موجود…',
+  mapFailed: 'بارگذاری گره‌های خروجی ناموفق بود — برای تلاش دوباره ضربه بزنید',
+  mapRelaysOnline: (count: number) => `${count} رله آنلاین`,
+  mapNoNodes: 'در حال حاضر هیچ گره خروجی موجود نیست',
+
+  // Recent locations.
+  recentsLabel: 'اخیر',
+
+  // Map / list toggle.
+  viewToggleMap: 'نقشه',
+  viewToggleList: 'فهرست',
+  listContentDescription: 'فهرست گره‌های خروجی موجود',
+  listRelayCount: (count: number) => (count === 1 ? '1 رله' : `${count} رله`),
+
+  // Debug console.
+  debugSettingTitle: 'اشکال‌زدایی',
+  debugSettingSubtitle: 'کنسول اتصال و عیب‌یابی.',
+  debugTitle: 'کنسول اشکال‌زدایی',
+
+  // Open-source licenses.
+  licensesSettingTitle: 'مجوزهای متن‌باز',
+  licensesSettingSubtitle: 'مجوزها و ذکر منبع برای نرم‌افزارهای همراه.',
+  licensesTitle: 'مجوزهای متن‌باز',
+  licensesIntro:
+    'OpenRung نرم‌افزار آزاد است و چون به sing-box پیوند می‌خورد، تحت مجوز GPL-3.0-or-later منتشر شده است. کد منبع کامل و متناظر این نسخه از طریق پیوند زیر در دسترس است.',
+  licensesSourceTitle: 'کد منبع',
+  privacyPolicyTitle: 'سیاست حفظ حریم خصوصی',
+  privacyPolicySubtitle:
+    'نحوهٔ مدیریت داده‌های تشخیصی و اطلاعات شخصی توسط OpenRung.',
+  licensesFullTextTitle: 'متن کامل مجوزها',
+  licensesFullTextSubtitle: 'GNU GPL-3.0 و اعلان‌های اشخاص ثالث.',
+  licensesComponentsHeader: 'مؤلفه‌ها',
+  shareApkTitle: 'اشتراک‌گذاری آفلاین OpenRung',
+  shareApkSubtitle:
+    'این فایل APK را بدون اینترنت به یک گوشی Android نزدیک بفرستید.',
+  shareApkErrorTitle: 'اشتراک‌گذاری OpenRung ممکن نیست',
+  shareApkErrorBody:
+    'فایل APK قابل اشتراک‌گذاری نبود. OpenRung را باز نگه دارید و دوباره تلاش کنید.',
+  shareApkSplitInstallError:
+    'این نسخه با چند فایل APK نصب شده است و نمی‌توان آن را به‌طور امن به اشتراک گذاشت. برای اشتراک‌گذاری آفلاین، فایل APK مستقل OpenRung را نصب کنید.',
+  shareAppStoreTitle: 'اشتراک‌گذاری OpenRung',
+  shareAppStoreSubtitle:
+    'پیوند App Store را بفرستید تا دیگران OpenRung را نصب کنند.',
+  shareAppStoreMessage:
+    'OpenRung را از App Store دریافت کنید:',
+  shareAppStoreErrorTitle: 'اشتراک‌گذاری OpenRung ممکن نیست',
+  shareAppStoreErrorBody:
+    'پیوند App Store به اشتراک گذاشته نشد. دوباره تلاش کنید.',
+
+  // Home tagline + about screen.
+  homeTagline: 'شبکهٔ رله‌ها',
+  homeSlogan: 'دسترسی به اینترنت یک حق است،\nنه یک امتیاز',
+  aboutMissionLead: 'ما باور داریم دسترسی به اینترنت یک حق است، نه یک امتیاز',
+  aboutMissionBody:
+    'و نه ابزار چانه‌زنی در دست صاحبان قدرت. حق دسترسی به اطلاعات در سرشت انسانی ما ریشه دارد و هیچ دیوار آتشی نباید اجازه داشته باشد آن را از بین ببرد. با این حال، امروز میلیاردها نفر پشت دیوارهایی زندگی می‌کنند که برای بیرون نگه داشتن اطلاعات و درون نگه داشتن سکوت ساخته شده‌اند؛ جایی که جست‌وجوی Google خطای 404 برمی‌گرداند، پرسیدن یک سؤال می‌تواند خطرناک باشد و کنجکاوی به یک صفحهٔ مسدودشده ختم می‌شود.\n\nOpenRung برای تغییر این وضعیت به وجود آمده است.\n\nما در حال ساختن نردبانی بر فراز این دیوارها هستیم. مردم عادی در سراسر جهان اتصال خود را به اشتراک می‌گذارند تا کسی در سوی دیگر یک دیوار آتش بتواند به اینترنت آزاد دسترسی پیدا کند.\n\nاطلاعات قدرت است و این قدرت به ما تعلق دارد، نه به کسانی که می‌خواهند آن را از ما بگیرند.',
+  aboutSupportHeader: 'از ما حمایت کنید',
+  donateTitle: 'کمک مالی',
+  donateSubtitle:
+    'کمک کنید نردبان برپا بماند. کمک‌ها به بنیاد OpenRung می‌رسد.',
+  aboutLegalHeader: 'حقوقی',
+  aboutFollowHeader: 'ما را دنبال کنید',
+
+  // --- Split tunneling (settings row + screen + Android app picker) ---
+  splitTunnelSettingTitle: 'تونل تفکیکی',
+  splitTunnelSettingSubtitleOn: 'روشن — ترافیک انتخاب‌شده از رله عبور نمی‌کند.',
+  splitTunnelSettingSubtitleOff: 'خاموش — همهٔ ترافیک از رله عبور می‌کند.',
+  splitTunnelHeader: 'تونل تفکیکی',
+  splitTunnelMasterTitle: 'تونل تفکیکی',
+  splitTunnelMasterSubtitle: 'ترافیک انتخاب‌شده را بیرون از تونل رله بفرستید.',
+  splitTunnelBypassHeader: 'عبور مستقیم',
+  splitTunnelLanTitle: 'شبکهٔ محلی',
+  splitTunnelLanSubtitle:
+    'به چاپگرها، تلویزیون‌ها و دیگر دستگاه‌های شبکهٔ محلی مستقیم دسترسی داشته باشید.',
+  splitTunnelIranTitle: 'سایت‌ها و برنامه‌های ایرانی',
+  splitTunnelIranSubtitle:
+    'سرویس‌های ایرانی را مستقیم و با سرعت کامل هدایت کنید.',
+  splitTunnelChinaTitle: 'سایت‌ها و برنامه‌های چینی',
+  splitTunnelChinaSubtitle:
+    'سرویس‌های چینی را مستقیم و با سرعت کامل هدایت کنید.',
+  splitTunnelAppsHeader: 'برنامه‌ها',
+  splitTunnelAppsTitle: 'برنامه‌های خارج از VPN',
+  splitTunnelAppsSubtitle: (count: number) =>
+    count === 1
+      ? '1 برنامه VPN را دور می‌زند.'
+      : `${count} برنامه VPN را دور می‌زنند.`,
+  splitTunnelAppPickerTitle: 'برنامه‌های خارج از VPN',
+  splitTunnelAppPickerLoading: 'در حال بارگذاری برنامه‌های نصب‌شده…',
+  splitTunnelAppPickerEmpty: 'برنامهٔ قابل اجرا پیدا نشد.',
+  splitTunnelAppPickerClose: 'بستن',
+  splitTunnelApplyHint:
+    'تغییرات بلافاصله اعمال می‌شوند؛ تونل برای چند ثانیه دوباره متصل می‌شود.',
+  splitTunnelResetHint:
+    'با راه‌اندازی مجدد برنامه، پیش‌تنظیم‌های ایران و چین بازنشانی می‌شوند.',
+  splitTunnelResetHintWithApps:
+    'با راه‌اندازی مجدد برنامه، پیش‌تنظیم‌های ایران و چین بازنشانی می‌شوند؛ برنامه‌های کنارگذاشته‌شده حفظ می‌شوند.',
+
+  // --- In-app update check (manifest banner / blocking screen / broadcast notice) ---
+  updateRequiredTitle: 'به‌روزرسانی لازم است',
+  updateRequiredBody:
+    'این نسخه از OpenRung دیگر نمی‌تواند به شبکهٔ رله‌ها متصل شود. برای ادامه، آخرین نسخه را نصب کنید.',
+  updateVersionTransition: (current: string, latest: string) =>
+    `v${current} -> v${latest}`,
+  updateActionNow: 'به‌روزرسانی',
+  updateActionLater: 'بعداً',
+  updateContinueAnyway: 'به هر حال ادامه دهید',
+  updateBannerTitle: 'به‌روزرسانی موجود است',
+  updateBannerBody: (latest: string) =>
+    `نسخهٔ ${latest} شامل اصلاحات مهمی است. در اولین فرصت به‌روزرسانی کنید.`,
+  updateSettingTitle: 'به‌روزرسانی موجود است',
+  updateSettingSubtitle: (current: string, latest: string) =>
+    `شما نسخهٔ v${current} را دارید؛ نسخهٔ v${latest} منتشر شده است. برای دریافت ضربه بزنید.`,
+  noticeDismiss: 'بستن',
+  noticeLearnMore: 'بیشتر بدانید',
+  errorAccessDenied:
+    'دسترسی این دستگاه غیرفعال شده است و نمی‌تواند وصل شود. با پشتیبانی OpenRung تماس بگیرید.',
+  errorEnrollmentRefused:
+    'ثبت ناموفق بود. VPNهای دیگر را قطع کنید و دوباره تلاش کنید.',
+  clockWarningTitle: 'تاریخ و ساعت دستگاه را بررسی کنید',
+  clockWarningBody:
+    'تاریخ و ساعت این دستگاه نادرست به نظر می‌رسد و این می‌تواند مانع اتصال OpenRung شود. تنظیم خودکار تاریخ و ساعت را در تنظیمات دستگاه روشن کنید و دوباره تلاش کنید.',
+  clockWarningRetry: 'تلاش دوباره',
+  // Desktop client only: the local proxy rows in Settings (DesktopProxySection).
+  desktopProxyHeader: 'پراکسی محلی',
+  desktopProxyEndpointTitle: 'نشانی',
+  desktopProxyEndpointConnected: (endpoint: string) => `${endpoint} · اکنون در دسترس است`,
+  desktopProxyEndpointIdle: (endpoint: string) => `${endpoint} · پس از اتصال در دسترس است`,
+  desktopProxyPreparing: 'در حال آماده‌سازی نشانی پراکسی محلی…',
+  desktopProxyPersistenceTitle: 'ماندگاری نشانی',
+  desktopShellIntegrationTitle: 'یکپارچه‌سازی با شل',
+  desktopShellEnableTitle: 'فعال‌سازی در این شل',
+  desktopShellEnableSubtitle: 'مقادیر فعلی پراکسی و حالت تنظیم‌نشده را حفظ می‌کند.',
+  desktopShellEnableRequiresConnection: 'پیش از فعال‌سازی در این شل، OpenRung را متصل کنید.',
+  desktopShellRestoreTitle: 'بازگردانی این شل',
+  desktopShellRestoreSubtitle: 'پس از قطع اتصال، خطا، خروج یا ازکارافتادن اجرا کنید.',
+  desktopTunModeTitle: 'حالت TUN',
+  desktopTunModeSubtitleOff:
+    'خاموش. فقط برنامه‌هایی که از پراکسی سیستم استفاده می‌کنند از OpenRung عبور می‌کنند.',
+  desktopTunModeSubtitleOn: 'روشن. همهٔ ترافیک این دستگاه از OpenRung عبور می‌کند.',
+  desktopTunModeRestartNote: 'روشن کردن آن OpenRung را با دسترسی مدیر دوباره راه‌اندازی می‌کند.',
+  desktopTunModeRequiresDisconnect: 'برای تغییر حالت، اتصال را قطع کنید.',
+  actionCopy: 'کپی',
+  actionCopied: 'کپی شد',
+};

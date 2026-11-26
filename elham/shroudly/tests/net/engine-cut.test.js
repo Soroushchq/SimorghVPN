@@ -1,0 +1,303 @@
+'use strict';
+
+/* The engine notices a network that lets a connection start and then cuts it
+ * (stall mid-record, reset, no reply), reports it, and opens the next
+ * connection to that site with a different technique. A filter that resets a
+ * handshake arriving in pieces (as Türk Telekom's does) makes a technique's
+ * later writes fail: that is a refusal like any other, and the engine goes on
+ * to the next technique. Fake censors sit in front of a real local TLS server;
+ * real sites check for false alarms. */
+
+const tls = require('tls');
+const net = require('net');
+const { startEngine, sleep, freePort, socks, getViaEngine, requestWatcher, testServerOptions, suite } = require('./helpers');
+
+const t = suite('engine-cut');
+const BIG = Buffer.alloc(200 * 1024, 'x');
+
+/* The shape of a first flight once the whole ClientHello is in: 'one' (one
+ * record holding the whole name), 'sni+1' (records split one byte into the
+ * name), 'end' (one byte before its end: tlsrec-sni-end), 'mid' (split in
+ * between: tlsrec-sni-mid), 'other'; null while it is still arriving. */
+function shape(buf, name) {
+  let p = 0, body = Buffer.alloc(0), first = -1;
+  while (p + 5 <= buf.length) {
+    if (buf[p] !== 0x16) return 'other';
+    const len = buf.readUInt16BE(p + 3);
+    if (p + 5 + len > buf.length) return null;
+    body = Buffer.concat([body, buf.subarray(p + 5, p + 5 + len)]);
+    if (first < 0) first = len;
+    p += 5 + len;
+    if (body.length >= 4 && body.length >= 4 + body.readUIntBE(1, 3)) {
+      const i = body.indexOf(name);
+      if (i < 0) return 'other';
+      const inFirst = first - i;
+      return inFirst >= name.length ? 'one' : inFirst <= 1 ? 'sni+1' : inFirst === name.length - 1 ? 'end' : 'mid';
+    }
+  }
+  return null;
+}
+
+(async () => {
+  const server = tls.createServer(testServerOptions(), (s) => {
+    s.on('data', () => { s.write(`HTTP/1.1 200 OK\r\nContent-Length: ${BIG.length}\r\n\r\n`); s.write(BIG); });
+    s.on('error', () => {});
+  }).listen(0, '127.0.0.1');
+  await new Promise((r) => server.once('listening', r));
+
+  let mode = 'normal';
+  const censor = net.createServer((c) => {
+    const m = mode;
+    const u = net.connect(server.address().port, '127.0.0.1');
+    // Everything up to the request passes; the censor acts on the reply.
+    const sawRequest = requestWatcher();
+    let handshakeDone = false, toClient = 0;
+    c.on('data', (d) => { if (sawRequest(d)) handshakeDone = true; u.write(d); });
+    u.on('data', (d) => {
+      if (!handshakeDone) { c.write(d); return; }
+      if (m === 'normal') c.write(d);
+      // 6000 bytes of the reply, then nothing: mid-record, as a filter that drops the rest leaves it.
+      else if (m === 'stall') { const room = 6000 - toClient; if (room > 0) { c.write(d.subarray(0, room)); toClient += Math.min(room, d.length); } }
+      else if (m === 'reset') { c.resetAndDestroy(); u.destroy(); }
+      // Forward the whole reply, then reset the idle connection a moment
+      // later, the way Microsoft, Instagram and Discord's gateway drop an
+      // idle keep-alive. This is not a censor cut and must not be reported.
+      else if (m === 'lateReset') { c.write(d); toClient += d.length; if (toClient >= BIG.length) setTimeout(() => { try { c.resetAndDestroy(); u.destroy(); } catch {} }, 700); }
+      // 'noreply': drop everything
+    });
+    c.on('error', () => {}); u.on('error', () => {}); c.on('close', () => u.destroy());
+  }).listen(0, '127.0.0.1');
+  await new Promise((r) => censor.once('listening', r));
+
+  const P = await freePort();
+  const eng = await startEngine(P, ['--strategy', 'split(sni)', '--auto', '--cut-addr-local']);
+  async function visit(m, host) {
+    mode = m;
+    const before = eng.out.length;
+    const s0 = await eng.stats();
+    const raw = await socks(P, '127.0.0.1', censor.address().port);
+    const s = tls.connect({ socket: raw, servername: host, rejectUnauthorized: false });
+    let got = 0;
+    await new Promise((resolve) => {
+      s.on('secureConnect', () => s.write('GET / HTTP/1.1\r\nHost: x\r\n\r\n'));
+      // lateReset: do not resolve on the full reply; wait for the idle reset
+      // that follows, so the relay sees the reset while watching this host.
+      s.on('data', (d) => { got += d.length; if (got > BIG.length && m !== 'lateReset') resolve(); });
+      s.on('error', resolve); s.on('close', resolve);
+      setTimeout(resolve, 18000);
+    });
+    s.destroy();
+    await sleep(1200);
+    const s1 = await eng.stats();
+    const lines = eng.out.slice(before).split('\n');
+    const cut = lines.filter((l) => l.includes('"cut"')).map((l) => JSON.parse(l));
+    const addr = lines.filter((l) => l.includes('"cut_addr"')).map((l) => JSON.parse(l));
+    return { got, cut, addr, desync: s1.desync - s0.desync };
+  }
+
+  let r = await visit('normal', 'fine.test.local');
+  t.ok(r.got > BIG.length && r.cut.length === 0 && r.addr.length === 0, 'a normal connection is relayed in full, no cut reported');
+  r = await visit('stall', 'site.test.local');
+  t.ok(r.cut.length === 1 && r.cut[0].strategy === 'stall', 'server stops mid-record -> "stall" reported');
+  // ... and its server's address, for Advanced mode's stronger way (rawscope.h).
+  t.ok(r.addr.length === 1 && r.addr[0].addr === '127.0.0.1' && r.addr[0].host === 'site.test.local',
+    `... and the server's address, for Advanced mode (${JSON.stringify(r.addr)})`);
+  r = await visit('normal', 'site.test.local');
+  t.ok(r.desync === 1 && r.got > BIG.length, 'next connection to the same site uses a technique, and loads');
+  r = await visit('normal', 'other.test.local');
+  t.ok(r.desync === 0, 'other sites are left untouched');
+  r = await visit('reset', 'reset.test.local');
+  t.ok(r.cut.length === 1 && r.cut[0].strategy === 'reset', 'reset after the handshake -> "reset" reported');
+  t.ok(r.addr.length === 1 && r.addr[0].addr === '127.0.0.1', '... and its server\'s address too');
+  r = await visit('noreply', 'quiet.test.local');
+  t.ok(r.cut.length === 1 && r.cut[0].strategy === 'noreply', 'request never answered -> "noreply" reported');
+  t.ok(r.addr.length === 0, '... but no address: nothing came after the handshake to be cut');
+  // A reset on an idle keep-alive, after the whole reply was delivered, is a
+  // normal teardown — not a cut. Reporting it turned Microsoft, Instagram and
+  // Discord's gateway into "connects then cut, only a VPN" false alarms.
+  r = await visit('lateReset', 'keepalive.test.local');
+  t.ok(r.got > BIG.length && r.cut.length === 0, 'an idle keep-alive reset after a full exchange is not reported as a cut');
+
+  // A filter that resets a handshake the moment its first piece arrives on its
+  // own, before the rest: a technique that sends the handshake in several
+  // writes then fails partway through sending. It also resets an untouched
+  // handshake and every other record split; only the one a byte before the
+  // name's end gets past, the sixth technique, so the ones sent in pieces
+  // before it are tried and reset first. The engine has to treat the failed
+  // sends as refusals and keep going, not drop the connection.
+  const PIECES = 'pieces.rst-site.local';
+  let piecesReset = 0;
+  const strict = net.createServer((c) => {
+    let buf = Buffer.alloc(0), u = null, chunks = 0;
+    c.on('error', () => {});
+    c.on('close', () => { if (u) u.destroy(); });
+    c.on('data', (d) => {
+      if (u) { u.write(d); return; }
+      buf = Buffer.concat([buf, d]); chunks++;
+      if (chunks === 1 && (buf.length < 5 || buf.length < 5 + buf.readUInt16BE(3))) {
+        piecesReset++; c.resetAndDestroy(); return;           // in pieces: reset before the rest
+      }
+      const k = shape(buf, PIECES);
+      if (!k) return;
+      if (k !== 'end') { c.resetAndDestroy(); return; }
+      u = net.connect(server.address().port, '127.0.0.1');
+      u.on('error', () => c.destroy());
+      u.write(buf); u.pipe(c);
+    });
+  }).listen(0, '127.0.0.1');
+  await new Promise((resolve) => strict.once('listening', resolve));
+  const strictVisit = async () => {
+    const before = eng.out.length;
+    const s0 = await eng.stats();
+    const t0 = Date.now();
+    const raw = await socks(P, '127.0.0.1', strict.address().port);
+    const s = tls.connect({ socket: raw, servername: PIECES, rejectUnauthorized: false });
+    let got = 0;
+    await new Promise((resolve) => {
+      s.on('secureConnect', () => s.write('GET / HTTP/1.1\r\nHost: x\r\n\r\n'));
+      s.on('data', (d) => { got += d.length; if (got > BIG.length) resolve(); });
+      s.on('error', resolve); s.on('close', resolve);
+      setTimeout(resolve, 18000);
+    });
+    const ms = Date.now() - t0;
+    s.destroy();
+    await sleep(300);
+    const s1 = await eng.stats();
+    const evs = (type) => eng.out.slice(before).split('\n').filter((l) => l.includes(`"type":"${type}"`)).map((l) => JSON.parse(l));
+    return { got, ms, desync: s1.desync - s0.desync, bypass: evs('bypass'), failed: evs('send_failed'), blocked: evs('blocked') };
+  };
+  r = await strictVisit();
+  t.ok(r.got > BIG.length, `handshakes reset in pieces (${piecesReset} of them) do not end the ladder: the site loads (${r.ms} ms)`);
+  t.ok(!r.failed.length && !r.blocked.length, 'no "send_failed", no "blocked"');
+  t.ok(r.bypass.length === 1 && r.bypass[0].strategy === 'tlsrec-sni-end' && !r.bypass[0].note,
+    `learned and reported as a bypass of a refusing filter: ${JSON.stringify(r.bypass[0])}`);
+  // Whether a reset lands between two writes of one technique depends on how
+  // far apart the engine sends them: off Linux, disorder waits 10 ms between
+  // them, which makes it certain; on Linux the pieces may arrive together and
+  // be reset as a whole instead. Either way the ladder must go on, which is
+  // what is checked above.
+  if (process.platform !== 'linux') t.ok(piecesReset >= 1, 'the filter did reset handshakes before the rest of them arrived');
+  r = await strictVisit();
+  t.ok(r.got > BIG.length && r.desync === 1 && r.ms < 2000 && !r.bypass.length,
+    `the next connection opens on its first try (${r.ms} ms)`);
+  // What an earlier run learned, given back at start (LEARN, as the app does
+  // from what it kept): a fresh engine opens the site on its first try, with
+  // no search, and reports nothing new. A name or technique it cannot use is
+  // ignored, never fatal.
+  {
+    const P2 = await freePort();
+    const eng2 = await startEngine(P2, ['--strategy', 'split(sni)', '--auto']);
+    eng2.proc.stdin.write(`LEARN ${PIECES} tlsrec-sni-end 120\nLEARN bad_host! tlsrec-sni-end 5\nLEARN fine.test.local no-such-technique 5\nLEARN 10.0.0.1 tlsrec-sni 5\n`);
+    await sleep(300);
+    const from = eng2.out.length;
+    const s0 = await eng2.stats();
+    const t0 = Date.now();
+    const raw = await socks(P2, '127.0.0.1', strict.address().port);
+    const s = tls.connect({ socket: raw, servername: PIECES, rejectUnauthorized: false });
+    let got = 0;
+    await new Promise((resolve) => {
+      s.on('secureConnect', () => s.write('GET / HTTP/1.1\r\nHost: x\r\n\r\n'));
+      s.on('data', (d) => { got += d.length; if (got > BIG.length) resolve(); });
+      s.on('error', resolve); s.on('close', resolve);
+      setTimeout(resolve, 18000);
+    });
+    const ms = Date.now() - t0;
+    s.destroy();
+    await sleep(300);
+    const s1 = await eng2.stats();
+    const news = eng2.out.slice(from).split('\n').filter((l) => l.includes('"type":"bypass"') || l.includes('"type":"blocked"'));
+    t.ok(got > BIG.length && s1.desync - s0.desync === 1 && ms < 2000 && !news.length && eng2.exited === null,
+      `a technique learned by an earlier run opens the site on the first try (${ms} ms, ${s1.desync - s0.desync} technique, no search)`);
+    eng2.stop();
+  }
+  strict.close();
+
+  // A long-lived connection (a WebSocket, a long-poll): the server answers
+  // the first request, then the client sends more and the server says
+  // nothing for longer than a request may wait, and finally resets the idle
+  // connection. None of that is a cut: the filter would have acted on the
+  // first request, which was answered.
+  {
+    const socketServer = tls.createServer(testServerOptions(), (s) => {
+      let n = 0;
+      s.on('data', () => { if (n++ === 0) s.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n'); });
+      s.on('error', () => {});
+      setTimeout(() => { try { s.resetAndDestroy(); } catch {} }, 17500);
+    }).listen(0, '127.0.0.1');
+    await new Promise((r) => socketServer.once('listening', r));
+    const before = eng.out.length;
+    const raw = await socks(P, '127.0.0.1', socketServer.address().port);
+    const s = tls.connect({ socket: raw, servername: 'ws.socket.test', rejectUnauthorized: false });
+    let upgraded = false;
+    await new Promise((resolve) => {
+      s.on('secureConnect', () => s.write('GET /socket HTTP/1.1\r\nHost: ws.socket.test\r\nUpgrade: websocket\r\n\r\n'));
+      s.on('data', () => { if (!upgraded) { upgraded = true; s.write(Buffer.from([0x81, 0x05, 0x68, 0x65, 0x6c, 0x6c, 0x6f])); } });
+      s.on('error', resolve); s.on('close', resolve);
+      setTimeout(resolve, 20000);
+    });
+    s.destroy();
+    await sleep(800);
+    const cuts = eng.out.slice(before).split('\n').filter((l) => l.includes('"cut"'));
+    t.ok(upgraded && cuts.length === 0, `a long-lived connection's later silence and idle reset are not cuts (${cuts.join(' ') || 'none'})`);
+    socketServer.close();
+  }
+
+  // A ladder that gives up: whose doing was it? Told by the engine in the
+  // report, for the app to decide whether to say anything.
+  {
+    const blockedOf = (from, host) => eng.out.slice(from).split('\n').filter((l) => l.includes('"type":"blocked"') && l.includes(`"${host}"`)).map((l) => JSON.parse(l));
+    const tryHost = async (port, host) => {
+      const from = eng.out.length;
+      const raw = await socks(P, '127.0.0.1', port).catch(() => null);
+      if (raw) {
+        const s = tls.connect({ socket: raw, servername: host, rejectUnauthorized: false });
+        await new Promise((resolve) => { s.on('secureConnect', resolve); s.on('error', resolve); s.on('close', resolve); setTimeout(resolve, 20000); });
+        s.destroy();
+      }
+      await sleep(800);
+      return blockedOf(from, host)[0] || null;
+    };
+    // Resets every handshake, whatever it looks like.
+    const refuser = net.createServer((c) => { c.on('error', () => {}); c.once('data', () => c.resetAndDestroy()); }).listen(0, '127.0.0.1');
+    // Answers every handshake, once it is all in, with a TLS alert
+    // (handshake_failure), then closes: the server itself turning it down.
+    const alerter = net.createServer((c) => {
+      let buf = Buffer.alloc(0);
+      c.on('error', () => {});
+      c.on('data', (d) => {
+        buf = Buffer.concat([buf, d]);
+        if (shape(buf, 'alert.other.test') === null) return;
+        c.end(Buffer.from([0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28]));
+      });
+    }).listen(0, '127.0.0.1');
+    await Promise.all([refuser, alerter].map((x) => new Promise((r) => x.once('listening', r))));
+
+    // www.working.test answers through Shroudly...
+    const ok = await visit('normal', 'www.working.test');
+    t.ok(ok.got > BIG.length && ok.cut.length === 0, 'www.working.test loads');
+    // ...so a ladder giving up on another of its names says the site works.
+    const sub = await tryHost(refuser.address().port, 'api.working.test');
+    t.ok(sub && sub.site_ok === true && !sub.alert, `another name of a working site that refuses everything: reported with site_ok (${JSON.stringify(sub)})`);
+    const other = await tryHost(refuser.address().port, 'api.unrelated.test');
+    t.ok(other && !other.site_ok && !other.alert, `a name of a site never seen working: no site_ok (${JSON.stringify(other)})`);
+    const alerted = await tryHost(alerter.address().port, 'alert.other.test');
+    t.ok(alerted && alerted.alert === true && !alerted.site_ok, `a server answering every handshake with a TLS alert: reported with alert (${JSON.stringify(alerted)})`);
+    refuser.close(); alerter.close();
+  }
+
+  // Real sites: no false alarms.
+  const before = eng.out.length;
+  const sites = ['discord.com', 'www.wikipedia.org', 'github.com', 'www.bbc.com', 'www.google.com', 'www.cloudflare.com'];
+  const res = await Promise.all(sites.map((h) => getViaEngine(P, h)));
+  // A CI machine's own connection drops one now and then: one more try for a
+  // site that did not answer, so only the engine can fail this.
+  const good = (x) => x.status >= 200 && x.status < 400;
+  for (let i = 0; i < sites.length; i++) if (!good(res[i])) res[i] = await getViaEngine(P, sites[i]);
+  await sleep(1500);
+  t.ok(res.every((x) => x.status >= 200 && x.status < 400), `real sites load through the engine: ${res.map((x) => x.status).join(' ')}`);
+  t.ok(!eng.out.slice(before).includes('"cut"'), 'no cut reported for any real site');
+
+  eng.stop(); server.close(); censor.close();
+  console.log(`engine-cut: ${t.count} passed`);
+  process.exit(0);
+})().catch((e) => { console.error('FAIL', e.message); process.exit(1); });

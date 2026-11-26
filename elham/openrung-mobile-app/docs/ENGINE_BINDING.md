@@ -1,0 +1,272 @@
+# ADR-003 B1: engine lifecycle binding
+
+B1 introduced the lifecycle binding; B2 now pins connectcore v0.15.0 (with brokerapi v0.11.0) and uses
+its mobile host API as Android's sole orchestrator. B3 uses that API on iOS,
+as documented in [IOS_ENGINE_CUTOVER.md](IOS_ENGINE_CUTOVER.md). The original B1 APIs and measurements below are retained
+for compatibility and historical evidence. The current Android constructor,
+parity checks and device gates are documented in [ANDROID_ENGINE_CUTOVER.md](ANDROID_ENGINE_CUTOVER.md).
+There is no runtime engine selector.
+
+## Native API
+
+Call `Libbox.setup` / `LibboxSetup` with the platform's existing paths, logging,
+and memory options before starting the engine. Construct inside the authorized
+VpnService or PacketTunnel owner:
+
+- `NewOpenRungEngineForAndroid(configJSON, PlatformInterface, OpenRungWSSProtector, OpenRungEngineListener)`
+- `NewOpenRungEngineForIOS(configJSON, PlatformInterface, OpenRungEngineListener)`
+
+Both return an `OpenRungEngine` interface plus a Go error (Java exception / Swift
+throwing API). Android requires its protector; the iOS constructor refuses every
+non-iOS runtime. The in-process runtime is fixed by the constructor. Every engine
+wires an `openrungpunch` establisher, including when punching is disabled.
+Coordination uses the engine-supplied HTTP client, retaining its socket hooks;
+the UDP socket uses the same protected platform path. The bridge owns the whole
+establishment so teardown releases both QUIC and UDP resources.
+
+Configuration is a strict JSON object. Unknown fields and trailing data fail:
+
+```json
+{
+  "mode": "tun",
+  "mtu": 1400,
+  "telemetry_directory": "/platform-owned/private-directory",
+  "punch_enabled": true,
+  "punch_url": ""
+}
+```
+
+Omitted mode means `tun`; `proxy` is also supported for loopback hosts/tests.
+Omitted/zero MTU means 1400. An empty telemetry directory keeps the engine's
+in-memory outbox. The platform supplies a private directory for durable sessions.
+Empty punch URL uses the signed relay's coordinator. TLS verification remains
+enabled. The release graft (`scripts/graft-engine-binding.sh`, shared by both
+release scripts) initializes connectcore's app version from `package.json`
+before any engine goroutine runs.
+
+| Method | Contract |
+|---|---|
+| `Start(brokerURL, country, relayID)` | Dispatch connect/switch; completion is asynchronous. Relay ID takes precedence over country. Empty strings mean no target. |
+| `Disconnect()` | Request user disconnect; completion comes through the state stream. |
+| `Stop(flushBudgetMillis)` | Join teardown and terminal telemetry flush. Zero uses connectcore's default; positive values bound the flush only. Returns flush errors and incomplete libbox teardown. Reusable after successful stop. |
+| `Pause()` / `Resume()` | Suspend/resume engine monitoring, heartbeats, and recovery. The data plane remains under the OS/libbox lifecycle. |
+| `NetworkChanged(up, fingerprint, dnsServersJSON)` | Publish physical-network state plus IP-literal DNS servers (`[]` clears them). Invalid DNS input changes neither DNS nor epoch state. |
+| `StateJSON()` | Current connectcore state snapshot. |
+| `TeardownComplete()` | Whether the in-process runtime has released its active service, independently of telemetry flush failure. |
+
+Whole lifecycle mutations are serialized. Native callers should use an IO queue.
+Publish the current physical DNS servers with `NetworkChanged` before the first
+Android `Start`; protected name resolution requires that platform observation.
+The engine owns one durable outbox lock for its process lifetime; `Stop` does not
+close that outbox. Keep one engine per process and use stable, delegating platform
+hooks that forward to the current OS owner across a VpnService recreation. Do not
+construct competing engines over the same outbox file. Platform adapter work must
+cover this ownership explicitly in B2/B3.
+
+## Callback and runtime lifetime
+
+`OpenRungEngineListener.OnEvent(string)` receives an envelope with `version: 1`,
+an increasing `sequence`, `kind` (`state`, `notice`, or `log`), and `payload`.
+Payload fields use connectcore's Go JSON names: for example state `Status`,
+`RelayLabel`, `LastError`, `Recents`, and notice `Kind`, `RelayID`, `FrontID`.
+The native adapter translates these into its existing RN state model.
+
+Callbacks run synchronously on Go goroutines and are serialized in sequence
+order. They must promptly enqueue onto the platform queue and return. Never call
+the engine inline from a callback: state delivery can hold the engine's lock.
+Keep the listener alive and make the platform queue discard events from replaced
+OS owners. Log callbacks carry diagnostic text, not telemetry payloads.
+
+Each runtime attempt has a fresh libbox `CommandServer` service and exit channel.
+The Go adapter subscribes to service status before launch, passes the engine's
+generated configuration bytes directly to `StartOrReloadService`, and forwards
+fatal/unexpected stop/reload events. It does not start a gRPC listener. Startup
+returns at launch; connectcore's probes retain readiness ownership. Failed starts
+close any partially created instance, including libbox's FATAL state, where
+`CloseService` itself refuses cleanup. If `Box.Start` already closed the failed
+instance, the adapter accepts `os.ErrClosed` as completed teardown and preserves
+the startup error. Other close failures still keep the runtime unavailable.
+
+Each `Done` reports once and closes. Stop waits for actual cleanup. An in-process
+Go call cannot be forcibly killed safely: a blocked native startup or close can
+exceed the stop grace. The binding then reports incomplete teardown and refuses
+a second service until cleanup finishes; a failed close keeps the runtime
+unavailable. The platform must retain its TUN owner until cleanup completes or
+terminate the process through its OS lifecycle. A process crash/jetsam cannot
+deliver an in-process callback. Real-device cancellation remains a B2/B3 gate.
+
+## A4 vectors and test instrumentation
+
+```sh
+cd android/punchbridge
+go test -race ./...
+cd ../..
+python3 scripts/test-engine-vectors.py -race -v
+```
+
+The latter is part of native binding CI. It runs all seven vendored A4 scenarios
+through `newOpenRungEngine`, the public lifecycle methods, serialized callback
+JSON, the binding's actual `TunnelRuntime`, and a local telemetry collector.
+Only the libbox service/network outcomes are simulated. Whole projected status,
+notice, and telemetry streams must equal the upstream vector expectations.
+
+connectcore v0.15.0 exposes its deterministic network/probe seams only to its own
+package tests. The runner copies that exact tagged module to a temporary test
+workspace and changes only those existing identifiers' visibility. It does not
+change engine logic, modify the module cache, regenerate expectations, or ship
+test hooks in either release artifact. Kotlin runs the same seven scenarios
+through JNI and EngineEventDispatcher using `scripts/test-android-engine-vectors.py`;
+its isolated test AAR and application ID cannot be used in a release build. The script rejects a different tag or local
+replacement until the adapter is reviewed. This is engine-contract validation;
+shipping-native parity remains separately reviewed. Kotlin is local in
+`testdata/contract/pin.json`; B3 also runs Swift through an isolated generated
+framework with `python3 scripts/test-ios-engine-vectors.py`. Both are local suites.
+
+Both release scripts also run the concrete graft's libbox launch-failure and
+constructor tests under Go's race detector, then verify generated ABI symbols.
+The launch tests cover invalid JSON and repeated OS TUN refusals after instance
+creation, followed by a successful start and stop on the same runtime.
+Android's `EngineBindingAbiTest` checks the rebuilt AAR signatures without loading
+Android native code in the host JVM. The Apple link smoke calls both constructors
+and references every lifecycle method against the device and simulator archives.
+
+## Memory evidence — 2026-09-05
+
+Go 1.26.4, macOS arm64, app 0.3.8, connectcore v0.5.0. After GC, 1,000 retained
+idle engines added 974,448 / 982,648 / 985,104 bytes of Go heap in three samples:
+approximately **974–985 bytes per engine**, with **zero additional goroutines**.
+Run without the race detector:
+
+```sh
+cd android/punchbridge
+go test -run TestOpenRungEngineLoadedMemory -count=3 -v
+```
+
+The actual generated iOS simulator framework was also measured in three fresh
+processes on iPhone 17 Pro / iOS 26.5 / arm64. `LibboxGoVersion` warms the existing
+Go runtime before sampling `TASK_VM_INFO.phys_footprint`. The first bound idle
+engine added **98,304 / 131,072 / 131,072 bytes (96–128 KiB)**. Retaining 1,000
+native engine handles added 3,997,720 / 4,210,712 / 4,210,712 bytes total, including
+Objective-C/gomobile handle storage and allocator overhead. Source:
+`ios/scripts/libbox-engine-memory.m`.
+
+To reproduce, build the Apple framework, compile the measurement source with the
+same simulator clang/link flags as `libbox-broker-link-smoke.m`, then use
+`xcrun simctl spawn <booted-device> <measurement-executable>`. No engine Start,
+platform callback, tunnel, directory fetch, or telemetry session runs here.
+
+These are idle incremental measurements, not a physical-device VPN footprint or
+an iOS memory-budget pass. B3 must measure the running engine, directory cache,
+libbox, network changes, and teardown against the maintainer's agreed limit.
+
+## Resolved divergences
+
+- The pin crosses connectcore's earlier explicit UDP/443 rejection fix. Updated
+  shared config goldens now reject tunneled QUIC after every split-tunnel bypass,
+  with `no_drop: true`; probe route pins are TCP-only. This affects the existing
+  native callers of the shared config builder in B1 as well as future engines.
+- The mobile outbox delegates to A3's shared implementation. Its public API,
+  cancelable uploads, backlog migration, and durability tests remain. Shared
+  queue-policy internals are tested upstream; their two white-box duplicates were
+  removed here. The shared queue also bounds requests by encoded byte size and
+  discards individually unsendable oversized events, an A3 behavior change.
+- An in-process runtime reports a teardown deadline failure and prohibits
+  overlapping runs instead of terminating a subprocess. The native owner must
+  handle that error; B2/B3 must test the OS behavior on devices.
+
+## Validation and cutover scope
+
+Historical B1 validation: TypeScript, 25 Jest suites / 300 tests, the standalone Go race
+suite, all seven A4 scenarios under the race detector, both release builds and
+their concrete libbox race tests, both Apple ABI links, 227 Android unit tests
+against the rebuilt AAR, and 167 iOS unit tests with Thread Sanitizer.
+
+Historical B1 scope: B1 passed engine-generated configs through unchanged. v0.5.0's orchestrator
+still selects its default config/probe shapes; its engine API does not yet expose
+all inputs accepted by the separate mobile config builder. B2/B3 must wire the
+mobile DoH/split-tunnel/protected-bridge shape and platform TUN readiness before
+cutover, preserve the existing install identity/outbox migration, translate relay
+metadata into RN state, and arrange OS service recreation, data-plane pause,
+traffic accounting, and memory enforcement. B1 did not claim real-device
+VPN validation, native-parity acceptance, or completion of either cutover.
+Current platform evidence is in [ANDROID_ENGINE_CUTOVER.md](ANDROID_ENGINE_CUTOVER.md)
+and [IOS_ENGINE_CUTOVER.md](IOS_ENGINE_CUTOVER.md).
+
+Android B2 treats an incomplete runtime teardown as a process-fatal condition.
+It detaches network/event callbacks, publishes failure, stops the foreground
+service, and terminates the process so the OS closes every duplicated TUN fd.
+No subsequent command may start another run while termination is pending.
+
+## B3 mobile iOS API
+
+`NewOpenRungMobileEngineForIOS(configJSON, OpenRungMobileHost, OpenRungInstallationKey, listener)`
+uses the B2 mobile configuration and callbacks with Apple socket ownership.
+It opens the existing app-group `outbox.json`; Android continues using
+`openrung_telemetry_outbox.jsonl`. Both retain a process-lifetime outbox lock.
+No Swift outbox instance may be opened alongside the engine.
+
+The mobile iOS Pause/Resume path serializes libbox data-plane sleep/wake with
+launch and close. It explicitly wakes the pause manager before resuming engine
+monitoring: pinned libbox's `CommandServer.Wake` is a no-op on iOS. The original
+one-minute libbox auto-wake timer is retained during sleep and canceled on
+explicit wake or retirement. Native aggregate traffic is sampled once a minute
+on iOS and read again after libbox closes; Android keeps its one-second cadence.
+
+`VerifyPath` may include `failure_facts` using the existing classifier input
+schema. The binding reconstructs the typed Go error chain; Swift-localized
+error text alone does not lose a timeout/DNS/TLS/errno classification. This is
+additive; the Kotlin callback envelope remains compatible.
+
+## Installation key (ADR-006)
+
+connectcore (since v0.7.0) requires `MobileHost.Key`: the installation's P-256 identity
+key, from which the broker derives a stable user ID and per-user relay
+credentials. Both mobile constructors take an `OpenRungInstallationKey`, a
+gomobile interface with connectcore's `InstallationKey` method set:
+`PublicKey()` returns the DER SubjectPublicKeyInfo and `Sign(digest)` the raw
+64-byte r‖s signature over an already-computed SHA-256 digest.
+
+- Android (`InstallationKey.kt`): one Android Keystore key, alias
+  `openrung_installation_key_v1`, created on first use with `DIGEST_NONE` and
+  signed through `NONEwithECDSA`; the public key is the key's X.509 encoding.
+- iOS (`PacketTunnel/InstallationKey.swift`): one keychain key in the Packet
+  Tunnel extension's default access group (only the extension runs the engine),
+  in the Secure Enclave when available, otherwise a software keychain key;
+  `AfterFirstUnlockThisDeviceOnly`. Signing uses
+  `ecdsaSignatureDigestX962SHA256`; the X9.63 point is wrapped in the P-256
+  SPKI prefix. The key is deliberately not in a shared keychain access group:
+  neither target declares `keychain-access-groups`, so the app process cannot
+  sign with it, and nothing in the app needs to today. If an app-side broker
+  call (`OpenRungBroker`) ever requires user authentication, the key must move
+  to a shared access group on both targets, and existing installs need a
+  one-time migration of the extension's key into that group, or they enroll
+  as new users.
+- Both platforms convert the DER signature to r‖s natively. A load error other
+  than "not found" never creates a replacement key, because a new key is a new
+  user. `testdata/installation-key-vectors.json` pins the conversion: the Go
+  suite verifies every vector with `brokerapi.VerifyUserAuth` and
+  `SignUserAuthWith`, and the Kotlin and Swift suites map each DER signature
+  and point onto the same bytes.
+- Key failures degrade, never crash: native errors return through gomobile,
+  connectcore logs the reason and connects with the public relay list. A host
+  that lends no key gets a stand-in that always reports "unavailable".
+- A broker refusal of the installation (HTTP 403) arrives as connectcore's
+  `access_denied` notice. The binding's state sink then marks the following
+  FAILED state with `ErrorCode: "access_denied"`, which the hosts expose as
+  `lastErrorCode` (CONTRACT §3) so TypeScript can show a translated message.
+- A broker refusal to enroll a new installation from a hosting/datacenter
+  network (HTTP 403 `datacenter_source`) arrives as connectcore's
+  `enrollment_refused` notice. It is not terminal: the engine continues on the
+  public relay list. The sink keeps it across that attempt's CONNECTING states
+  and, if the attempt ends FAILED, marks that state with
+  `ErrorCode: "enrollment_refused"` (an `access_denied` in the same attempt
+  wins); any other state clears it.
+- A relay list fetch that fails the way a wrong device clock makes it fail (a
+  signed list already expired, or a broker certificate outside its validity
+  period) arrives as connectcore's `clock_skew` notice (connectcore 0.15.0),
+  directly before FAILED. The sink marks that state with `ErrorCode: "clock_skew"` so
+  TypeScript can ask the user to correct the date and time.
+- The app stores nothing else for this: the user ID and access token stay in
+  the engine (the mobile host has no `UserIDPersistence`), and neither key
+  material nor tokens are logged. The telemetry install ID is unrelated.
+

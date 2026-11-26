@@ -1,0 +1,85 @@
+package me.codeshare.shroudly
+
+import java.security.MessageDigest
+
+/*
+ * The rules of the APK's own updates (ApkUpdates, in the APK from GitHub
+ * only; the copy from Google Play is updated by Play alone): when a new
+ * version found in the background is said in a notification, where its APK
+ * is fetched from, and whether a file fetched is one to install.
+ */
+object ApkUpdatePolicy {
+    /* The largest APK taken (it is about 30 MB). */
+    const val MAX_APK = 200L * 1024 * 1024
+    private const val REDIRECTS = 5
+
+    /* A notification for `version`, found in the background: once a
+     * version, and only while notifications are allowed (one not shown is
+     * not counted as said). */
+    fun notifyFor(version: String?, notified: String?, notificationsOn: Boolean): Boolean =
+        version != null && notificationsOn && version != notified
+
+    /* Where the APK is fetched from, in order: the release's own file on
+     * GitHub, then the same file from Shroudly's download server, which
+     * passes the latest release's files through from GitHub where its
+     * addresses are blocked (server/stats, as the desktop's updater uses
+     * it). A link from anywhere else is not followed. */
+    fun sources(url: String?, version: String, variant: String = BuildConfig.APK_VARIANT): List<String> {
+        val mirror = "https://${OnlineHttp.HOST}${Versions.mirrorApkPath(version, variant)}"
+        val own = url?.takeIf { it.startsWith(Versions.DOWNLOADS) || it.startsWith("https://${OnlineHttp.HOST}/dl/") }
+        return listOfNotNull(own, mirror).distinct()
+    }
+
+    /* One try at fetching the APK: from `url`, through the engine or
+     * directly (Proxy.NO_PROXY; Shroudly's own connections are outside its
+     * VPN), and in which round (0 the first). */
+    data class Attempt(val url: String, val throughEngine: Boolean, val round: Int)
+
+    /* Every try at fetching the APK, in order, until one gives it.
+     *
+     * Protection off (no engine): each source once, directly, as it always
+     * was.
+     *
+     * Protection on: each source through the engine, as it always was; then,
+     * only if every one of them failed, each through the engine once more;
+     * then, only if those failed too, each directly. On a network that drops
+     * a blocked connection silently, the engine's first connection to a
+     * server can take longer than the 15 s an update waits for an answer
+     * (UpdateCheck.getViaEngine), while it goes down its ladder of
+     * techniques; it remembers the one that worked, so the next connection
+     * to the same server goes through at once. One try per source gave up
+     * right there: "github.com did not give it (Read timed out)", the same
+     * for Shroudly's download server, and the update was never fetched. The
+     * direct round is for a network where the engine itself is in the way
+     * and the servers are not blocked at all. */
+    fun attempts(sources: List<String>, throughEngine: Boolean): List<Attempt> =
+        if (!throughEngine) sources.map { Attempt(it, false, 0) }
+        else sources.map { Attempt(it, true, 0) } + sources.map { Attempt(it, true, 1) } + sources.map { Attempt(it, false, 2) }
+
+    /* Where a redirect goes: https only, at most REDIRECTS of them. */
+    fun redirect(from: String, location: String?, hops: Int): String? {
+        if (location.isNullOrBlank() || hops >= REDIRECTS) return null
+        val to = try { java.net.URL(java.net.URL(from), location.trim()) } catch (_: Exception) { return null }
+        return if (to.protocol == "https" && !to.host.isNullOrEmpty()) to.toString() else null
+    }
+
+    fun sha256Hex(bytes: ByteArray): String =
+        MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+
+    /* The file's signers are this app's: the same certificates (by SHA-256),
+     * none missing, none more. Nothing read on either side: not the same. */
+    fun sameSigner(installed: Collection<String>, file: Collection<String>): Boolean =
+        installed.isNotEmpty() && file.isNotEmpty() && installed.map { it.lowercase() }.toSet() == file.map { it.lowercase() }.toSet()
+
+    /* A file to hand to Android's installer: this app, a newer version of
+     * it, signed as it is. sameVersion: the full APK in place of the lite
+     * one (LiteOffer), where the same version is the point. */
+    fun installable(filePackage: String?, fileCode: Long, ownPackage: String, ownCode: Long, sameSigner: Boolean, sameVersion: Boolean = false): Boolean =
+        filePackage == ownPackage && (fileCode > ownCode || (sameVersion && fileCode == ownCode)) && sameSigner
+
+    /* The full APK of `version` on GitHub (LiteOffer): the release's file. */
+    fun fullApkUrl(version: String): String {
+        val v = Versions.display(version)
+        return "${Versions.DOWNLOADS}v$v/Shroudly-$v-Android.apk"
+    }
+}

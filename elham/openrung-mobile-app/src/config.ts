@@ -1,0 +1,145 @@
+// The app version string lives in exactly ONE place — package.json — and every other
+// surface (Android versionName, iOS MARKETING_VERSION, this constant) derives from it so
+// they cannot drift. scripts/check-versions.mjs enforces this in CI.
+import { Platform } from 'react-native';
+
+import { version } from '../package.json';
+import { isDesktop, OpenRungDesktop } from './native/OpenRungDesktop';
+
+/**
+ * App configuration, ported 1:1 from the production `config/AppConfig.kt`
+ * (same constant names and values).
+ */
+export const AppConfig = {
+  /**
+   * Primary broker passed to the native brokerapi selector. Go owns the built-in candidates,
+   * custom-override policy, staggered racing, relay verification, and transport selection.
+   */
+  DEFAULT_BROKER_URL: 'https://broker.openrung.org/',
+
+  /**
+   * Relay fetch used to populate the exit-node map directory. This is the broker's maximum
+   * allowed page size — the broker rejects anything larger with HTTP 400 — so it captures the
+   * full set of currently-advertised relays.
+   */
+  DIRECTORY_RELAY_LIMIT: 20,
+
+  /**
+   * Public source repository. Surfaced in the in-app open-source licenses screen and used as the
+   * GPL-3.0 corresponding-source offer for the (GPL-licensed) app.
+   */
+  SOURCE_URL: 'https://github.com/openrung/openrung-mobile-app',
+
+  /** The same offer for the desktop client, whose build lives in the main repository. */
+  DESKTOP_SOURCE_URL: 'https://github.com/openrung/openrung',
+
+  /** Public policy covering app and network data handling. */
+  PRIVACY_URL: 'https://www.openrung.org/privacy',
+
+  /**
+   * Every.org donation page for the OpenRung Foundation, opened in the system browser from the
+   * About screen's donate button. The `code` query param attributes donations to the mobile app.
+   */
+  DONATE_URL: 'https://www.every.org/openrung-foundation?code=af922628#/donate',
+
+  /**
+   * External speed test opened in the system browser from Settings. The row is enabled only
+   * while connected, so the page measures the tunnel.
+   */
+  SPEED_TEST_URL: 'https://fast.com',
+
+  /** Public website and official social profiles shown on the About screen. */
+  WEBSITE_URL: 'https://openrung.org/',
+  GITHUB_URL: 'https://github.com/openrung',
+  X_URL: 'https://x.com/OpenRung',
+  THREADS_URL: 'https://www.threads.com/@openrung',
+  BLUESKY_URL: 'https://bsky.app/profile/openrung.bsky.social',
+  INSTAGRAM_URL: 'https://www.instagram.com/openrung',
+  TELEGRAM_URL: 'https://t.me/openrung_bot',
+
+  /**
+   * App Store page for the iOS app, shared from Settings → "Share OpenRung" (the iOS counterpart
+   * of Android's offline APK sharing) and opened by the "Update" buttons. The numeric ID is the
+   * app's Apple ID in App Store Connect; the Settings row hides itself whenever this is empty.
+   */
+  APP_STORE_URL: 'https://apps.apple.com/app/id6791778805',
+
+  /**
+   * Vector tiles + glyphs for the exit-node map. We build our own flat style around these MapLibre
+   * demo tiles rather than using the demo *style*, which colour-codes every country. An operator
+   * can point these at a self-hosted source to avoid third-party tiles.
+   */
+  MAP_TILES_URL: 'https://demotiles.maplibre.org/tiles/tiles.json',
+  MAP_GLYPHS_URL: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
+
+  /**
+   * Ordered candidates for the in-app update manifest (docs/UPDATE_MANIFEST.md), tried
+   * sequentially with a per-attempt timeout, fail-open: all-fail just means "no update UI".
+   * The CloudFront and direct broker candidates use native brokerapi. CloudFront leads because the
+   * SNI-less front stays reachable where broker.openrung.org is blocked, mirroring brokerapi's
+   * discovery order (@see brokerapi.DefaultBrokerURLs). The GitHub release asset is
+   * the narrow redirecting JavaScript-fetch exception and remains last because github.com is
+   * unreliable in several target regions.
+   * These URLs are a FOREVER CONTRACT with shipped clients: never repurpose or break them.
+   * This list MUST stay identical (same entries, same order) to `MANIFEST_CANDIDATE_URLS` in
+   * net/updateManifestClient.ts, which is the routing allowlist: an entry the router does not
+   * recognize throws inside the fail-open walk and is swallowed, silently demoting the app to the
+   * GitHub-only candidate. `npm run transport:check` and updateManifest.test.ts enforce the match.
+   */
+  UPDATE_MANIFEST_URLS: [
+    'https://d2r7mdpyevvs1m.cloudfront.net/api/v1/app-manifest',
+    'https://broker.openrung.org/api/v1/app-manifest',
+    'https://github.com/openrung/openrung-mobile-app/releases/latest/download/update-manifest.json',
+  ],
+
+  /**
+   * Where the "Update" buttons send Android users. Deliberately a pinned constant — update
+   * destinations NEVER come from the manifest, so even a validly-signed (let alone forged)
+   * manifest cannot redirect users to a hostile download. iOS uses APP_STORE_URL.
+   */
+  UPDATE_URL_ANDROID:
+    'https://github.com/openrung/openrung-mobile-app/releases/latest',
+
+  /** Where the "Update" buttons send desktop client users: the download page, pinned likewise. */
+  UPDATE_URL_DESKTOP: 'https://openrung.org/download/',
+
+  /** Minimum interval between successful update-manifest checks (cold start + app foreground). */
+  UPDATE_CHECK_INTERVAL_MS: 6 * 3_600_000,
+
+  /** Minimum interval between retries after a failed check (in-memory, per app session). */
+  UPDATE_CHECK_RETRY_MS: 15 * 60_000,
+
+  /**
+   * Pinned Ed25519 public keys for update-manifest signature verification. The manifest can
+   * hard-block app startup, so its signing key is scoped to exactly that power and remains in
+   * TypeScript even though relay verification moved into native brokerapi.
+   * The client only ever hard-blocks ("Update required") on a manifest that verifies against one
+   * of these keys; unsigned or unverifiable manifests are capped at the passive update row. MUST
+   * stay in sync with the `pinned_keys` block of testdata/update_manifest_vectors.json (CI guard
+   * in updateManifest.test.ts + scripts/update-manifest.mjs check). Rotation: keygen mode of
+   * scripts/update-manifest.mjs, pin the new key here, ship a release, then swap the secret.
+   */
+  MANIFEST_SIGNING_KEYS: [
+    {
+      keyId: 'a71d7615b7af163b', // active (seed in GitHub secret OPENRUNG_MANIFEST_SIGNING_SEED_B64)
+      publicKeyHex:
+        '3443068d4cb27dd474dee11155c365a44df6a24c560b8ae2cb019487b555bfc7',
+    },
+  ],
+} as const;
+
+/**
+ * App version reported in X-OpenRung-App-Version (production uses BuildConfig.VERSION_NAME). The
+ * desktop client is versioned by its own host, not by this package.
+ */
+export const APP_VERSION = OpenRungDesktop?.appVersion ?? version;
+
+/** Where the "Update" buttons send this build's users. Pinned: never taken from the manifest. */
+export const APP_UPDATE_URL = isDesktop
+  ? AppConfig.UPDATE_URL_DESKTOP
+  : Platform.OS === 'ios'
+    ? AppConfig.APP_STORE_URL
+    : AppConfig.UPDATE_URL_ANDROID;
+
+/** Corresponding-source location for the build that is running. */
+export const APP_SOURCE_URL = isDesktop ? AppConfig.DESKTOP_SOURCE_URL : AppConfig.SOURCE_URL;

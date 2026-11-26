@@ -1,0 +1,139 @@
+package me.codeshare.shroudly
+
+import android.app.ActivityManager
+import android.content.Context
+import android.net.ConnectivityManager
+import android.os.Build
+import android.os.PowerManager
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+/*
+ * "Share logs" (MainActivity): what we need to know when Shroudly does not
+ * work for someone, as plain text they send us themselves. Made only when
+ * they tap it; nothing is sent anywhere by the app.
+ */
+object Diagnostics {
+    /* The protection line of the report: its state, for how long, how
+     * Android runs the VPN, whether IPv6 goes through it, and whether it is
+     * holding on offline (lockdown). onForMs < 0: not on. */
+    fun protectionLine(state: String, error: String?, onForMs: Long, alwaysOn: Boolean, lockdown: Boolean, ipv6: Boolean, offline: Boolean): String {
+        val sb = StringBuilder("Protection: ").append(state)
+        if (onForMs >= 0) sb.append(" for ").append(onForMs / 60000).append(" min")
+        if (onForMs >= 0) {
+            sb.append("; always-on VPN ").append(if (alwaysOn) "yes" else "no")
+                .append(", lockdown ").append(if (lockdown) "yes" else "no")
+                .append("; IPv6 ").append(if (ipv6) "routed" else "off")
+            if (offline) sb.append("; holding on offline")
+        }
+        error?.let { sb.append("; last error: ").append(it) }
+        return sb.toString()
+    }
+
+    /* The battery state as Android and the phone's maker see it. */
+    data class Battery(
+        /* The user let the app run without battery optimization. */
+        val unrestricted: Boolean,
+        /* The user restricted its background work (Android 9+). */
+        val backgroundRestricted: Boolean,
+        val saver: Boolean,
+    ) {
+        override fun toString() =
+            "optimization ${if (unrestricted) "off for Shroudly" else "on"}, " +
+                "background ${if (backgroundRestricted) "restricted" else "allowed"}, " +
+                "battery saver ${if (saver) "on" else "off"}"
+    }
+
+    fun battery(ctx: Context): Battery {
+        val pm = ctx.getSystemService(PowerManager::class.java)
+        val am = ctx.getSystemService(ActivityManager::class.java)
+        return Battery(
+            unrestricted = try { pm?.isIgnoringBatteryOptimizations(ctx.packageName) == true } catch (_: Exception) { false },
+            backgroundRestricted = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
+                (try { am?.isBackgroundRestricted == true } catch (_: Exception) { false }),
+            saver = try { pm?.isPowerSaveMode == true } catch (_: Exception) { false },
+        )
+    }
+
+    /* Phone makers whose own battery managers end or freeze apps that Android
+     * itself lets run in the background (dontkillmyapp.com), by
+     * Build.MANUFACTURER or Build.BRAND, lower case. */
+    private val STRICT_MAKERS = setOf(
+        "xiaomi", "redmi", "poco", "huawei", "honor", "oppo", "realme", "oneplus", "vivo", "iqoo",
+        "meizu", "asus", "samsung", "tecno", "infinix", "itel", "transsion", "lenovo", "motorola",
+        "zte", "nubia", "sony", "nokia", "hmd global", "wiko", "blackview", "ulefone", "doogee",
+        "oukitel", "umidigi", "cubot",
+    )
+
+    fun strictMaker(manufacturer: String?, brand: String?): Boolean =
+        listOfNotNull(manufacturer, brand).any { it.trim().lowercase(Locale.ROOT) in STRICT_MAKERS }
+
+    /* Whether the window asks the user to let Shroudly run without battery
+     * restrictions: always when they restricted it, and on phones whose maker
+     * stops background apps on its own, until it runs unrestricted. */
+    fun batteryHint(b: Battery, manufacturer: String?, brand: String?): Boolean =
+        b.backgroundRestricted || (!b.unrestricted && strictMaker(manufacturer, brand))
+
+    const val NOTICE_AGAIN_MS = 30L * 24 * 60 * 60 * 1000
+
+    /* The battery card (MainActivity.showNotice): only once protection has
+     * been used (worked on a day, or was on when Android ended it), so the
+     * first screen of a new install is not a warning about something not yet
+     * running. "Not now" (laterAt) hides it for NOTICE_AGAIN_MS, or until
+     * Android next ends protection by itself (endedAt), which shows the
+     * warning was right. A clock set back shows it again. */
+    fun batteryDue(hint: Boolean, workedDays: Int, laterAt: Long, endedAt: Long, now: Long): Boolean =
+        hint && (workedDays > 0 || endedAt > 0) && (laterAt == 0L || endedAt > laterAt || now - laterAt !in 0 until NOTICE_AGAIN_MS)
+
+    /* Notifications turned off for Shroudly (asked for once at the first
+     * start, Android 13+; or off in Android's settings): the notices that
+     * protection stopped, or needs a tap to come back, never show. Said
+     * once protection has been used, until "Not now" for NOTICE_AGAIN_MS. */
+    fun notificationsDue(enabled: Boolean, workedDays: Int, laterAt: Long, now: Long): Boolean =
+        !enabled && workedDays > 0 && (laterAt == 0L || now - laterAt !in 0 until NOTICE_AGAIN_MS)
+
+    /* Which APK this is (build.gradle.kts, shroudly.variant). */
+    fun apkKind(variant: String): String = when (variant) {
+        "" -> "full"
+        "lite" -> "lite, without Tor"
+        else -> variant
+    }
+
+    /* Where Tor stands: whether this copy has it, the setting, the user's
+     * yes (TorAsk), what it is doing, and what it carried this session. */
+    fun torLine(bundled: Boolean, enabled: Boolean, approved: Boolean, state: String, progress: Int, carried: Long): String {
+        if (!bundled) return "not in this copy"
+        if (!enabled) return "turned off in Settings"
+        val now = if (state == "starting" && progress > 0) "starting ($progress%)" else state
+        return "on; ${if (approved) "allowed by the user" else "not allowed yet (asked when a site needs it)"}; now $now; $carried connections carried"
+    }
+
+    /* sites: false leaves the lines about sites out (Share logs' "Without
+     * site names"). */
+    fun report(ctx: Context, sites: Boolean = true): String {
+        val sb = StringBuilder()
+        val source = try { if (InstallSource.githubUpdates(ctx)) "APK from GitHub (${apkKind(BuildConfig.APK_VARIANT)})" else "Google Play" } catch (_: Exception) { "unknown source" }
+        sb.append("Shroudly ").append(BuildConfig.VERSION_NAME).append(" (").append(BuildConfig.VERSION_CODE).append(") for Android, ")
+            .append(source).append(if (BuildConfig.DEBUG) ", debug build" else "").append('\n')
+        sb.append("Android ").append(Build.VERSION.RELEASE).append(" (API ").append(Build.VERSION.SDK_INT).append("), ")
+            .append(Build.MANUFACTURER).append(' ').append(Build.MODEL).append(" (").append(Build.DEVICE).append("), ")
+            .append(Build.SUPPORTED_ABIS.joinToString(",")).append('\n')
+        sb.append("Build: ").append(Build.DISPLAY).append('\n')
+        val cm = ctx.getSystemService(ConnectivityManager::class.java)
+        sb.append("Network: ").append(if (cm != null) Net.describe(cm) else "unknown").append('\n')
+        sb.append("Battery: ").append(battery(ctx)).append('\n')
+        sb.append("Tor (the last way out): ").append(torLine(TorRoute.bundled(ctx), TorRoute.enabled(ctx), TorRoute.approved(ctx),
+            TorRoute.state, TorRoute.progress, Protection.stats?.fallback ?: 0L)).append('\n')
+        val on = Protection.state == Protection.State.ON && Protection.startedAt > 0
+        sb.append(protectionLine(Protection.state.name.lowercase(Locale.ROOT), Protection.errorDetail,
+            if (on) android.os.SystemClock.elapsedRealtime() - Protection.startedAt else -1L,
+            Protection.alwaysOn, Protection.lockdown, Protection.ipv6, Protection.troubleRes == R.string.androidLockdownOffline)).append('\n')
+        sb.append("Now: ").append(SimpleDateFormat("yyyy-MM-dd HH:mm:ss Z", Locale.ROOT).format(Date())).append('\n')
+        val lines = AppLog.snapshot(sites)
+        sb.append('\n').append("Log, last ").append(lines.size)
+            .append(if (sites) " lines (with the names of sites Shroudly handled):\n" else " lines (the lines about sites left out):\n")
+        for (l in lines) sb.append(l).append('\n')
+        return sb.toString()
+    }
+}

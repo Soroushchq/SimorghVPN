@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="vpn_notification_channel">OpenRung VPN</string>
+    <string name="vpn_notification_title">OpenRung VPN</string>
+    <string name="vpn_notification_preparing">Подготовка OpenRung VPN</string>
+    <string name="vpn_notification_connected">Подключено через %1$s</string>
+    <string name="relay_location_unknown">Неизвестное местоположение</string>
+    <string name="status_disconnected">Отключено</string>
+    <string name="status_preparing">Подготовка VPN</string>
+    <string name="status_connecting">Подключение</string>
+    <string name="status_connected">Подключено</string>
+    <string name="status_disconnecting">Отключение</string>
+    <string name="status_failed">Ошибка</string>
+    <string name="log_split_ruleset_missing">набор правил раздельного туннелирования для %1$s отсутствует; этот трафик остаётся в туннеле</string>
+    <string name="log_error_prefix">ошибка: %1$s</string>
+</resources>

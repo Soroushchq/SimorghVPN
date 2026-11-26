@@ -1,0 +1,297 @@
+{
+  "name": "shroudly",
+  "version": "2.6.90",
+  "whatsNewFor": "2.6.90",
+  "description": "Shroudly - Unseen. Unstoppable. | Cross-platform DPI bypass (self-contained engine)",
+  "main": "electron/main.js",
+  "private": true,
+  "author": {
+    "name": "Codeshare Technology Ltd",
+    "email": "contact@codeshare.me"
+  },
+  "homepage": "https://codeshare.me",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/umutxyp/Shroudly"
+  },
+  "bugs": {
+    "url": "https://github.com/umutxyp/Shroudly/issues"
+  },
+  "license": "MIT",
+  "scripts": {
+    "clean": "node scripts/clean.js",
+    "dev": "next dev",
+    "build": "next build && node scripts/fix-paths.js",
+    "build:core": "node scripts/build-core.js",
+    "build:core:all": "node scripts/build-core.js --cross",
+    "postinstall": "node scripts/build-core.js || echo \"[core] skipped (no compiler); run npm run build:core later\"",
+    "test:core": "cd core && make test",
+    "create-icon": "node scripts/create-icon.js",
+    "check:translations": "node scripts/check-translations.js && node scripts/gen-polkit.js --check",
+    "verify": "npm run build:core && npm run check:translations && npm run build",
+    "electron": "npm run build && electron .",
+    "electron:dev": "concurrently \"next dev\" \"wait-on http://localhost:3000 && electron .\"",
+    "electron:prod": "npm run verify && electron .",
+    "dist:win": "npm run verify && electron-builder --win nsis --publish never",
+    "dist:mac": "npm run verify && electron-builder --mac --publish never",
+    "dist:linux": "npm run verify && electron-builder --linux AppImage deb --publish never",
+    "dist:all": "npm run build:core:all && npm run build:core:advanced:all && npm run fetch:windivert && npm run check:translations && npm run build && electron-builder -mwl --publish never",
+    "build:core:advanced": "node scripts/build-core-advanced.js",
+    "build:core:advanced:all": "node scripts/build-core-advanced.js --cross",
+    "fetch:windivert": "node scripts/fetch-windivert.js",
+    "fetch:tor": "node scripts/fetch-tor.js",
+    "publish:release": "node scripts/publish-release.js",
+    "test:net": "node tests/net/run.js"
+  },
+  "build": {
+    "appId": "me.codeshare.shroudly",
+    "productName": "Shroudly",
+    "copyright": "Copyright © 2026 Codeshare Technology Ltd",
+    "directories": {
+      "buildResources": "public",
+      "output": "dist"
+    },
+    "files": [
+      "out/**/*",
+      "electron/**/*",
+      "locales/*.json",
+      "!electron/tools/core/**",
+      "!electron/tools/tor/**",
+      "package.json",
+      "!**/*.map",
+      "!**/*.pdb",
+      "!core/**",
+      "!**/README*",
+      "!**/CHANGELOG*",
+      "!**/*.test.*"
+    ],
+    "asarUnpack": [
+      "electron/tools/core/**"
+    ],
+    "afterPack": "scripts/after-pack.js",
+    "electronFuses": {
+      "runAsNode": false,
+      "enableNodeOptionsEnvironmentVariable": false,
+      "enableNodeCliInspectArguments": false,
+      "resetAdHocDarwinSignature": true
+    },
+    "electronLanguages": [
+      "en-US"
+    ],
+    "toolsets": {
+      "appimage": "1.0.3"
+    },
+    "win": {
+      "icon": "public/icon.ico",
+      "artifactName": "${productName}-${version}-Windows-${arch}-Setup.${ext}",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64",
+            "arm64",
+            "ia32"
+          ]
+        }
+      ],
+      "signAndEditExecutable": false,
+      "files": [
+        "electron/tools/core/win32-${arch}/**"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "installerIcon": "public/icon.ico",
+      "uninstallerIcon": "public/icon.ico",
+      "include": "scripts/installer.nsh",
+      "differentialPackage": false
+    },
+    "extraResources": [
+      {
+        "from": "public/icon.ico",
+        "to": "icon.ico"
+      },
+      {
+        "from": "public/icon.png",
+        "to": "icon.png"
+      },
+      {
+        "from": "public",
+        "to": ".",
+        "filter": [
+          "tray-on*",
+          "tray-off*"
+        ]
+      },
+      {
+        "from": "logos",
+        "to": "logos"
+      }
+    ],
+    "mac": {
+      "icon": "apple/App/AppIcon.icon",
+      "category": "public.app-category.utilities",
+      "extendInfo": {
+        "CFBundleAllowMixedLocalizations": true
+      },
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "files": [
+        "electron/tools/core/darwin-${arch}/**"
+      ],
+      "artifactName": "${productName}-${version}-macOS-${arch}.${ext}"
+    },
+    "linux": {
+      "icon": "public/icon.png",
+      "category": "Network",
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64",
+            "arm64",
+            "armv7l"
+          ]
+        },
+        {
+          "target": "deb",
+          "arch": [
+            "x64",
+            "armv7l"
+          ]
+        },
+        {
+          "target": "pacman",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "rpm",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "maintainer": "Codeshare Technology Ltd <contact@codeshare.me>",
+      "files": [
+        "electron/tools/core/linux-${arch}/**"
+      ],
+      "artifactName": "${productName}-${version}-Linux-${arch}.${ext}"
+    },
+    "deb": {
+      "depends": [
+        "libgtk-3-0",
+        "libnotify4",
+        "libnss3",
+        "libxtst6",
+        "libatspi2.0-0",
+        "libuuid1",
+        "libsecret-1-0",
+        "xdg-utils",
+        "libdrm2",
+        "libgbm1",
+        "libasound2t64 | libasound2"
+      ],
+      "recommends": [
+        "libappindicator3-1",
+        "pkexec | policykit-1"
+      ],
+      "fpm": [
+        "scripts/linux/me.codeshare.shroudly.policy=/usr/share/polkit-1/actions/me.codeshare.shroudly.policy"
+      ]
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "umutxyp",
+        "repo": "Shroudly",
+        "releaseType": "release"
+      }
+    ],
+    "dmg": {
+      "writeUpdateInfo": false
+    },
+    "pacman": {
+      "depends": [
+        "gtk3",
+        "libnotify",
+        "nss",
+        "libxtst",
+        "at-spi2-core",
+        "util-linux-libs",
+        "libsecret",
+        "xdg-utils",
+        "libdrm",
+        "mesa",
+        "alsa-lib"
+      ],
+      "fpm": [
+        "--pacman-optional-depends",
+        "polkit: lets Advanced mode ask for administrator permission",
+        "scripts/linux/me.codeshare.shroudly.policy=/usr/share/polkit-1/actions/me.codeshare.shroudly.policy"
+      ]
+    },
+    "rpm": {
+      "depends": [
+        "libgtk-3.so.0()(64bit)",
+        "libnotify.so.4()(64bit)",
+        "libnss3.so()(64bit)",
+        "libXtst.so.6()(64bit)",
+        "libatspi.so.0()(64bit)",
+        "libuuid.so.1()(64bit)",
+        "libsecret-1.so.0()(64bit)",
+        "xdg-utils",
+        "libdrm.so.2()(64bit)",
+        "libgbm.so.1()(64bit)",
+        "libasound.so.2()(64bit)"
+      ],
+      "fpm": [
+        "--rpm-tag",
+        "Recommends: polkit",
+        "scripts/linux/me.codeshare.shroudly.policy=/usr/share/polkit-1/actions/me.codeshare.shroudly.policy"
+      ]
+    }
+  },
+  "dependencies": {
+    "electron-store": "^8.1.0",
+    "electron-updater": "6.8.9"
+  },
+  "devDependencies": {
+    "autoprefixer": "^10.4.0",
+    "concurrently": "^8.2.2",
+    "electron": "43.8.1",
+    "electron-builder": "26.15.3",
+    "lucide-react": "1.47.0",
+    "next": "^16.4.5",
+    "playwright-core": "1.63.0",
+    "postcss": "^8.4.0",
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0",
+    "resedit": "3.0.2",
+    "tailwindcss": "^3.4.0",
+    "wait-on": "^7.2.0"
+  },
+  "overrides": {
+    "fast-uri": "3.1.9",
+    "js-yaml": "5.4.2"
+  }
+}

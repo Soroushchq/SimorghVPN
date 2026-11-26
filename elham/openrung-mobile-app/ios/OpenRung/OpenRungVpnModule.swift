@@ -1,0 +1,490 @@
+import Foundation
+import NetworkExtension
+import React
+import UIKit
+
+/// React Native bridge for the OpenRung VPN (contract §3). Port of the manager/state half of the
+/// production `AppViewModel`: owns the `NETunnelProviderManager` (found by localizedDescription
+/// "OpenRung VPN"), mirrors the rich connection state the PacketTunnel extension
+/// publishes via `SharedConnectionState` (re-read on a Darwin notification), watches
+/// `.NEVPNStatusDidChange`, and reports every change to JS as an `openrungStateChanged` event.
+@objc(OpenRungVpn)
+final class OpenRungVpnModule: RCTEventEmitter {
+    private static let stateChangedEvent = "openrungStateChanged"
+    /// iOS-only (contract §3): a home-screen widget tap that passed `WidgetConnectPolicy`. JS runs
+    /// the same prepare-and-connect path as the in-app button with no target country or relay.
+    private static let connectRequestedEvent = "openrungConnectRequested"
+
+    private var manager: NETunnelProviderManager?
+    private var vpnStatus: NEVPNStatus = .invalid
+    private var status: ConnectionStatus = .disconnected
+    private var sessionID: String?
+    private var relayLabel: String?
+    private var relayName: String?
+    private var relayClass: String?
+    private var lastError: String?
+    private var lastErrorCode: String?
+    private var logLines: [String] = []
+    private var recentRegions: [RecentNode] = []
+    private var hasListeners = false
+    private var vpnStatusObserver: NSObjectProtocol?
+    /// True while a trailing shared-state reload is scheduled (MainActor-confined). Each reload
+    /// decodes the full snapshot and serializes an 80-line payload across the bridge, so
+    /// notification bursts collapse into one reload ~100 ms later instead of one per line.
+    private var sharedStateReloadScheduled = false
+    /// Bumped by every explicit connect/disconnect and by a split-tunnel reapply. The reapply
+    /// dance stops the tunnel and restarts it after a 350 ms delay; it captures this value before
+    /// sleeping and aborts the restart if a newer command (e.g. the user tapping Disconnect)
+    /// arrived meanwhile — so a settings reapply never resurrects a tunnel the user just stopped.
+    private var controlEpoch = 0
+    /// Re-requests a widget reload while the app is in the foreground (where WidgetKit honours it
+    /// at once) whenever the face the widget last rendered lags the snapshot — a reload the tunnel
+    /// requested while the app was away may have been deferred.
+    private var widgetRenderCatchUp = WidgetRenderCatchUp.live()
+    private var didBecomeActiveObserver: NSObjectProtocol?
+
+    override init() {
+        super.init()
+        // What the app shows on a cold launch: a stale CONNECTED never survives, and the relay
+        // label (which could leak a prior relay) is dropped until re-resolved.
+        apply(SharedConnectionState.sanitizedForColdStart(), emit: false)
+        observeVPNStatus()
+        observeSharedState()
+        observeActivation()
+        WidgetConnectMailbox.shared.onSubmit = { [weak self] in
+            Task { @MainActor in self?.deliverWidgetConnectRequest() }
+        }
+        Task { @MainActor in
+            await self.loadExistingManager()
+        }
+    }
+
+    deinit {
+        if let vpnStatusObserver {
+            NotificationCenter.default.removeObserver(vpnStatusObserver)
+        }
+        if let didBecomeActiveObserver {
+            NotificationCenter.default.removeObserver(didBecomeActiveObserver)
+        }
+        CFNotificationCenterRemoveEveryObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            Unmanaged.passUnretained(self).toOpaque()
+        )
+    }
+
+    // MARK: - RCTEventEmitter
+
+    override static func requiresMainQueueSetup() -> Bool { true }
+
+    override func supportedEvents() -> [String]! { [Self.stateChangedEvent, Self.connectRequestedEvent] }
+
+    override func startObserving() {
+        hasListeners = true
+        // Sync JS with the current snapshot as soon as it subscribes, then hand over a widget tap
+        // that arrived before JS was listening (a cold launch from the widget).
+        Task { @MainActor in
+            self.emitStateChanged()
+            self.deliverWidgetConnectRequest()
+        }
+    }
+
+    override func stopObserving() {
+        hasListeners = false
+    }
+
+    // MARK: - Bridged methods (contract §3)
+
+    /// iOS half of `prepare()`: load-or-create the `NETunnelProviderManager` and save it (saving a
+    /// freshly created configuration is what triggers the OS VPN-consent dialog). Resolves true
+    /// when usable; false on the simulator, where NetworkExtension is unavailable by design.
+    @objc(prepare:rejecter:)
+    func prepare(_ resolve: @escaping RCTPromiseResolveBlock, rejecter reject: @escaping RCTPromiseRejectBlock) {
+        Task { @MainActor in
+            guard Self.canUseNetworkExtension else {
+                resolve(false)
+                return
+            }
+            do {
+                let manager = try await VpnProfile.loadOrCreate()
+                if manager.protocolConfiguration == nil {
+                    try await VpnProfile.configure(manager: manager, brokerURL: AppConfig.defaultBrokerURL, targetCountry: nil)
+                }
+                self.manager = manager
+                self.publishWidgetBackgroundConnect()
+                self.refreshVPNStatus()
+                resolve(true)
+            } catch {
+                reject("prepare_failed", AppError.message(for: error), error)
+            }
+        }
+    }
+
+    /// Start (or switch) the tunnel. Mirrors `AppViewModel.connect(countryCode:)` including the
+    /// production relay-switch dance: stop → 350 ms → reconfigure → start.
+    @objc(connect:targetCountry:targetRelayId:resolver:rejecter:)
+    func connect(
+        _ brokerUrl: String,
+        targetCountry: String?,
+        targetRelayId: String?,
+        resolver resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+        Task { @MainActor in
+            self.controlEpoch += 1
+            let normalizedCountry = Self.normalizedCountryCode(targetCountry)
+            let normalizedRelayID = targetRelayId?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let shouldSwitchRelay = self.status.isConnected || self.status.isWorking
+            do {
+                guard Self.canUseNetworkExtension else {
+                    throw AppError.networkExtensionUnavailableInSimulator
+                }
+                let brokerURL = URL(string: brokerUrl) ?? AppConfig.defaultBrokerURL
+                let manager = try await VpnProfile.loadOrCreate()
+                if shouldSwitchRelay {
+                    manager.connection.stopVPNTunnel()
+                    self.refreshVPNStatus()
+                    try? await Task.sleep(nanoseconds: 350_000_000)
+                }
+                try await VpnProfile.configure(
+                    manager: manager,
+                    brokerURL: brokerURL,
+                    targetCountry: normalizedCountry,
+                    targetRelayID: normalizedRelayID?.isEmpty == false ? normalizedRelayID : nil
+                )
+                try manager.connection.startVPNTunnel()
+                self.manager = manager
+                self.publishWidgetBackgroundConnect()
+                self.refreshVPNStatus()
+                resolve(nil)
+            } catch {
+                let message = AppError.message(for: error)
+                self.lastError = message
+                self.lastErrorCode = nil
+                self.status = .failed
+                // Relay identity never survives a failure (contract: relayClass/relayName are
+                // null whenever not CONNECTED), matching SharedConnectionState.fail().
+                self.relayLabel = nil
+                self.relayName = nil
+                self.relayClass = nil
+                self.emitStateChanged()
+                reject("connect_failed", message, error)
+            }
+        }
+    }
+
+    @objc(disconnect:rejecter:)
+    func disconnect(_ resolve: @escaping RCTPromiseResolveBlock, rejecter reject: @escaping RCTPromiseRejectBlock) {
+        Task { @MainActor in
+            self.controlEpoch += 1
+            self.manager?.connection.stopVPNTunnel()
+            self.refreshVPNStatus()
+            resolve(nil)
+        }
+    }
+
+    @objc(getState:rejecter:)
+    func getState(_ resolve: @escaping RCTPromiseResolveBlock, rejecter reject: @escaping RCTPromiseRejectBlock) {
+        Task { @MainActor in
+            resolve(self.statePayload())
+        }
+    }
+
+    /// Persists the split-tunnel config JSON in the app-group defaults (contract §3). When the
+    /// payload actually changed AND both the shared and system lifecycles report a fully connected
+    /// tunnel, reapplies it with the same relay-switch dance `connect` uses (stop → 350 ms → start;
+    /// providerConfiguration already carries the last targets, so no reconfigure is needed).
+    /// Resolves after persistence + reapply dispatch — not reapply completion — matching Android's
+    /// ACTION_REAPPLY intent semantics.
+    @objc(setSplitTunnelConfig:resolver:rejecter:)
+    func setSplitTunnelConfig(
+        _ configJson: String,
+        resolver resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+        Task { @MainActor in
+            guard let defaults = UserDefaults(suiteName: AppConfig.appGroupIdentifier) else {
+                resolve(nil)
+                return
+            }
+            let stored = defaults.string(forKey: AppConfig.splitTunnelConfigDefaultsKey)
+            // Persist the raw string always, but only reapply when the EFFECTIVE config changed:
+            // a first push of a disabled config, or any change that nets to the same
+            // emitted sing-box config, must never bounce a live tunnel (contract §1). iOS ignores
+            // excluded_packages entirely (no OS-level per-app exclusion), so a packages-only change
+            // is not an effective change here.
+            // Both signatures resolve against ONE region read, so a zone change landing between
+            // them can never masquerade as a config change (and vice versa). A region change is
+            // not this comparison's business anyway: it reaches the engine through the next
+            // connect/recovery rebuild, which re-derives from scratch.
+            let region = SplitTunnelRegion.deviceRegion
+            let effectiveChanged = SplitTunnelConfig.effectiveSignature(ofRawJSON: stored, region: region)
+                != SplitTunnelConfig.effectiveSignature(ofRawJSON: configJson, region: region)
+            if stored != configJson {
+                defaults.set(configJson, forKey: AppConfig.splitTunnelConfigDefaultsKey)
+            }
+            if SplitTunnelReapplyPolicy.shouldReapply(
+                effectiveConfigChanged: effectiveChanged,
+                sharedTunnelIsConnected: self.status == .connected,
+                systemTunnelIsConnected: self.vpnStatus == .connected
+            ),
+               Self.canUseNetworkExtension,
+               let manager = self.manager {
+                self.controlEpoch += 1
+                let reapplyEpoch = self.controlEpoch
+                Task { @MainActor in
+                    manager.connection.stopVPNTunnel()
+                    self.refreshVPNStatus()
+                    try? await Task.sleep(nanoseconds: 350_000_000)
+                    // A connect/disconnect during the sleep bumps controlEpoch; if so, that command
+                    // now owns the tunnel — don't resurrect it against the user's explicit action.
+                    guard self.controlEpoch == reapplyEpoch else {
+                        self.refreshVPNStatus()
+                        return
+                    }
+                    do {
+                        try manager.connection.startVPNTunnel()
+                    } catch {
+                        self.lastError = AppError.message(for: error)
+                        self.lastErrorCode = nil
+                        self.status = .failed
+                        // Same failure semantics as the connect() catch above.
+                        self.relayLabel = nil
+                        self.relayName = nil
+                        self.relayClass = nil
+                        self.emitStateChanged()
+                        return
+                    }
+                    self.refreshVPNStatus()
+                }
+            }
+            resolve(nil)
+        }
+    }
+
+    @objc(getIdentity:rejecter:)
+    func getIdentity(_ resolve: @escaping RCTPromiseResolveBlock, rejecter reject: @escaping RCTPromiseRejectBlock) {
+        Task { @MainActor in
+            self.refreshVPNStatus(emit: false)
+            resolve([
+                "clientId": ClientIdentity.getOrCreate(),
+                "sessionId": self.sessionID ?? NSNull(),
+            ] as [String: Any])
+        }
+    }
+
+    // MARK: - Manager plumbing (port of AppViewModel)
+
+    @MainActor
+    private func loadExistingManager() async {
+        // Every exit re-offers a pending widget request; only a SUCCESSFUL load lets it through
+        // (deliverWidgetConnectRequest requires a manager), so a failed load or the simulator
+        // drops it instead of reading the placeholder `.invalid` status as "down".
+        defer { deliverWidgetConnectRequest() }
+        guard Self.canUseNetworkExtension else { return }
+        do {
+            manager = try await VpnProfile.loadOrCreate()
+            publishWidgetBackgroundConnect()
+            // `manager` is set before this refresh, so the stale-tunnel marker (which requires a
+            // loaded manager) is published on this very launch if the extension died earlier.
+            refreshVPNStatus()
+        } catch {
+            lastError = AppError.message(for: error)
+            lastErrorCode = nil
+            emitStateChanged()
+        }
+    }
+
+    /// Tells the widget whether its Connect can run without opening the app: only once a saved
+    /// profile exists, since saving the first one needs the app in front for the consent dialog.
+    /// Called wherever the profile was just read from or written to the OS.
+    @MainActor
+    private func publishWidgetBackgroundConnect() {
+        WidgetBackgroundConnect.shared.publish(available: manager?.protocolConfiguration != nil)
+    }
+
+    // MARK: - State observation
+
+    private func observeVPNStatus() {
+        vpnStatusObserver = NotificationCenter.default.addObserver(
+            forName: .NEVPNStatusDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.refreshVPNStatus() }
+        }
+    }
+
+    /// Back in the foreground: a widget reload deferred while the app was away is free now, so
+    /// forget the per-face dedupe and re-check the widget against the snapshot.
+    private func observeActivation() {
+        didBecomeActiveObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.widgetRenderCatchUp.resetForActivation()
+                self?.refreshVPNStatus(emit: false)
+            }
+        }
+    }
+
+    private func observeSharedState() {
+        let observer = Unmanaged.passUnretained(self).toOpaque()
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            observer,
+            { _, observer, _, _, _ in
+                guard let observer else { return }
+                let module = Unmanaged<OpenRungVpnModule>.fromOpaque(observer).takeUnretainedValue()
+                Task { @MainActor in module.scheduleSharedStateReload() }
+            },
+            AppConfig.darwinNotificationName as CFString,
+            nil,
+            .deliverImmediately
+        )
+    }
+
+    @MainActor
+    private func scheduleSharedStateReload() {
+        guard !sharedStateReloadScheduled else { return }
+        sharedStateReloadScheduled = true
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            self.sharedStateReloadScheduled = false
+            self.reloadSharedState()
+        }
+    }
+
+    @MainActor
+    private func reloadSharedState() {
+        // A delayed Darwin notification must not restore a crashed tunnel's identity.
+        refreshVPNStatus()
+    }
+
+    @MainActor
+    private func refreshVPNStatus(emit: Bool = true) {
+        vpnStatus = manager?.connection.status ?? .invalid
+        let systemTunnelIsDown = vpnStatus == .disconnected || vpnStatus == .invalid
+        var snapshot = SharedConnectionState.snapshot()
+        // The widget cannot ask the OS, so when a loaded manager says the tunnel is down while the
+        // tunnel-written snapshot still claims it is live (the extension was killed), publish that
+        // under the widget's own key. Before a manager exists `vpnStatus` is only a placeholder,
+        // so nothing is published then. The snapshot itself is never written from here; the next
+        // tunnel write clears the marker (WidgetReloadGate).
+        if manager != nil {
+            WidgetStaleTunnelMarker.shared.publish(
+                systemTunnelIsDown: systemTunnelIsDown,
+                snapshotFace: WidgetFace(statusRawValue: snapshot.status.rawValue)
+            )
+        }
+        snapshot.reconcileSystemTunnel(isDown: systemTunnelIsDown)
+        apply(snapshot, emit: emit)
+        // Only while in front: there a reload is free and immediate; from the background it would
+        // just join the budgeted queue the tunnel's own request is already in.
+        if UIApplication.shared.applicationState == .active {
+            widgetRenderCatchUp.publish(currentFace: WidgetSharedState.currentFace())
+        }
+    }
+
+    private func apply(_ snapshot: ConnectionStateSnapshot, emit: Bool = true) {
+        status = snapshot.status
+        sessionID = snapshot.sessionID
+        relayLabel = snapshot.relayLabel
+        relayName = snapshot.relayName
+        relayClass = snapshot.relayClass
+        lastError = snapshot.lastError
+        lastErrorCode = snapshot.lastErrorCode
+        logLines = snapshot.logLines
+        recentRegions = snapshot.recentRegions
+        if emit {
+            emitStateChanged()
+        }
+    }
+
+    // MARK: - Widget handoff
+
+    /// Collects the pending widget request and forwards it only when neither the shared snapshot
+    /// nor the OS reports a tunnel in motion. A request that fails the policy is consumed, not
+    /// retried: the user sees the live state in the app that just opened.
+    ///
+    /// Ordering: the request stays in the mailbox until BOTH JavaScript is listening (so the event
+    /// can be received) AND a tunnel manager has been loaded (so `vpnStatus` is the OS's answer,
+    /// not the `.invalid` placeholder that would read as "down" and let a country-pinned tunnel be
+    /// replaced). A failed load, or the simulator, never satisfies the second condition, so the
+    /// request simply expires. Each of those events calls this again, and the mailbox's 30 s
+    /// freshness bounds how long an early tap may wait.
+    @MainActor
+    private func deliverWidgetConnectRequest() {
+        guard hasListeners, manager != nil, let request = WidgetConnectMailbox.shared.collect() else { return }
+        refreshVPNStatus(emit: false)
+        let decision = WidgetConnectPolicy.decide(
+            sharedStatus: status,
+            systemTunnel: WidgetConnectPolicy.SystemTunnel(vpnStatus)
+        )
+        guard decision == .start else { return }
+        sendEvent(withName: Self.connectRequestedEvent, body: ["source": request.source.rawValue])
+    }
+
+    // MARK: - Event emission
+
+    private func emitStateChanged() {
+        guard hasListeners else { return }
+        sendEvent(withName: Self.stateChangedEvent, body: statePayload())
+    }
+
+    /// Maps the mirrored `ConnectionStateSnapshot` fields to the contract §3 `NativeVpnState`.
+    private func statePayload() -> [String: Any] {
+        [
+            "status": status.rawValue,
+            "relayLabel": relayLabel ?? NSNull(),
+            "relayName": relayName ?? NSNull(),
+            "relayClass": relayClass ?? NSNull(),
+            "lastError": lastError ?? NSNull(),
+            "lastErrorCode": lastErrorCode ?? NSNull(),
+            "logLines": logLines,
+            "recents": recentRegions.map { node in
+                [
+                    "countryCode": node.countryCode,
+                    "relayId": node.relayId ?? NSNull(),
+                    "label": node.label,
+                    "relayName": node.relayName ?? NSNull(),
+                    "latitude": node.latitude,
+                    "longitude": node.longitude,
+                ] as [String: Any]
+            },
+        ]
+    }
+
+    // MARK: - Helpers
+
+    private static var canUseNetworkExtension: Bool { VpnProfile.canUseNetworkExtension }
+
+    private static func normalizedCountryCode(_ countryCode: String?) -> String? {
+        guard let normalized = countryCode?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased(),
+              normalized.isEmpty == false
+        else {
+            return nil
+        }
+        return normalized
+    }
+}
+
+enum AppError: LocalizedError {
+    case networkExtensionUnavailableInSimulator
+
+    var errorDescription: String? {
+        switch self {
+        case .networkExtensionUnavailableInSimulator:
+            return "The iOS simulator cannot install or start a Packet Tunnel VPN profile. Run on a signed physical iPhone with the Network Extension packet-tunnel entitlement to test Connect."
+        }
+    }
+
+    static func message(for error: Error) -> String {
+        let nsError = error as NSError
+        if nsError.domain == "NEConfigurationErrorDomain", nsError.code == 11 {
+            return "Network Extension preferences are unavailable. On the simulator this is expected; on a real iPhone, confirm the app and Packet Tunnel extension are signed with the packet-tunnel entitlement and matching App Group."
+        }
+        return (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+    }
+}

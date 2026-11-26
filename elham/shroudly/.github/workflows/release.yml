@@ -1,0 +1,724 @@
+name: Build & Release
+
+# Push a tag like v2.3.0 to build every platform on its own native runner and
+# publish a GitHub release. Windows installers are code-signed through SignPath
+# when signing is enabled (repository variables ENABLE_SIGNPATH = true,
+# SIGNPATH_ORGANIZATION_ID and SIGNPATH_POLICY_SLUG, secret SIGNPATH_API_TOKEN);
+# otherwise they ship unsigned, exactly as the local builds do today.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      signing_policy:
+        description: 'SignPath policy for this run (test-signing to try signing; a manual run never publishes)'
+        type: choice
+        options: [none, test-signing, release-signing]
+        default: none
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: win
+          - os: macos-latest
+            platform: mac
+          - os: ubuntu-latest
+            platform: linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+
+      # zig cross-compiles the C engine for every OS/arch (scripts find `zig`
+      # on PATH first). Same toolchain family used for local builds.
+      - name: Install zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'linux'
+        # rpm: rpmbuild, for the .rpm. libarchive-tools: bsdtar, which fpm shells out to for the
+        # .pacman and which the runner image does not carry.
+        run: sudo apt-get update && sudo apt-get install -y rpm libarchive-tools xz-utils
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build engine (all arches)
+        run: node scripts/build-core.js --cross
+
+      # With zig, as the engine above: zig compiles in its version info
+      # (scripts/core-version-info.js), and a failed build fails the job.
+      - name: Build advanced engine + fetch WinDivert (Windows)
+        if: matrix.platform == 'win'
+        run: |
+          node scripts/build-core-advanced.js --target win32-x64
+          npm run fetch:windivert
+
+      - name: Build advanced engine (Linux x64 and arm64, against glibc 2.28)
+        if: matrix.platform == 'linux'
+        run: |
+          bash scripts/ci-linux-advanced.sh amd64
+          bash scripts/ci-linux-advanced.sh arm64
+          bash scripts/ci-check-glibc.sh
+
+      - name: Build web UI
+        run: npm run build
+
+      - name: Package (Windows)
+        if: matrix.platform == 'win'
+        run: npx electron-builder --win --publish never
+
+      # Windows 7, 8 and 8.1: the same app on Electron 22, the last that runs
+      # there (electron-builder-legacy.js), with Windows' Universal C runtime
+      # beside the engine (fetch-ucrt.js; after the Windows 10 build, which
+      # does not carry it). One installer for 32- and 64-bit, and its own
+      # update feed (legacy.yml).
+      - name: Package (Windows 7 and 8)
+        if: matrix.platform == 'win'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/fetch-ucrt.js
+          npx electron-builder --win --publish never -c electron-builder-legacy.js
+          cp dist-legacy/*-Windows7-8-Setup.exe dist-legacy/legacy.yml dist/
+
+      # Signed with the Developer ID and notarized by Apple once those secrets
+      # are set (apple/APP_STORE.md, step 6): no "unidentified developer" on
+      # the first start. Until then ad-hoc signed, as before.
+      - name: Package (macOS)
+        if: matrix.platform == 'mac'
+        env:
+          MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "$MAC_CERT_P12" ] && [ -n "$ASC_KEY_ID" ] && [ -n "$ASC_ISSUER_ID" ] && [ -n "$ASC_KEY_P8" ]; then
+            printf '%s' "$ASC_KEY_P8" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+            CSC_LINK="$MAC_CERT_P12" CSC_KEY_PASSWORD="$MAC_CERT_PASSWORD" \
+            APPLE_API_KEY="$RUNNER_TEMP/AuthKey.p8" APPLE_API_KEY_ID="$ASC_KEY_ID" APPLE_API_ISSUER="$ASC_ISSUER_ID" \
+              npx electron-builder --mac --publish never -c.mac.hardenedRuntime=true -c.mac.notarize=true
+            rm -f "$RUNNER_TEMP/AuthKey.p8"
+          else
+            echo "Developer ID secrets not set: ad-hoc signed, not notarized"
+            CSC_IDENTITY_AUTO_DISCOVERY=false npx electron-builder --mac --publish never
+          fi
+
+      - name: Package (Linux)
+        if: matrix.platform == 'linux'
+        run: npx electron-builder --linux --publish never   # targets/arches from package.json
+
+      - name: Collect artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.platform }}
+          retention-days: 3
+          if-no-files-found: error
+          path: |
+            dist/*.exe
+            dist/*.dmg
+            dist/*.zip
+            dist/*.AppImage
+            dist/*.deb
+            dist/*.pacman
+            dist/*.rpm
+            dist/latest*.yml
+            dist/legacy.yml
+
+  # ── Windows code signing via SignPath (off unless enabled) ───────────────
+  # A job of its own, after the build: a release-signing request waits for
+  # the maintainer to approve it in SignPath (required for SignPath
+  # Foundation certificates), which can take a while, and must neither hold
+  # the build up nor fail it by running out of time. The unsigned installers
+  # go up as a GitHub artifact, SignPath signs them (the project's default
+  # artifact configuration: a zip of Shroudly-*-Windows-*-Setup.exe,
+  # Authenticode, product name and version enforced) and hands them back;
+  # latest.yml is rewritten for the signed bytes so auto-update still
+  # verifies, and dist-win is replaced by the signed set, which is what the
+  # install test and the release then use. A manual run can pick
+  # test-signing to try the whole path without publishing: only a tag
+  # publishes.
+  sign-windows:
+    needs: build
+    if: ${{ (inputs.signing_policy && inputs.signing_policy != 'none') || vars.ENABLE_SIGNPATH == 'true' }}
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      # A manual run's choice, else release-signing once ENABLE_SIGNPATH is on.
+      SIGN_POLICY: ${{ (inputs.signing_policy != 'none' && inputs.signing_policy) || (vars.ENABLE_SIGNPATH == 'true' && vars.SIGNPATH_POLICY_SLUG) || '' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist-win
+          path: dist
+
+      - name: Stage the Windows installers for signing
+        id: unsigned
+        uses: actions/upload-artifact@v7
+        with:
+          name: unsigned-win
+          retention-days: 1
+          if-no-files-found: error
+          # The two published installers; the universal one electron-builder
+          # also makes is never published (scripts/publish-release.js).
+          path: dist/Shroudly-*-Windows-*-Setup.exe
+
+      # The artifact configuration enforces the installers' product name and
+      # version (SignPath Foundation terms): the version comes from here.
+      - name: Version for the signing request
+        id: appver
+        shell: bash
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Sign the Windows installers (SignPath)
+        uses: signpath/github-action-submit-signing-request@v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: Shroudly
+          signing-policy-slug: ${{ env.SIGN_POLICY }}
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          # A release-signing request waits for a person to approve it in
+          # SignPath: up to almost six hours, the most a job may run.
+          wait-for-completion-timeout-in-seconds: 21000
+          output-artifact-directory: dist/signed
+          parameters: |
+            version: "${{ steps.appver.outputs.version }}"
+
+      - name: Put the signed installers in place
+        shell: pwsh
+        run: |
+          $signed = @(Get-ChildItem dist/signed -Recurse -File -Filter '*-Setup.exe')
+          $built = @(Get-ChildItem dist -File -Filter 'Shroudly-*-Windows-*-Setup.exe')
+          if ($signed.Count -ne $built.Count -or $built.Count -eq 0) { throw "expected $($built.Count) signed installers, got $($signed.Count)" }
+          foreach ($f in $signed) {
+            $sig = Get-AuthenticodeSignature $f.FullName
+            if (-not $sig.SignerCertificate) { throw "$($f.Name) came back without a signature" }
+            # The test certificate is not trusted by Windows; the release one is.
+            if ($env:SIGN_POLICY -eq 'release-signing' -and $sig.Status -ne 'Valid') { throw "$($f.Name): signature $($sig.Status)" }
+            "$($f.Name): $($sig.SignerCertificate.Subject) [$($sig.Status)]"
+            Move-Item $f.FullName (Join-Path dist $f.Name) -Force
+          }
+          Remove-Item dist/signed -Recurse -Force
+
+      - name: Recompute Windows update metadata after signing
+        run: node scripts/recompute-win-latest.js
+
+      - name: Replace the Windows artifacts with the signed ones
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist-win
+          overwrite: true
+          retention-days: 3
+          if-no-files-found: error
+          path: |
+            dist/*.exe
+            dist/latest*.yml
+            dist/legacy.yml
+
+  # ── Install what was built, on the systems it is for, before anything is
+  # published. A package that does not install, misses a library or whose
+  # engine does not start stops the release here.
+  linux-packages:
+    needs: build
+    runs-on: ubuntu-latest
+    # Tumbleweed rolls, and its mirrors are now and then caught mid-sync: its
+    # check failing does not hold the release (Fedora installs the same .rpm).
+    continue-on-error: ${{ matrix.image == 'opensuse/tumbleweed' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: 'archlinux:latest', pkg: 'dist/*.pacman' }
+          - { image: 'fedora:latest',    pkg: 'dist/*.rpm' }
+          - { image: 'opensuse/tumbleweed', pkg: 'dist/*.rpm' }
+          - { image: 'debian:stable',    pkg: 'dist/*.deb' }
+          - { image: 'ubuntu:24.04',     pkg: 'dist/*.deb' }
+          - { image: 'ubuntu:22.04',     pkg: 'dist/*.deb' }
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist-linux
+          path: dist
+      - name: Install and check (${{ matrix.image }})
+        run: sh scripts/ci-linux-package-test.sh "${{ matrix.pkg }}"
+
+  appimage:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,    file: x86_64, core: linux-x64 }
+          - { os: ubuntu-24.04-arm, file: arm64,  core: linux-arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist-linux
+          path: dist
+      # The AppImage itself, not extracted, on a fresh Ubuntu 24.04 with FUSE 3
+      # and no libfuse2: an AppImage on the old FUSE 2 runtime does not start
+      # there at all, and the extraction below needs no FUSE to hide that.
+      - name: Start the ${{ matrix.file }} AppImage on Ubuntu 24.04 without libfuse2
+        run: |
+          docker run --rm --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined \
+            -v "$PWD:/w" -w /w ubuntu:24.04 sh scripts/ci-appimage-start-test.sh 'dist/*-Linux-${{ matrix.file }}.AppImage'
+      - name: Extract and check the ${{ matrix.file }} AppImage
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          f=$(ls *-Linux-${{ matrix.file }}.AppImage)
+          chmod +x "$f"
+          ./"$f" --appimage-extract >/dev/null
+          test -x squashfs-root/shroudly
+          eng=squashfs-root/resources/app.asar.unpacked/electron/tools/core/${{ matrix.core }}/shroudly-core
+          if ldd "$eng" | grep 'not found'; then exit 1; fi
+          out=$( (sleep 2; echo STOP) | "$eng" --listen 127.0.0.1 --port 18765 --strategy 'split(sni)' 2>&1 | head -n 1 )
+          echo "$out" | grep -q '"ready"'
+          echo "ok  $f: app present, engine starts ($out)"
+      # On a server with no display, as scripts/server/install-helper.sh sets
+      # up an AppImage: Chromium's sandbox helper owned by root, setuid, and
+      # Shroudly started with --help-others (helper-server.js).
+      - name: The ${{ matrix.file }} AppImage helping from a server, no display
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo chown root:root dist/squashfs-root/chrome-sandbox
+          sudo chmod 4755 dist/squashfs-root/chrome-sandbox
+          sh scripts/ci-helper-test.sh dist/squashfs-root/shroudly
+      # The whole server set-up on a real machine with systemd, from the .deb:
+      # its own user, the service up with Chromium's sandbox, then removed.
+      - name: Set up the server helper from the .deb, then remove it (x86_64)
+        if: matrix.file == 'x86_64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo sh scripts/server/install-helper.sh --package "$(ls dist/*-Linux-amd64.deb)"
+          systemctl is-active shroudly-helper
+          id shroudly-helper
+          sudo journalctl -u shroudly-helper -n 30 --no-pager | tee /tmp/helper.log
+          grep -q "helping people in censored countries" /tmp/helper.log
+          sudo /usr/local/sbin/shroudly-helper-install --remove
+          if id shroudly-helper 2>/dev/null || [ -e /opt/Shroudly ] || [ -e /etc/systemd/system/shroudly-helper.service ]; then
+            echo "FAIL: --remove left something"; pgrep -a -u shroudly-helper || true; ls -d /opt/Shroudly /etc/systemd/system/shroudly-helper.service 2>/dev/null || true; exit 1
+          fi
+          echo "ok  the server helper set up, running as its own user, and removed"
+
+  # 32-bit ARM Linux (armhf: Raspberry Pi OS 32-bit and the like). GitHub has
+  # no such machine, so a 32-bit ARM Debian runs under QEMU: the AppImage is
+  # unpacked there by its own runtime, its engine starts, and the .deb says
+  # armhf.
+  appimage-armv7l:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist-linux
+          path: dist
+      - name: 32-bit ARM in QEMU
+        run: docker run --privileged --rm tonistiigi/binfmt --install arm
+      - name: The armv7l AppImage and .deb on 32-bit ARM Debian
+        run: docker run --rm --platform linux/arm/v7 -v "$PWD:/w" -w /w debian:12-slim sh scripts/ci-armv7l-test.sh
+
+  windows-install:
+    # The signed installers when signing is on; the build's otherwise.
+    needs: [build, sign-windows]
+    if: ${{ !cancelled() && !failure() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, arch: x64 }
+          - { os: windows-11-arm, arch: arm64 }
+          # 32-bit Windows 10/11 (as 32-bit programs run on 64-bit Windows),
+          # and the Windows 7 and 8 installer (Electron 22).
+          - { os: windows-latest, arch: ia32 }
+          - { os: windows-latest, arch: legacy }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist-win
+          path: dist
+      - name: Install, run, uninstall (${{ matrix.arch }})
+        run: node scripts/ci-windows-install-test.js ${{ matrix.arch }}
+
+  macos-dmg:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest,   arch: arm64, lipo: arm64 }
+          - { os: macos-15-intel, arch: x64,   lipo: x86_64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist-mac
+          path: dist
+      - name: Open the ${{ matrix.arch }} disk image and check the app
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg=$(ls dist/*-macOS-${{ matrix.arch }}.dmg)
+          mnt=$(mktemp -d)
+          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$dmg" >/dev/null
+          app="$mnt/Shroudly.app"
+          test -d "$app"
+          lipo -archs "$app/Contents/MacOS/Shroudly" | grep -q ${{ matrix.lipo }}
+          eng="$app/Contents/Resources/app.asar.unpacked/electron/tools/core/darwin-${{ matrix.arch }}/shroudly-core"
+          lipo -archs "$eng" | grep -q ${{ matrix.lipo }}
+          out=$( (sleep 2; echo STOP) | "$eng" --listen 127.0.0.1 --port 18765 --strategy 'split(sni)' 2>&1 | head -n 1 )
+          echo "$out" | grep -q '"ready"'
+          # The app itself, from the disk image: its one-off restore start
+          # loads every module of the packaged app and exits (as the AppImage
+          # job does). One that cannot start could not update itself either.
+          "$app/Contents/MacOS/Shroudly" --restore-proxy > start.log 2>&1 &
+          pid=$!
+          for i in $(seq 1 120); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+          if kill -0 "$pid" 2>/dev/null; then kill "$pid"; tail -n 20 start.log; echo "the app did not exit within 2 minutes"; exit 1; fi
+          if ! wait "$pid"; then tail -n 20 start.log; echo "the app did not start and exit cleanly"; exit 1; fi
+          hdiutil detach "$mnt" >/dev/null
+          echo "ok  $dmg: ${{ matrix.lipo }} app and engine, both start"
+      # What a macOS update installs is the .zip, not the disk image. It is
+      # unpacked and its signature checked exactly as the install script does
+      # (electron/updater.js): a zip that failed that check would leave every
+      # Mac on the old version. Its SHA-512 must be the one latest-mac.yml gives.
+      - name: Unpack the ${{ matrix.arch }} update zip and check it as the updater does
+        shell: bash
+        run: |
+          set -euo pipefail
+          zip=$(ls dist/*-macOS-${{ matrix.arch }}.zip)
+          x=$(mktemp -d)
+          /usr/bin/ditto -x -k "$zip" "$x"
+          app=$(ls -d "$x"/*.app | head -n 1)
+          test -d "$app"
+          /usr/bin/codesign --verify --deep --strict "$app"
+          want=$(grep -F -A1 "url: $(basename "$zip")" dist/latest-mac.yml | sed -n 's/^ *sha512: *//p' | head -n 1)
+          have=$(openssl dgst -sha512 -binary "$zip" | base64 | tr -d '\n')
+          if [ -z "$want" ] || [ "$want" != "$have" ]; then echo "SHA-512 of $zip is $have, latest-mac.yml says '$want'"; exit 1; fi
+          echo "ok  $zip: unpacks, its signature checks out, SHA-512 as in latest-mac.yml"
+
+  # The iPhone/iPad and Mac App Store app (apple/), archived and uploaded to
+  # App Store Connect (TestFlight first; sending it for review is one click
+  # there) once the App Store Connect API key and the team are set as
+  # secrets (apple/APP_STORE.md, step 6). Until then it says so and does
+  # nothing, and the release goes ahead without it. Signing is automatic:
+  # the API key lets xcodebuild make the certificates and profiles.
+  apple:
+    # Only a release tag uploads: a manual run tries the build, never the store.
+    # A GitHub-only release (while the stores are reviewing the last one) sets
+    # the repository variable APPLE_UPLOAD to off: nothing goes to App Store
+    # Connect then. Play is never uploaded from here (a bundle by hand, below).
+    if: startsWith(github.ref, 'refs/tags/v') && vars.APPLE_UPLOAD != 'off'
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      # Apple TV only: automatic signing needs a registered Apple TV for its
+      # development profile, so tvOS is signed by hand with a distribution
+      # certificate and two tvOS App Store profiles (valid to 2027-11-03).
+      APPLE_DIST_KEY: ${{ secrets.APPLE_DIST_KEY }}
+      APPLE_DIST_CERT: ${{ secrets.APPLE_DIST_CERT }}
+      TVOS_PROFILE_APP: ${{ secrets.TVOS_PROFILE_APP }}
+      TVOS_PROFILE_TUNNEL: ${{ secrets.TVOS_PROFILE_TUNNEL }}
+    steps:
+      - name: Are the App Store Connect secrets set?
+        id: ready
+        shell: bash
+        run: |
+          if [ -n "$ASC_KEY_ID" ] && [ -n "$ASC_ISSUER_ID" ] && [ -n "$ASC_KEY_P8" ] && [ -n "$APPLE_TEAM_ID" ]; then
+            echo "ok=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "App Store Connect secrets not set: nothing uploaded (apple/APP_STORE.md, step 6)"
+          fi
+      - uses: actions/checkout@v7
+        if: steps.ready.outputs.ok == '1'
+      - uses: actions/setup-node@v7
+        if: steps.ready.outputs.ok == '1'
+        with:
+          node-version: '22'
+      - name: Engine pieces, strings and version
+        if: steps.ready.outputs.ok == '1'
+        run: |
+          node apple/scripts/fetch-hev.js
+          node apple/scripts/fetch-tor.js
+          bash apple/scripts/build-hev.sh
+          node apple/scripts/gen-strings.js --check
+          node apple/scripts/gen-version.js
+      # Each run's automatic signing gets a new development certificate from
+      # Apple; ten of them fill the account and the next archive fails. Those
+      # made during this run are revoked at the end (apple/scripts/ci-dev-certs.js).
+      - name: Development certificates before the archive
+        if: steps.ready.outputs.ok == '1'
+        shell: bash
+        run: |
+          printf '%s' "$ASC_KEY_P8" | base64 --decode > "$RUNNER_TEMP/certs.p8"
+          ASC_KEY_PATH="$RUNNER_TEMP/certs.p8" node apple/scripts/ci-dev-certs.js list > "$RUNNER_TEMP/dev-certs.tmp" \
+            && mv "$RUNNER_TEMP/dev-certs.tmp" "$RUNNER_TEMP/dev-certs-before.txt"
+          rm -f "$RUNNER_TEMP/certs.p8"
+          [ -f "$RUNNER_TEMP/dev-certs-before.txt" ] || echo "::warning::could not list development certificates: none will be revoked"
+      - name: Archive and upload (iOS, macOS, then tvOS)
+        if: steps.ready.outputs.ok == '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "$ASC_KEY_P8" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          auth=(-allowProvisioningUpdates -authenticationKeyPath "$RUNNER_TEMP/AuthKey.p8" -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID")
+          # The tvOS signing identity in a keychain of its own, removed at the end.
+          kc="$RUNNER_TEMP/tvsign.keychain-db"; kp="$(openssl rand -hex 16)"
+          security create-keychain -p "$kp" "$kc"
+          security set-keychain-settings "$kc"
+          security unlock-keychain -p "$kp" "$kc"
+          printf '%s' "$APPLE_DIST_KEY" | base64 --decode > "$RUNNER_TEMP/dist.key"
+          printf '%s' "$APPLE_DIST_CERT" | base64 --decode > "$RUNNER_TEMP/dist.cer"
+          # It does not renew itself: a release in its last 45 days says so (apple/APP_STORE.md).
+          if ! openssl x509 -inform der -in "$RUNNER_TEMP/dist.cer" -noout -checkend $((45*86400)) >/dev/null; then
+            echo "::warning title=Apple TV signing::the distribution certificate and tvOS profiles expire $(openssl x509 -inform der -in "$RUNNER_TEMP/dist.cer" -noout -enddate | cut -d= -f2); make new ones and update APPLE_DIST_KEY, APPLE_DIST_CERT, TVOS_PROFILE_APP, TVOS_PROFILE_TUNNEL"
+          fi
+          curl -fsSL -o "$RUNNER_TEMP/wwdr.cer" https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer
+          security import "$RUNNER_TEMP/dist.key" -k "$kc" -T /usr/bin/codesign -T /usr/bin/security >/dev/null
+          security import "$RUNNER_TEMP/dist.cer" -k "$kc" >/dev/null
+          security import "$RUNNER_TEMP/wwdr.cer" -k "$kc" >/dev/null || true
+          rm -f "$RUNNER_TEMP/dist.key"
+          security set-key-partition-list -S apple-tool:,apple: -k "$kp" "$kc" >/dev/null
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+          pd="$HOME/Library/MobileDevice/Provisioning Profiles"; mkdir -p "$pd"
+          printf '%s' "$TVOS_PROFILE_APP" | base64 --decode > "$pd/tvos-app.mobileprovision"
+          printf '%s' "$TVOS_PROFILE_TUNNEL" | base64 --decode > "$pd/tvos-tunnel.mobileprovision"
+          trap 'security delete-keychain "$kc" 2>/dev/null; rm -f "$RUNNER_TEMP/AuthKey.p8"' EXIT
+          for platform in iOS macOS tvOS; do
+            options=apple/Config/ExportOptions-AppStore.plist
+            [ "$platform" = tvOS ] && options=apple/Config/ExportOptions-tvOS.plist
+            xcodebuild -project apple/Shroudly.xcodeproj -scheme Shroudly -configuration Release \
+              -destination "generic/platform=$platform" -archivePath "$RUNNER_TEMP/Shroudly-$platform.xcarchive" \
+              DEVELOPMENT_TEAM="$APPLE_TEAM_ID" "${auth[@]}" archive
+            xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/Shroudly-$platform.xcarchive" \
+              -exportOptionsPlist "$options" -exportPath "$RUNNER_TEMP/export-$platform" "${auth[@]}"
+            echo "ok  $platform build uploaded to App Store Connect"
+          done
+      - name: Revoke this run's development certificates
+        if: always() && steps.ready.outputs.ok == '1'
+        shell: bash
+        run: |
+          [ -f "$RUNNER_TEMP/dev-certs-before.txt" ] || { echo "no list from before the archive: nothing revoked"; exit 0; }
+          printf '%s' "$ASC_KEY_P8" | base64 --decode > "$RUNNER_TEMP/certs.p8"
+          trap 'rm -f "$RUNNER_TEMP/certs.p8"' EXIT
+          ASC_KEY_PATH="$RUNNER_TEMP/certs.p8" node apple/scripts/ci-dev-certs.js revoke-new "$RUNNER_TEMP/dev-certs-before.txt"
+
+  # The iPhone and iPad app as an .ipa, on the release beside the others, for
+  # installing it outside the App Store until the App Store has it (TrollStore,
+  # or signed again with one's own Apple developer account). Built and checked
+  # by apple/scripts/make-ipa.sh: version, packet tunnel, arm64, entitlements.
+  ios-ipa:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - name: Build and check the .ipa
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="$(node -p "require('./package.json').version")"
+          mkdir -p dist
+          bash apple/scripts/make-ipa.sh "dist/Shroudly-$v-iOS.ipa"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-ios
+          path: dist/*.ipa
+          if-no-files-found: error
+          retention-days: 3
+
+  # The Android app, signed with the project's key (secrets ANDROID_*). The
+  # signature is checked against the key's certificate before it is handed
+  # on; without the secrets nothing is published for Android and the desktop
+  # release goes ahead. Beside it, the same version as an app bundle for
+  # Google Play (STORE_BUILD: no GitHub update check), signed with the upload
+  # key (secrets ANDROID_UPLOAD_*; the app signing key when those are not
+  # set). The bundle is kept as a workflow artifact for 90 days, never put on
+  # the release (android/PLAY_STORE.md). Both pass the 16 KB page size check.
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      NDK_VERSION: 28.2.13676358
+      # SHA-256 of the signing certificate (android/README.md).
+      CERT_SHA256: 23ac014b7226343b74c7c9c0a4fd6f1ded97518a3bfd35bcde65b6c1eca8bd76
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Gradle wrapper is the one published by Gradle
+        run: echo "7a9ce74cff467ca1bf60a4fcd9f05185acceda4d0f382434d393e17864262c5d  android/gradle/wrapper/gradle-wrapper.jar" | sha256sum -c -
+      - name: Android SDK packages
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0" "ndk;$NDK_VERSION" >/dev/null
+      - name: hev source, generated files
+        run: |
+          node android/scripts/fetch-hev.js
+          node scripts/fetch-tor.js --android
+          node android/scripts/gen-strings.js --check
+          node android/scripts/gen-block-ips.js --check
+          node android/scripts/gen-raw-apps.js --check
+          node android/scripts/gen-donate.js --check
+      - name: Signed release build (APK) and Play bundle (AAB)
+        id: apk
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          UPLOAD_KEYSTORE_B64: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_B64 }}
+          ANDROID_UPLOAD_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_PASSWORD }}
+          ANDROID_UPLOAD_KEY_ALIAS: ${{ secrets.ANDROID_UPLOAD_KEY_ALIAS }}
+          ANDROID_UPLOAD_KEY_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KEYSTORE_B64" ]; then echo "::warning::No Android signing key configured: no APK in this release"; exit 0; fi
+          ks="$RUNNER_TEMP/release.jks"
+          uks="$RUNNER_TEMP/upload.jks"
+          trap 'rm -f "$ks" "$uks"' EXIT
+          echo "$KEYSTORE_B64" | base64 -d > "$ks"
+          ver=$(node -p "require('./package.json').version")
+
+          # The APK on GitHub: the app signing key, GitHub update check.
+          (cd android && ANDROID_KEYSTORE="$ks" ./gradlew --no-daemon testDebugUnitTest assembleRelease)
+          mkdir -p dist
+          cp android/app/build/outputs/apk/release/app-release.apk "dist/Shroudly-$ver-Android.apk"
+          bt="$ANDROID_HOME/build-tools/36.0.0"
+          "$bt/apksigner" verify --print-certs "dist/Shroudly-$ver-Android.apk" | tee "$RUNNER_TEMP/certs.txt"
+          grep -qi "Signer #1 certificate SHA-256 digest: $CERT_SHA256" "$RUNNER_TEMP/certs.txt"
+          # The same app for 64-bit ARM phones only, and without Tor (issue #75):
+          # each looks for updates of its own kind (Versions.apkUrl).
+          for v in arm64 lite; do
+            (cd android && ANDROID_KEYSTORE="$ks" ./gradlew --no-daemon -Pshroudly.variant=$v assembleRelease)
+            cp android/app/build/outputs/apk/release/app-release.apk "dist/Shroudly-$ver-Android-$v.apk"
+            "$bt/apksigner" verify --print-certs "dist/Shroudly-$ver-Android-$v.apk" | grep -qi "Signer #1 certificate SHA-256 digest: $CERT_SHA256"
+          done
+          ls -la dist/*-Android*.apk
+
+          # The bundle for Google Play: same version and version code, no
+          # GitHub update check, the upload key. Play re-signs what it
+          # delivers with the app signing key above.
+          if [ -n "$UPLOAD_KEYSTORE_B64" ]; then
+            echo "$UPLOAD_KEYSTORE_B64" | base64 -d > "$uks"
+          else
+            echo "::warning::No upload key (ANDROID_UPLOAD_*): the Play bundle is signed with the app signing key"
+            cp "$ks" "$uks"
+            ANDROID_UPLOAD_KEYSTORE_PASSWORD="$ANDROID_KEYSTORE_PASSWORD"
+            ANDROID_UPLOAD_KEY_ALIAS="$ANDROID_KEY_ALIAS"
+            ANDROID_UPLOAD_KEY_PASSWORD="$ANDROID_KEY_PASSWORD"
+          fi
+          (cd android && ANDROID_UPLOAD_KEYSTORE="$uks" ./gradlew --no-daemon -Pshroudly.store=play bundleRelease)
+          mkdir -p play
+          cp android/app/build/outputs/bundle/release/app-release.aab "play/Shroudly-$ver.aab"
+          # Signed, and by which key (jarsigner's many warnings about the
+          # bundle's layout are kept out of the log).
+          jarsigner -verify "play/Shroudly-$ver.aab" > "$RUNNER_TEMP/aab.txt" 2>&1 || true
+          grep -q "jar verified" "$RUNNER_TEMP/aab.txt" || { tail -5 "$RUNNER_TEMP/aab.txt"; exit 1; }
+          keytool -printcert -jarfile "play/Shroudly-$ver.aab" | grep -i "SHA256:" | sed 's/^/Bundle signed by upload key /'
+          echo "built=1" >> "$GITHUB_OUTPUT"
+      - name: 16 KB page size (APK, and the APKs Play makes from the bundle)
+        if: steps.apk.outputs.built == '1'
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION"
+          bash android/scripts/check-16k.sh dist/*-Android*.apk play/*.aab
+      - uses: actions/upload-artifact@v7
+        if: steps.apk.outputs.built == '1'
+        with:
+          name: dist-android
+          path: dist/*-Android*.apk
+          # As long as the desktop sets: publish.yml re-publishes a run within
+          # those three days, and without the APK phones were offered nothing.
+          retention-days: 3
+          if-no-files-found: error
+      # For a Google Play upload by hand: not a dist-* set, so never on the release.
+      - uses: actions/upload-artifact@v7
+        if: steps.apk.outputs.built == '1'
+        with:
+          name: play-bundle
+          path: play/*.aab
+          retention-days: 90
+          if-no-files-found: error
+
+  release:
+    needs: [build, sign-windows, linux-packages, appimage, appimage-armv7l, windows-install, macos-dmg, android, ios-ipa]
+    runs-on: ubuntu-latest
+    # sign-windows is skipped while signing is off; anything failed stops it.
+    if: ${{ startsWith(github.ref, 'refs/tags/') && !cancelled() && !failure() }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      # The dist-* sets only: never the unsigned copies staged for SignPath.
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          path: dist-all
+      - name: Flatten into dist/
+        run: |
+          mkdir -p dist
+          find dist-all -type f -exec cp -n {} dist/ \;
+          ls -la dist
+      - name: Publish GitHub release
+        env:
+          # The workflow's built-in token publishes as github-actions[bot], which
+          # puts a bot's name on the release instead of the maintainer's. Use the
+          # maintainer's own token when it is configured, and fall back only so a
+          # fork without the secret can still build.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          # With the Android key the APK must be published too.
+          ANDROID_SIGNED: ${{ secrets.ANDROID_KEYSTORE_B64 != '' }}
+        run: node scripts/publish-release.js

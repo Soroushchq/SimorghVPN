@@ -1,0 +1,614 @@
+name: go-checks
+
+# Vet + test every Go module in the repo on each PR and push to main. This is
+# the compile/test gate for the module edges between the root module, the
+# nested brokerapi, connectcore, punchcore, and wsscore modules, and the two
+# Wails app modules. The app modules are tested through their Go service
+# subpackages only, not `./...`, which would require frontend/dist to exist;
+# the desktop app's package main is instead compile-checked by a Windows
+# cross-build over a placeholder dist. These checks are the normal PR gate for
+# their Go suites; the Volunteer Desktop release workflow also repeats the
+# native direct-setup/service subset on each platform before packaging.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # The engine's Windows-only process lifecycle — the stdin-close stop
+  # protocol's parent-death teardown, the kill-on-close job object for
+  # stopless children, CREATE_NO_WINDOW — is guarded by tests that only
+  # compile and run on Windows (connectcore/client/engine_windows_test.go);
+  # the Ubuntu suite excludes them and the cross-build steps compile no test
+  # files, so without this job those assertions would never execute in CI.
+  # Also exercise shared cache ownership with Windows' native file locks.
+  go-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+
+      # bash, not the default pwsh: pwsh run blocks surface only the LAST
+      # command's exit code, so a vet failure followed by a passing test
+      # would slip through.
+      - name: connectcore client and cache ownership on Windows (vet + test)
+        working-directory: connectcore
+        shell: bash
+        run: |
+          go vet ./client/
+          go test -v ./client/
+          go vet .
+          go test -v -run 'Test(EngineFakeIP|FakeIPLock)' .
+
+      # The smoke test rewrites the runner user's proxy setting, which is
+      # disposable here.
+      - name: proxymode on Windows (vet + test, real WinInet settings)
+        shell: bash
+        env:
+          OPENRUNG_PROXYMODE_SMOKE: windows
+        run: |
+          go vet ./internal/proxymode/
+          go test -v ./internal/proxymode/
+
+  relay-deploy-script:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to the version the broker origin runs; the release checksum file
+      # is verified before the binary is used.
+      - name: Install Caddy
+        env:
+          CADDY_VERSION: '2.11.4'
+        run: |
+          base="https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}"
+          tarball="caddy_${CADDY_VERSION}_linux_amd64.tar.gz"
+          curl -fsSLO "${base}/${tarball}"
+          curl -fsSL -o caddy_checksums.txt "${base}/caddy_${CADDY_VERSION}_checksums.txt"
+          grep " ${tarball}\$" caddy_checksums.txt | sha512sum -c -
+          tar -xzf "$tarball" caddy
+          sudo install -m 0755 caddy /usr/local/bin/caddy
+          caddy version
+
+      - name: Deploy script tests
+        run: |
+          bash -n deploy/broker/Caddyfile_test.sh
+          bash deploy/broker/Caddyfile_test.sh
+          sh -n deploy/relay/egress-limit.sh
+          bash -n deploy/relay/egress-limit_test.sh
+          command -v nft >/dev/null || sudo apt-get install -y nftables
+          sudo bash deploy/relay/egress-limit_test.sh
+          sh -n deploy/relay/volunteer-up.sh
+          sh -n deploy/relay/volunteer-up_test.sh
+          OPENRUNG_TEST_SHELL=/bin/dash sh deploy/relay/volunteer-up_test.sh
+          OPENRUNG_TEST_SHELL=/bin/bash sh deploy/relay/volunteer-up_test.sh
+          docker run --rm -v "$PWD:/src:ro" -w /src alpine:3 sh deploy/relay/volunteer-up_test.sh
+
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      # The desktop app embeds the split-tunnel rule sets from the
+      # desktop/mobile-app submodule, so its cross-build below needs them.
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+
+      # For the desktop version injection contract below.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Component version sources
+        run: |
+          for file in cmd/broker/VERSION cmd/client/VERSION cmd/relay/VERSION cmd/relayhub/VERSION cmd/wsssidecar/VERSION desktop/VERSION desktop-volunteer/VERSION; do
+            version="$(tr -d '\r\n' < "$file")"
+            if ! printf '%s\n' "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+              echo "invalid $file \"$version\" (want X.Y.Z)" >&2
+              exit 1
+            fi
+            echo "$file -> $version"
+          done
+
+      # The two Wails apps keep an info.productVersion copy in wails.json only
+      # because Wails stamps it into the native package metadata. VERSION is
+      # canonical; reject drift at PR time rather than at release time.
+      - name: Wails packaging version copies
+        run: |
+          for app in desktop desktop-volunteer; do
+            version="$(tr -d '\r\n' < "$app/VERSION")"
+            copy="$(jq -r '.info.productVersion' "$app/wails.json")"
+            if [ "$copy" != "$version" ]; then
+              echo "$app/wails.json info.productVersion ($copy) disagrees with $app/VERSION ($version); VERSION is canonical" >&2
+              exit 1
+            fi
+            echo "$app/wails.json info.productVersion == $app/VERSION ($version)"
+          done
+
+      # The bundled sing-box runtime's build tags — the configuration every
+      # shipped cmd/client binary uses (see client-release.yml): with_utls
+      # compiles the uTLS/Reality client in, and with_external_windivert keeps
+      # the LGPLv3 WinDivert64.sys driver out of the binary (it serves
+      # Windows bridge/tlsspoof backends the client never uses, and shipping
+      # it would carry license-text obligations — THIRD_PARTY_NOTICES.md §8).
+      # The relay's runtime credential management and its egress guard are
+      # proven against the real xray (internal/relayruntime's *_e2e_test and
+      # xrayctl tests), which fail — not skip — when xray is missing in CI.
+      # Install the exact release the relay image pins, verified against the
+      # upstream .dgst checksum exactly as deploy/relay/Dockerfile does.
+      - name: Install pinned Xray-core for relay integration tests
+        run: |
+          set -eu
+          version="$(sed -n 's/^ARG XRAY_VERSION=//p' deploy/relay/Dockerfile | head -n1)"
+          test -n "$version"
+          asset="Xray-linux-64.zip"
+          base="https://github.com/XTLS/Xray-core/releases/download/${version}"
+          curl -fsSL -o /tmp/xray.zip "${base}/${asset}"
+          curl -fsSL -o /tmp/xray.dgst "${base}/${asset}.dgst"
+          expected="$(awk '/^SHA2-256=/ {print $2}' /tmp/xray.dgst)"
+          actual="$(sha256sum /tmp/xray.zip | awk '{print $1}')"
+          echo "xray ${version} ${asset} expected=${expected} actual=${actual}"
+          test -n "$expected"
+          test "$expected" = "$actual"
+          mkdir -p "$HOME/xray"
+          unzip -o /tmp/xray.zip xray -d "$HOME/xray"
+          chmod +x "$HOME/xray/xray"
+          echo "$HOME/xray" >> "$GITHUB_PATH"
+          "$HOME/xray/xray" version | head -n1
+
+      # The extra untagged vet keeps a plain `go build` compiling for
+      # contributors, whose binary refuses Reality configs with upstream's
+      # rebuild hint.
+      - name: Root module (vet + test)
+        run: |
+          go vet ./...
+          go vet -tags with_utls,with_external_windivert ./...
+          go test -race -tags with_utls,with_external_windivert ./...
+
+      # The Linux proxy controller shells out to gsettings and
+      # kwriteconfig/kreadconfig, which exit 0 even when a write is lost, and
+      # its unit tests use a fake desktop. Run it against the real tools in a
+      # private D-Bus session with a throwaway config directory per desktop,
+      # reading every value back. The directory is set before the session
+      # starts so the bus-activated dconf service writes where the tools read.
+      - name: Linux desktop proxy tools (gsettings + kioslaverc)
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            dbus dconf-service dconf-gsettings-backend gsettings-desktop-schemas \
+            libglib2.0-bin libkf5config-bin
+          go test -c -o "$RUNNER_TEMP/proxymode.test" ./internal/proxymode/
+          for desktop in gnome kde; do
+            config="$(mktemp -d)"
+            XDG_CONFIG_HOME="$config" OPENRUNG_PROXYMODE_SMOKE="$desktop" dbus-run-session -- \
+              "$RUNNER_TEMP/proxymode.test" -test.v -test.run '^TestLinuxRealDesktopTools$'
+          done
+
+      # with_external_windivert only alters GOOS=windows compilation, which
+      # nothing else in this workflow exercises; without this the tag's
+      # windows path would first compile at release time.
+      - name: Client windows cross-build (bundled sing-box tags)
+        run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags with_utls,with_external_windivert -o /dev/null ./cmd/client
+
+      - name: brokerapi module (vet + test)
+        working-directory: brokerapi
+        run: |
+          go vet ./...
+          go test -race ./...
+
+      - name: punchcore module (vet + test)
+        working-directory: punchcore
+        run: |
+          go vet ./...
+          go test -race ./...
+
+      - name: wsscore module (vet + test)
+        working-directory: wsscore
+        run: |
+          go vet ./...
+          go test -race ./...
+
+      # Standalone, not just through the root module's replace. Note this is
+      # still not the build a fetching consumer sees: connectcore's own
+      # replace directives resolve the sibling modules from in-tree source.
+      # The require-pin step below keeps the published requires equal to the
+      # sibling versions this step actually tests.
+      - name: connectcore module (vet + test)
+        working-directory: connectcore
+        run: |
+          go vet ./...
+          go test -race ./...
+
+      # connectcore is fetched by external consumers through its go.mod
+      # requires, while every in-repo build resolves siblings through replace
+      # directives — so the requires are never compiled against here. Keeping
+      # each require equal to the sibling's VERSION file means the
+      # configuration CI tests is the one external consumers fetch; a stale
+      # require would publish a tag that fails to resolve or compile only
+      # outside this repository.
+      - name: connectcore sibling require pins
+        run: |
+          for sibling in brokerapi punchcore wsscore; do
+            version="v$(cat "$sibling/VERSION")"
+            require="$(cd connectcore && go mod edit -json | \
+              jq -r --arg path "github.com/openrung/openrung/$sibling" \
+              '.Require[] | select(.Path == $path) | .Version')"
+            if [ "$require" != "$version" ]; then
+              echo "connectcore/go.mod requires $sibling $require but $sibling/VERSION is $version; bump them together (docs/architecture.md, connectcore pin/upgrade procedure)" >&2
+              exit 1
+            fi
+            echo "connectcore requires $sibling $version (== $sibling/VERSION)"
+          done
+
+      - name: desktop module (vet + test + build)
+        working-directory: desktop
+        run: |
+          go vet ./vpnservice/...
+          go test -race ./vpnservice/...
+          go build ./vpnservice/...
+          # Package main needs the embedded frontend and a native webview, so
+          # its one pure helper is tested by file (as desktop-volunteer does).
+          go test window_size.go window_size_test.go
+
+      # The desktop app statically links the sing-box engine and re-invokes
+      # itself as the tunnel child process, so its package main now carries
+      # that wiring — but ./... needs the embedded frontend/dist (gitignored,
+      # built by Wails) and its native webview, so nothing here compiles it.
+      # A Windows cross-build does: Wails' Windows backend is pure Go
+      # (go-webview2), so this needs no webview packages, and it compiles the
+      # whole app with the engine's build tags — the same tags every desktop
+      # package carries (desktop/scripts/versioned-wails-build.mjs), including
+      # the windows-only with_external_windivert path.
+      - name: desktop app cross-build (bundled sing-box tags)
+        working-directory: desktop
+        run: |
+          mkdir -p frontend/dist
+          echo '<!doctype html><title>go-checks placeholder</title>' > frontend/dist/index.html
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
+            go build -tags desktop,production,with_utls,with_external_windivert -o /dev/null .
+
+      # The desktop packaging script stamps the build version by setting
+      # github.com/openrung/openrung/connectcore/client.appVersion with -X,
+      # but the linker silently ignores -X for a symbol it cannot resolve.
+      # Renaming that variable would otherwise leave every release reporting
+      # "dev" with this whole job green. Belongs here, not in
+      # desktop-frontend.yml: it needs Go, and it has to run when
+      # connectcore/client changes.
+      - name: Desktop version injection contract
+        working-directory: desktop
+        run: node --test scripts/version-injection.test.mjs
+
+      - name: desktop-volunteer module (vet + test)
+        working-directory: desktop-volunteer
+        run: |
+          go vet ./persist/... ./directsetup/... ./volunteerservice/...
+          go test ./persist/... ./directsetup/... ./volunteerservice/...
+          go test version.go version_test.go
+
+  # A punchcore change that merges without a VERSION bump would never get a
+  # punchcore/vX.Y.Z tag (punchcore-tag.yml triggers on VERSION changes), so
+  # the mobile repo could never pin it. Enforce the bump at PR time and make
+  # sure the bumped version is not already tagged. README-only edits are
+  # exempt. Like contract-vectors-version, this also runs on pushes to main:
+  # two independently green PRs can race the same bump and merge cleanly, and
+  # the second merge would ship module code the existing tag does not name —
+  # the push run judges exactly what landed and turns main red instead. The
+  # tag-freshness probe stays PR-only, because on a push the tag workflow may
+  # be creating this very tag concurrently and probing would race it into a
+  # false failure.
+  punchcore-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require a fresh VERSION when punchcore changes
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            oldrev="$(git merge-base "origin/${{ github.base_ref }}" HEAD)"
+          else
+            oldrev="${{ github.event.before }}"
+            if ! git cat-file -e "$oldrev^{commit}" 2>/dev/null; then
+              echo "no reachable before-commit (branch creation or forced push); nothing to compare"
+              exit 0
+            fi
+          fi
+          changed="$(git diff --name-only "$oldrev" HEAD -- punchcore/ ':!punchcore/README.md')"
+          if [ -z "$changed" ]; then
+            echo "punchcore/ untouched"
+            exit 0
+          fi
+          if git diff --quiet "$oldrev" HEAD -- punchcore/VERSION; then
+            echo "punchcore/ changed without a punchcore/VERSION bump:" >&2
+            echo "$changed" >&2
+            exit 1
+          fi
+          version="$(tr -d '[:space:]' < punchcore/VERSION)"
+          if ! printf '%s\n' "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+            echo "invalid punchcore/VERSION \"$version\" (want X.Y.Z)" >&2
+            exit 1
+          fi
+          tag="punchcore/v$version"
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "punchcore/VERSION -> $version"
+            exit 0
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "punchcore/VERSION is $version but $tag already exists; bump to a new version" >&2
+            exit 1
+          fi
+          echo "punchcore/VERSION -> $version (will tag $tag on merge)"
+
+  # Keep the independently consumable WSS transport module releasable by
+  # requiring every non-documentation change to declare a fresh module version.
+  # Push-mode and the PR-only tag probe: see the note on punchcore-version.
+  wsscore-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require a fresh VERSION when wsscore changes
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            oldrev="$(git merge-base "origin/${{ github.base_ref }}" HEAD)"
+          else
+            oldrev="${{ github.event.before }}"
+            if ! git cat-file -e "$oldrev^{commit}" 2>/dev/null; then
+              echo "no reachable before-commit (branch creation or forced push); nothing to compare"
+              exit 0
+            fi
+          fi
+          changed="$(git diff --name-only "$oldrev" HEAD -- wsscore/ ':!wsscore/README.md')"
+          if [ -z "$changed" ]; then
+            echo "wsscore/ untouched"
+            exit 0
+          fi
+          if git diff --quiet "$oldrev" HEAD -- wsscore/VERSION; then
+            echo "wsscore/ changed without a wsscore/VERSION bump:" >&2
+            echo "$changed" >&2
+            exit 1
+          fi
+          version="$(tr -d '[:space:]' < wsscore/VERSION)"
+          if ! printf '%s\n' "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+            echo "invalid wsscore/VERSION \"$version\" (want X.Y.Z)" >&2
+            exit 1
+          fi
+          tag="wsscore/v$version"
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "wsscore/VERSION -> $version"
+            exit 0
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "wsscore/VERSION is $version but $tag already exists; bump to a new version" >&2
+            exit 1
+          fi
+          echo "wsscore/VERSION -> $version (will tag $tag on merge)"
+
+  # Keep the client policy engine module releasable by requiring every
+  # non-documentation change to declare a fresh module version.
+  # Push-mode and the PR-only tag probe: see the note on punchcore-version.
+  connectcore-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require a fresh VERSION when connectcore changes
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            oldrev="$(git merge-base "origin/${{ github.base_ref }}" HEAD)"
+          else
+            oldrev="${{ github.event.before }}"
+            if ! git cat-file -e "$oldrev^{commit}" 2>/dev/null; then
+              echo "no reachable before-commit (branch creation or forced push); nothing to compare"
+              exit 0
+            fi
+          fi
+          changed="$(git diff --name-only "$oldrev" HEAD -- connectcore/ ':!connectcore/README.md')"
+          if [ -z "$changed" ]; then
+            echo "connectcore/ untouched"
+            exit 0
+          fi
+          if git diff --quiet "$oldrev" HEAD -- connectcore/VERSION; then
+            echo "connectcore/ changed without a connectcore/VERSION bump:" >&2
+            echo "$changed" >&2
+            exit 1
+          fi
+          version="$(tr -d '[:space:]' < connectcore/VERSION)"
+          if ! printf '%s\n' "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+            echo "invalid connectcore/VERSION \"$version\" (want X.Y.Z)" >&2
+            exit 1
+          fi
+          tag="connectcore/v$version"
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "connectcore/VERSION -> $version"
+            exit 0
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "connectcore/VERSION is $version but $tag already exists; bump to a new version" >&2
+            exit 1
+          fi
+          echo "connectcore/VERSION -> $version (will tag $tag on merge)"
+
+  # Keep the independently consumable broker control-plane client releasable
+  # by requiring every non-documentation change to declare a fresh version.
+  # Push-mode and the PR-only tag probe: see the note on punchcore-version.
+  brokerapi-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require a fresh VERSION when brokerapi changes
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            oldrev="$(git merge-base "origin/${{ github.base_ref }}" HEAD)"
+          else
+            oldrev="${{ github.event.before }}"
+            if ! git cat-file -e "$oldrev^{commit}" 2>/dev/null; then
+              echo "no reachable before-commit (branch creation or forced push); nothing to compare"
+              exit 0
+            fi
+          fi
+          changed="$(git diff --name-only "$oldrev" HEAD -- brokerapi/ ':!brokerapi/README.md')"
+          if [ -z "$changed" ]; then
+            echo "brokerapi/ untouched"
+            exit 0
+          fi
+          if git diff --quiet "$oldrev" HEAD -- brokerapi/VERSION; then
+            echo "brokerapi/ changed without a brokerapi/VERSION bump:" >&2
+            echo "$changed" >&2
+            exit 1
+          fi
+          version="$(tr -d '[:space:]' < brokerapi/VERSION)"
+          if ! printf '%s\n' "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+            echo "invalid brokerapi/VERSION \"$version\" (want X.Y.Z)" >&2
+            exit 1
+          fi
+          tag="brokerapi/v$version"
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "brokerapi/VERSION -> $version"
+            exit 0
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "brokerapi/VERSION is $version but $tag already exists; bump to a new version" >&2
+            exit 1
+          fi
+          echo "brokerapi/VERSION -> $version (will tag $tag on merge)"
+
+  # The contract vectors are vendored byte for byte by the mobile repo, and a
+  # file's top-level "version" is what routes an edit to every copy
+  # (contract/README.md). The Go suites pin the version they were written
+  # against, but a PR that edits a file and forgets the bump would leave main
+  # and the vendored copies agreeing on a version that now names two different
+  # contents. Enforce a strictly increasing bump — a downgrade or a reused
+  # number would also make one version name two contents across history — with
+  # no exemption for "small" edits: once vendored, every edit including row
+  # additions coordinates copies. A file new in the PR has no copy to
+  # coordinate yet and passes at the version it will land on, which is the
+  # README's drafting rule. Runs on pull requests AND on pushes to main: the
+  # repo has no up-to-date-branch protection, so two independently green PRs
+  # can race the same bump and merge cleanly (the #75 failure mode) — the push
+  # run judges exactly what landed and turns main red instead of shipping a
+  # version that names untested content.
+  contract-vectors-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require a version bump on every vectors edit
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            oldrev="$(git merge-base "origin/${{ github.base_ref }}" HEAD)"
+          else
+            oldrev="${{ github.event.before }}"
+            if ! git cat-file -e "$oldrev^{commit}" 2>/dev/null; then
+              echo "no reachable before-commit (branch creation or forced push); nothing to compare"
+              exit 0
+            fi
+          fi
+          # NUL-delimited --name-status rather than line-oriented --name-only:
+          # core.quotepath would C-quote a non-ASCII filename and route it into
+          # the wrong arm, and without -M a rename is an unchecked delete+add
+          # pair. The pathspec matches the vectors directory anywhere in the
+          # tree, so moving it (ADR-001 D3) cannot silently disable this job.
+          status=0
+          checked=0
+          while IFS= read -r -d '' state; do
+            IFS= read -r -d '' file || break
+            dest="$file"
+            case "$state" in
+              R*|C*) IFS= read -r -d '' dest || break ;;
+            esac
+            checked=1
+            case "$state" in
+              A)
+                new="$(jq '.version' "$dest")"
+                if ! printf '%s\n' "$new" | grep -Eq '^[1-9][0-9]*$'; then
+                  echo "$dest carries version $new, want a positive integer" >&2
+                  status=1
+                  continue
+                fi
+                echo "$dest is new at version $new; the bump rule binds from its next edit"
+                ;;
+              D)
+                echo "$file was deleted, which strands every vendored copy; removing a vector file needs the mobile repo's vendoring check to exist first" >&2
+                status=1
+                ;;
+              M|R*|C*)
+                new="$(jq '.version' "$dest")"
+                if ! printf '%s\n' "$new" | grep -Eq '^[1-9][0-9]*$'; then
+                  echo "$dest carries version $new, want a positive integer" >&2
+                  status=1
+                  continue
+                fi
+                old="$(git show "$oldrev:$file" | jq '.version')"
+                if ! printf '%s\n' "$old" | grep -Eq '^[1-9][0-9]*$'; then
+                  # Fail closed: an unreadable old version must never be treated
+                  # as 0 and wave a downgrade through.
+                  echo "$file carries unreadable version $old at the base revision; refusing to fail open" >&2
+                  status=1
+                  continue
+                fi
+                if [ "$new" -gt "$old" ]; then
+                  if [ "$dest" = "$file" ]; then
+                    echo "$file: version $old -> $new"
+                  else
+                    echo "$file -> $dest: version $old -> $new"
+                  fi
+                else
+                  echo "$dest changed (was $file at version $old) but carries version $new; every edit — renames included — must raise the version above the old one, so the change reaches the vendored copies and no version ever names two contents; bump the Go suite's pinned constant with it" >&2
+                  status=1
+                fi
+                ;;
+              *)
+                echo "$file has unhandled diff status $state; refusing to guess" >&2
+                status=1
+                ;;
+            esac
+          done < <(git diff --name-status -z -M "$oldrev" HEAD -- '*contract/vectors/*.json')
+          if [ "$checked" -eq 0 ]; then
+            echo "contract/vectors/ untouched"
+          fi
+          exit $status
+
+  # PR-time smoke build of every deploy image. The image workflows themselves
+  # only run on pushes to main, so without this a Docker packaging error (e.g.
+  # a Dockerfile missing a COPY for a nested module's go.mod that the root
+  # replace directive needs) would surface only after merge. Single-arch and
+  # never pushed: this is a build gate, not a release.
+  docker:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [broker, relayhub, relay]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/${{ matrix.image }}/Dockerfile
+          platforms: linux/amd64
+          push: false

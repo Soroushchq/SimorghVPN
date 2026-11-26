@@ -1,0 +1,209 @@
+package relayruntime
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+
+	"openrung/internal/relay"
+)
+
+const (
+	relayRegisterPath       = "/api/v1/relays/register"
+	relayHeartbeatPathBase  = "/api/v1/relays/"
+	maxBrokerErrorBodyBytes = 64 << 10
+)
+
+// BrokerClient speaks the relay side of the broker HTTP API: registration,
+// heartbeats and access-lease synchronisation. The zero HTTPClient falls back
+// to http.DefaultClient; Token is optional (anonymous registration when the
+// broker allows it).
+type BrokerClient struct {
+	BaseURL    string
+	Token      string
+	HTTPClient *http.Client
+	// RequireSecureTransport refuses plaintext non-loopback broker URLs. It is
+	// enabled for the high-value foundation credential; loopback HTTP remains
+	// available for local integration tests. All broker requests refuse
+	// redirects regardless of this setting.
+	RequireSecureTransport bool
+}
+
+// Register announces the relay and returns the broker-minted descriptor.
+func (b *BrokerClient) Register(ctx context.Context, req relay.RegisterRequest) (relay.Descriptor, error) {
+	var registration relay.RegisterResponse
+	if err := b.postJSON(ctx, relayRegisterPath, req, &registration); err != nil {
+		return relay.Descriptor{}, err
+	}
+	return registration.Descriptor, nil
+}
+
+// Heartbeat renews the relay's lease. A non-empty clientID asks the broker to
+// serve that VLESS credential from now on; the response reports the
+// credential the directory serves after the call (empty from a broker that
+// predates rotation). A pruned relay yields an APIError with status 404 that
+// IsRelayNotFound recognizes.
+func (b *BrokerClient) Heartbeat(ctx context.Context, id, leaseToken, clientID string) (relay.HeartbeatResponse, error) {
+	var resp relay.HeartbeatResponse
+	err := b.postJSON(ctx, relayHeartbeatPathBase+id+"/heartbeat", relay.HeartbeatRequest{OK: true, LeaseToken: leaseToken, ClientID: clientID}, &resp)
+	return resp, err
+}
+
+// PollLeases fetches the access leases the relay must accept. A negative
+// after asks for the full set immediately (the first poll of a session, or
+// after a re-registration); otherwise the broker holds the request until its
+// revision exceeds after or its hold elapses, answering with the current set
+// either way. The bearer is the registration's lease token, never the
+// registration token. A wrong token, a pruned relay or a legacy identityless
+// row yields the 404 that IsRelayNotFound recognizes, so the caller waits for
+// the heartbeat to re-register and retries with the new token.
+func (b *BrokerClient) PollLeases(ctx context.Context, id, leaseToken string, after int64) (relay.LeaseSyncResponse, error) {
+	path := relayHeartbeatPathBase + id + "/leases"
+	if after >= 0 {
+		path += "?after=" + strconv.FormatInt(after, 10)
+	}
+	var resp relay.LeaseSyncResponse
+	err := b.doJSON(ctx, http.MethodGet, path, leaseToken, nil, &resp)
+	return resp, err
+}
+
+// AckLeases tells the broker the relay has applied the lease set at revision.
+func (b *BrokerClient) AckLeases(ctx context.Context, id, leaseToken string, revision int64) error {
+	return b.doJSON(ctx, http.MethodPost, relayHeartbeatPathBase+id+"/leases/ack", leaseToken, relay.LeaseAckRequest{Revision: revision}, nil)
+}
+
+func (b *BrokerClient) postJSON(ctx context.Context, path string, body any, out any) error {
+	return b.doJSON(ctx, http.MethodPost, path, b.Token, body, out)
+}
+
+// doJSON performs one broker request with the given bearer (empty sends no
+// Authorization header) and JSON body (nil sends none), decoding a 2xx body
+// into out when out is non-nil.
+func (b *BrokerClient) doJSON(ctx context.Context, method, path, bearer string, body any, out any) error {
+	var reader io.Reader
+	if body != nil {
+		payload, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		reader = bytes.NewReader(payload)
+	}
+
+	requestURL := strings.TrimRight(b.BaseURL, "/") + path
+	if b.RequireSecureTransport {
+		if err := ValidateSecureBrokerURL(requestURL); err != nil {
+			return err
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, method, requestURL, reader)
+	if err != nil {
+		return err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+
+	httpClient := b.HTTPClient
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
+	// Clone the caller's client so the policy neither mutates a shared client
+	// nor depends on its CheckRedirect setting. Broker write endpoints never
+	// need a redirect; refusing every redirect prevents forwarding the bearer
+	// token to another location.
+	noRedirectClient := *httpClient
+	noRedirectClient.CheckRedirect = func(req *http.Request, _ []*http.Request) error {
+		return fmt.Errorf("broker request refused redirect to %s", req.URL.Redacted())
+	}
+	httpClient = &noRedirectClient
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		errorBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxBrokerErrorBodyBytes+1))
+		bodyWithinLimit := len(errorBody) <= maxBrokerErrorBodyBytes
+		var apiErr relay.ErrorResponse
+		if readErr == nil && bodyWithinLimit {
+			_ = json.Unmarshal(errorBody, &apiErr)
+		}
+		if apiErr.Error == "" {
+			apiErr.Error = resp.Status
+		}
+		return &APIError{
+			Path:       strings.SplitN(path, "?", 2)[0],
+			StatusCode: resp.StatusCode,
+			Message:    apiErr.Error,
+			RetryAfter: resp.Header.Get("Retry-After"),
+		}
+	}
+
+	if out != nil {
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// ValidateSecureBrokerURL enforces the secure-transport broker policy on a
+// URL: https anywhere, plaintext http only on loopback. BrokerClient applies
+// it per request when RequireSecureTransport is set; config validators call
+// it directly so the misconfiguration fails at startup instead of on the
+// first request.
+func ValidateSecureBrokerURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("parse broker URL %q: %w", rawURL, err)
+	}
+	if u.Scheme == "https" {
+		return nil
+	}
+	if u.Scheme == "http" && isLoopbackBrokerHost(u.Hostname()) {
+		return nil
+	}
+	return fmt.Errorf("secure broker requests require an https URL (got %q); plaintext http is allowed only on loopback", rawURL)
+}
+
+func isLoopbackBrokerHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// APIError is a non-2xx broker response.
+type APIError struct {
+	Path       string
+	StatusCode int
+	Message    string
+	// RetryAfter is the raw Retry-After header (seconds), present on 429s so
+	// callers can honour the broker's backoff request.
+	RetryAfter string
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("broker %s: %s", e.Path, e.Message)
+}
+
+// IsRelayNotFound reports whether err is the broker telling us the relay lease
+// expired and the ID is gone — the caller should re-register.
+func IsRelayNotFound(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound && apiErr.Message == "relay not found"
+}

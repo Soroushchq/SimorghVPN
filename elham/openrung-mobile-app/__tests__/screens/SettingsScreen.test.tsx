@@ -1,0 +1,338 @@
+import React from 'react';
+import ReactTestRenderer from 'react-test-renderer';
+import { Alert, Linking, Share, Text } from 'react-native';
+
+const mockShareInstalledApk = jest.fn<Promise<void>, [string]>();
+
+// Jest's react-native preset resolves Platform.OS to 'ios', so giving the config an App Store
+// link is all it takes to make the iOS sharing row available.
+jest.mock('../../src/config', () => {
+  const actual = jest.requireActual('../../src/config');
+  return {
+    ...actual,
+    AppConfig: {
+      ...actual.AppConfig,
+      APP_STORE_URL: 'https://apps.apple.com/app/id0000000000',
+    },
+  };
+});
+
+jest.mock('@react-native-async-storage/async-storage', () => ({
+  __esModule: true,
+  default: {
+    getItem: jest.fn(async () => null),
+    setItem: jest.fn(async () => {}),
+    removeItem: jest.fn(async () => {}),
+  },
+}));
+
+jest.mock('react-native-safe-area-context', () => ({
+  useSafeAreaInsets: () => ({ top: 0, right: 0, bottom: 0, left: 0 }),
+  useSafeAreaFrame: () => ({ x: 0, y: 0, width: 320, height: 640 }),
+}));
+
+jest.mock('../../src/state/useVpnState', () => ({
+  useVpnState: () => ({
+    isConnected: false,
+    // Only the slice SettingsScreen reads from state; the update row stays hidden at tier 'none'.
+    state: {
+      update: { tier: 'none', latestVersion: null, verified: false, notice: null },
+    },
+  }),
+}));
+
+jest.mock('../../src/native/OpenRungApkShare', () => ({
+  isApkShareAvailable: true,
+  shareInstalledApk: (chooserTitle: string) =>
+    mockShareInstalledApk(chooserTitle),
+  apkShareErrorCode: (error: unknown) =>
+    typeof error === 'object' && error != null && 'code' in error
+      ? (error as { code: string }).code
+      : null,
+}));
+
+import type { NativeVpnState } from '../../src/native/types';
+import { AboutScreen } from '../../src/screens/AboutScreen';
+import { SettingsScreen } from '../../src/screens/SettingsScreen';
+import { applyNativeState, resetStoreForTests } from '../../src/state/store';
+
+async function renderSettings(
+  onOpenSplitTunneling: () => void = jest.fn(),
+): Promise<ReactTestRenderer.ReactTestRenderer> {
+  let tree: ReactTestRenderer.ReactTestRenderer | undefined;
+  await ReactTestRenderer.act(async () => {
+    tree = ReactTestRenderer.create(
+      <SettingsScreen
+        onOpenDebug={jest.fn()}
+        onOpenSplitTunneling={onOpenSplitTunneling}
+      />,
+    );
+  });
+  return tree!;
+}
+
+function findButton(
+  tree: ReactTestRenderer.ReactTestRenderer,
+  title: string,
+): ReactTestRenderer.ReactTestInstance {
+  return tree.root
+    .findAll(node => typeof node.props.onPress === 'function')
+    .find(node =>
+      node.findAllByType(Text).some(text => text.props.children === title),
+    )!;
+}
+
+async function unmount(
+  tree: ReactTestRenderer.ReactTestRenderer,
+): Promise<void> {
+  await ReactTestRenderer.act(async () => {
+    tree.unmount();
+  });
+}
+
+describe('SettingsScreen Android APK sharing', () => {
+  beforeEach(() => {
+    mockShareInstalledApk.mockReset();
+  });
+
+  it('places offline sharing in General and opens the native share sheet', async () => {
+    mockShareInstalledApk.mockResolvedValue(undefined);
+    const tree = await renderSettings();
+    const labels = tree.root
+      .findAllByType(Text)
+      .map(text => text.props.children)
+      .filter((label): label is string => typeof label === 'string');
+
+    expect(labels.indexOf('GENERAL')).toBeLessThan(
+      labels.indexOf('Share OpenRung offline'),
+    );
+    expect(labels.indexOf('Share OpenRung offline')).toBeLessThan(
+      labels.indexOf('DIAGNOSTICS'),
+    );
+
+    await ReactTestRenderer.act(async () => {
+      findButton(tree, 'Share OpenRung offline').props.onPress();
+      await Promise.resolve();
+    });
+
+    expect(mockShareInstalledApk).toHaveBeenCalledWith(
+      'Share OpenRung offline',
+    );
+    await unmount(tree);
+  });
+
+  it('explains why a split install cannot be shared', async () => {
+    mockShareInstalledApk.mockRejectedValue(
+      Object.assign(new Error('split install'), {
+        code: 'E_SPLIT_APK_INSTALL',
+      }),
+    );
+    const alert = jest.spyOn(Alert, 'alert').mockImplementation(() => {});
+    const tree = await renderSettings();
+
+    await ReactTestRenderer.act(async () => {
+      findButton(tree, 'Share OpenRung offline').props.onPress();
+      await Promise.resolve();
+    });
+
+    expect(alert).toHaveBeenCalledWith(
+      'Unable to share OpenRung',
+      'This copy was installed as multiple APK files and cannot be shared safely. Install the standalone OpenRung APK to use offline sharing.',
+    );
+    alert.mockRestore();
+    await unmount(tree);
+  });
+
+  it('does not leave a duplicate sharing action on the About tab', async () => {
+    let tree: ReactTestRenderer.ReactTestRenderer | undefined;
+    await ReactTestRenderer.act(async () => {
+      tree = ReactTestRenderer.create(
+        <AboutScreen onOpenLicenses={jest.fn()} />,
+      );
+    });
+
+    const hasShareAction = tree!.root
+      .findAllByType(Text)
+      .some(text => text.props.children === 'Share OpenRung offline');
+    expect(hasShareAction).toBe(false);
+    await unmount(tree!);
+  });
+});
+
+describe('SettingsScreen iOS App Store sharing', () => {
+  it('places App Store sharing in General and opens the system share sheet', async () => {
+    const share = jest
+      .spyOn(Share, 'share')
+      .mockResolvedValue({ action: Share.sharedAction });
+    const tree = await renderSettings();
+    const labels = tree.root
+      .findAllByType(Text)
+      .map(text => text.props.children)
+      .filter((label): label is string => typeof label === 'string');
+
+    expect(labels.indexOf('GENERAL')).toBeLessThan(
+      labels.indexOf('Share OpenRung'),
+    );
+    expect(labels.indexOf('Share OpenRung')).toBeLessThan(
+      labels.indexOf('DIAGNOSTICS'),
+    );
+
+    await ReactTestRenderer.act(async () => {
+      findButton(tree, 'Share OpenRung').props.onPress();
+      await Promise.resolve();
+    });
+
+    expect(share).toHaveBeenCalledWith(
+      {
+        message: 'Get OpenRung on the App Store:',
+        url: 'https://apps.apple.com/app/id0000000000',
+      },
+      { subject: 'Share OpenRung' },
+    );
+    share.mockRestore();
+    await unmount(tree);
+  });
+
+  it('surfaces an alert when the share sheet cannot be opened', async () => {
+    const share = jest
+      .spyOn(Share, 'share')
+      .mockRejectedValue(new Error('share sheet unavailable'));
+    const alert = jest.spyOn(Alert, 'alert').mockImplementation(() => {});
+    const tree = await renderSettings();
+
+    await ReactTestRenderer.act(async () => {
+      findButton(tree, 'Share OpenRung').props.onPress();
+      await Promise.resolve();
+    });
+
+    expect(alert).toHaveBeenCalledWith(
+      'Unable to share OpenRung',
+      'The App Store link could not be shared. Try again.',
+    );
+    share.mockRestore();
+    alert.mockRestore();
+    await unmount(tree);
+  });
+});
+
+describe('SettingsScreen split tunneling', () => {
+  it('places the split tunneling row under GENERAL and opens the screen', async () => {
+    const onOpenSplitTunneling = jest.fn();
+    const tree = await renderSettings(onOpenSplitTunneling);
+    const labels = tree.root
+      .findAllByType(Text)
+      .map(text => text.props.children)
+      .filter((label): label is string => typeof label === 'string');
+
+    expect(labels.indexOf('GENERAL')).toBeLessThan(
+      labels.indexOf('Split tunneling'),
+    );
+    expect(labels.indexOf('Split tunneling')).toBeLessThan(
+      labels.indexOf('DIAGNOSTICS'),
+    );
+    // Fresh installs start with all three preset bypasses enabled.
+    expect(labels).toContain('On — selected traffic bypasses the relay.');
+
+    await ReactTestRenderer.act(async () => {
+      findButton(tree, 'Split tunneling').props.onPress();
+    });
+
+    expect(onOpenSplitTunneling).toHaveBeenCalledTimes(1);
+    await unmount(tree);
+  });
+});
+
+describe('SettingsScreen speed test link', () => {
+  const CONNECTED: NativeVpnState = {
+    status: 'connected',
+    relayLabel: 'Tokyo, Japan',
+    relayName: null,
+    relayClass: null,
+    lastError: null,
+    lastErrorCode: null,
+    logLines: [],
+    recents: [],
+  };
+
+  function speedTestRow(
+    tree: ReactTestRenderer.ReactTestRenderer,
+  ): ReactTestRenderer.ReactTestInstance {
+    // The row's Pressable, not the SettingPanel wrapping it: the one that carries the
+    // accessibility props a disabled row must expose.
+    return tree.root
+      .findAll(
+        node =>
+          node.props.accessibilityRole === 'button' &&
+          typeof node.props.onPress === 'function',
+      )
+      .find(node =>
+        node.findAllByType(Text).some(text => text.props.children === 'Speed test'),
+      )!;
+  }
+
+  function labelsOf(tree: ReactTestRenderer.ReactTestRenderer): unknown[] {
+    return tree.root.findAllByType(Text).map(text => text.props.children);
+  }
+
+  afterEach(() => {
+    resetStoreForTests();
+  });
+
+  it('stays in Diagnostics, disabled with a hint, while disconnected', async () => {
+    const openURL = jest.spyOn(Linking, 'openURL').mockResolvedValue(undefined);
+    const tree = await renderSettings();
+    const labels = labelsOf(tree);
+
+    expect(labels.indexOf('DIAGNOSTICS')).toBeLessThan(labels.indexOf('Speed test'));
+    expect(labels).toContain('Connect first to measure the tunnel');
+    expect(labels).not.toContain('Opens fast.com in your browser');
+    expect(speedTestRow(tree).props.disabled).toBe(true);
+    expect(speedTestRow(tree).props.accessibilityState).toEqual({ disabled: true });
+    expect(openURL).not.toHaveBeenCalled();
+
+    openURL.mockRestore();
+    await unmount(tree);
+  });
+
+  it('opens the speed test in the system browser while connected', async () => {
+    const openURL = jest.spyOn(Linking, 'openURL').mockResolvedValue(undefined);
+    const tree = await renderSettings();
+    await ReactTestRenderer.act(async () => {
+      applyNativeState(CONNECTED);
+    });
+
+    expect(labelsOf(tree)).toContain('Opens fast.com in your browser');
+    expect(speedTestRow(tree).props.disabled).toBe(false);
+
+    await ReactTestRenderer.act(async () => {
+      speedTestRow(tree).props.onPress();
+      await Promise.resolve();
+    });
+
+    expect(openURL).toHaveBeenCalledTimes(1);
+    expect(openURL).toHaveBeenCalledWith('https://fast.com');
+    openURL.mockRestore();
+    await unmount(tree);
+  });
+});
+
+describe('AboutScreen links', () => {
+  it('opens the privacy policy from the About tab', async () => {
+    const openURL = jest.spyOn(Linking, 'openURL').mockResolvedValue(undefined);
+    let tree: ReactTestRenderer.ReactTestRenderer | undefined;
+    await ReactTestRenderer.act(async () => {
+      tree = ReactTestRenderer.create(
+        <AboutScreen onOpenLicenses={jest.fn()} />,
+      );
+    });
+
+    await ReactTestRenderer.act(async () => {
+      findButton(tree!, 'Privacy policy').props.onPress();
+      await Promise.resolve();
+    });
+
+    expect(openURL).toHaveBeenCalledWith('https://www.openrung.org/privacy');
+    openURL.mockRestore();
+    await unmount(tree!);
+  });
+});

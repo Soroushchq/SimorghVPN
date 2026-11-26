@@ -1,0 +1,69 @@
+package me.codeshare.shroudly
+
+/* Version numbers as tagged on GitHub ("v2.5.14", "2.6.0"). */
+object Versions {
+    fun parse(v: String): List<Int>? {
+        val core = display(v).substringBefore('-').substringBefore('+')
+        val parts = core.split('.')
+        if (parts.isEmpty() || parts.size > 4) return null
+        return parts.map { it.toIntOrNull()?.takeIf { n -> n >= 0 } ?: return null }
+    }
+
+    /* Negative, zero or positive, like compareTo. Unreadable versions sort first. */
+    fun compare(a: String, b: String): Int {
+        val x = parse(a) ?: return if (parse(b) == null) 0 else -1
+        val y = parse(b) ?: return 1
+        for (i in 0 until maxOf(x.size, y.size)) {
+            val c = x.getOrElse(i) { 0 }.compareTo(y.getOrElse(i) { 0 })
+            if (c != 0) return c
+        }
+        return 0
+    }
+
+    fun isNewer(candidate: String, current: String) = compare(candidate, current) > 0
+
+    /* A release is offered to this app only when it is newer and has an APK:
+     * desktop-only releases share the version numbers. */
+    fun offers(tag: String, assetNames: List<String>, current: String): Boolean =
+        isNewer(tag, current) && assetNames.any { it.endsWith(".apk", ignoreCase = true) }
+
+    internal const val DOWNLOADS = "https://github.com/umutxyp/Shroudly/releases/download/"
+
+    /* The release's Android APK (name, browser_download_url pairs): the one
+     * named -Android.apk, else any .apk; only from this project's releases. */
+    fun apkUrl(assets: List<Pair<String, String>>, variant: String = ""): String? {
+        val ours = assets.filter { (_, url) -> url.startsWith(DOWNLOADS) && !url.contains("..") }
+        // The same kind as this copy (issue #75: -arm64, -lite), else the one for every phone.
+        if (variant.isNotEmpty()) ours.firstOrNull { it.first.endsWith("-Android-$variant.apk", ignoreCase = true) }?.let { return it.second }
+        return (ours.firstOrNull { it.first.endsWith("-Android.apk", ignoreCase = true) }
+            ?: ours.firstOrNull { it.first.endsWith(".apk", ignoreCase = true) })?.second
+    }
+
+    /* The version an update feed (electron-builder's latest.yml) names, if readable. */
+    fun feedVersion(yml: String): String? =
+        yml.lineSequence().firstOrNull { it.startsWith("version:") }
+            ?.substringAfter(':')?.trim()?.trim('\'', '"')?.takeIf { parse(it) != null }
+
+    /* That release's APK on Shroudly's download server, which serves the
+     * latest release's files by name. */
+    fun mirrorApkPath(version: String, variant: String = "") =
+        "/dl/Shroudly-${display(version)}-Android${if (variant.isEmpty()) "" else "-$variant"}.apk"
+
+    /* "v2.6.0" -> "2.6.0", for display. */
+    fun display(tag: String) = tag.trim().removePrefix("v").removePrefix("V")
+
+    /* The version a versionCode stands for (app/build.gradle.kts: major*10000
+     * + minor*100 + patch): 20644 -> "2.6.44". Google Play names only the code. */
+    fun fromCode(code: Int) = "${code / 10000}.${code / 100 % 100}.${code % 100}"
+
+    /* Version numbers from installed to latest (versionCodes): the patches
+     * apart within one major.minor; into a newer minor, its patches and one
+     * for the step (how many patches the old one still had is not known); a
+     * newer major, as far as it goes. */
+    fun behind(installed: Int, latest: Int): Int = when {
+        latest <= installed -> 0
+        latest / 100 == installed / 100 -> latest - installed
+        latest / 10000 == installed / 10000 -> latest % 100 + 1
+        else -> Int.MAX_VALUE
+    }
+}

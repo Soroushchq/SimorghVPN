@@ -1,0 +1,492 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Android TV and Google TV: no touchscreen, a remote instead; the
+         same app, with a banner in the TV's launcher. -->
+    <uses-feature android:name="android.software.leanback" android:required="false" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- To follow the real network under the VPN (IPv6 or not). -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- A VPN app may use the systemExempted type once the user has allowed
+         the VPN (the ACTIVATE_VPN app op, which lint does not know about).
+         It is the only type: the service is started only after that consent
+         (ShroudlyVpnService.start), and Google Play needs no specialUse
+         review for it. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED" />
+    <!-- "Proxy only" (ShroudlyProxyService) runs with no VPN, so it is not a
+         VPN app's service then: Android 14+ needs a type for it, and none of
+         the listed ones fits a local proxy (dataSync would stop it after six
+         hours a day on Android 15). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- "Start when the phone starts" (Settings, off by default). -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- "Apps that skip Shroudly" lists the apps that can be opened (their
+         launcher entries), not every package on the phone; and whether the
+         Play Store is there, for the suggestion to move to the copy from
+         Google Play (StoreCards). -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+        <!-- On a TV, apps are opened from the TV's launcher. -->
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+        </intent>
+        <package android:name="com.android.vending" />
+    </queries>
+
+    <!-- No backup and no device-to-device copy of anything: see
+         res/xml/data_extraction_rules.xml (Android 12+); allowBackup covers
+         the earlier versions. extractNativeLibs: the native libraries (the
+         engine and hev) stay compressed in the APK, a smaller download, and
+         are unpacked at install; bundletool keeps this in every APK Google
+         Play makes from the bundle. -->
+    <application
+        android:allowBackup="false"
+        android:banner="@drawable/tv_banner"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="false"
+        android:extractNativeLibs="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:localeConfig="@xml/locales_config"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Shroudly">
+
+        <!-- "Share Shroudly": this app's APK, to the app the user picks,
+             for that once (ApkShare). -->
+        <provider
+            android:name=".ApkProvider"
+            android:authorities="${applicationId}.apk"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+
+        <!-- The main window (HomeActivity, all of it MainActivity's). The
+             launcher's entries are aliases of it, one per logo (Logos.kt):
+             the classic one keeps the name ".MainActivity" that launchers
+             have pinned since the first version; the others are off until
+             chosen in Settings. -->
+        <activity
+            android:name=".HomeActivity"
+            android:exported="true"
+            android:launchMode="singleTop">
+            <!-- A long press on the Quick Settings tile opens Shroudly, not
+                 Android's App info (issue #35). -->
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE_PREFERENCES" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+        <activity-alias
+            android:name=".MainActivity"
+            android:exported="true"
+            android:targetActivity=".HomeActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Logo_flat"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_logo_flat"
+            android:targetActivity=".HomeActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Logo_line"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_logo_line"
+            android:targetActivity=".HomeActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Logo_paper"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_logo_paper"
+            android:targetActivity=".HomeActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Logo_key"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_logo_key"
+            android:targetActivity=".HomeActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Logo_veil"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_logo_veil"
+            android:targetActivity=".HomeActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Logo_terminal"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_logo_terminal"
+            android:targetActivity=".HomeActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Logo_night"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_logo_night"
+            android:targetActivity=".HomeActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Logo_coral"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_logo_coral"
+            android:targetActivity=".HomeActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Logo_newyear"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_logo_newyear"
+            android:targetActivity=".HomeActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Logo_halloween"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_logo_halloween"
+            android:targetActivity=".HomeActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Logo_valentine"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_logo_valentine"
+            android:targetActivity=".HomeActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Logo_spring"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_logo_spring"
+            android:targetActivity=".HomeActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Logo_ramadan"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_logo_ramadan"
+            android:targetActivity=".HomeActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Logo_winter"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_logo_winter"
+            android:targetActivity=".HomeActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Logo_tr"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_logo_tr"
+            android:targetActivity=".HomeActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Logo_ir"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_logo_ir"
+            android:targetActivity=".HomeActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Logo_ru"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_logo_ru"
+            android:targetActivity=".HomeActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Logo_cn"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_logo_cn"
+            android:targetActivity=".HomeActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Logo_pk"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_logo_pk"
+            android:targetActivity=".HomeActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Logo_az"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_logo_az"
+            android:targetActivity=".HomeActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Logo_kz"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_logo_kz"
+            android:targetActivity=".HomeActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Logo_eg"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_logo_eg"
+            android:targetActivity=".HomeActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Logo_vn"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_logo_vn"
+            android:targetActivity=".HomeActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <service
+            android:name=".ShroudlyVpnService"
+            android:exported="false"
+            android:foregroundServiceType="systemExempted"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            tools:ignore="ForegroundServicePermission">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.net.VpnService.SUPPORTS_ALWAYS_ON"
+                android:value="true" />
+        </service>
+
+        <!-- Proxy only (Settings): the engine as a proxy on 127.0.0.1, no VPN. -->
+        <service
+            android:name=".ShroudlyProxyService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="A local proxy on 127.0.0.1 that other apps on this device send their connections through, chosen by the user instead of the VPN so that another VPN app can stay connected; it runs while the user keeps protection on and stops when they turn it off." />
+        </service>
+
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:label="@string/navSettings" />
+
+        <!-- "Something not working?" (ReportActivity). -->
+        <activity
+            android:name=".ReportActivity"
+            android:exported="false"
+            android:label="@string/reportTitle"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!-- Follow Shroudly (FollowActivity). -->
+        <activity
+            android:name=".FollowActivity"
+            android:exported="false"
+            android:label="@string/followTitle" />
+
+        <!-- Connections by site, with blocking (issue #74; ConnectionsActivity). -->
+        <activity
+            android:name=".ConnectionsActivity"
+            android:exported="false"
+            android:label="@string/connsTitle" />
+
+        <!-- Brings protection back once a network is there, if it ended
+             without the user turning it off (KeepOn). -->
+        <service
+            android:name=".ResumeJob"
+            android:exported="false"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
+
+        <!-- "Start when the phone starts" (Settings), and protection back on
+             after an update of Shroudly ended it (KeepOn.updated). -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Automation apps (Tasker, MacroDroid): on, off, switch. Every
+             broadcast is ignored until the user allows it in Settings. -->
+        <receiver
+            android:name=".AutomationReceiver"
+            android:exported="true"
+            tools:ignore="ExportedReceiver">
+            <intent-filter>
+                <action android:name="me.codeshare.shroudly.action.START" />
+                <action android:name="me.codeshare.shroudly.action.STOP" />
+                <action android:name="me.codeshare.shroudly.action.TOGGLE" />
+            </intent-filter>
+        </receiver>
+
+        <!-- The home-screen widget (ShroudlyWidget): its own taps only. -->
+        <receiver
+            android:name=".ShroudlyWidget"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_info" />
+        </receiver>
+
+        <!-- Renames the notification channels when the system language changes. -->
+        <receiver
+            android:name=".LocaleReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.LOCALE_CHANGED" />
+            </intent-filter>
+        </receiver>
+
+        <service
+            android:name=".ShroudlyTileService"
+            android:exported="true"
+            android:icon="@drawable/ic_stat_logo"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+            <!-- An on/off switch (Android 13+). Not an "active" tile: the
+                 panel asks it for its state each time it opens, which every
+                 phone's panel does, while some never ask an active one and
+                 show a state of their own (issue #49). -->
+            <meta-data
+                android:name="android.service.quicksettings.TOGGLEABLE_TILE"
+                android:value="true" />
+        </service>
+    </application>
+</manifest>

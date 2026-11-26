@@ -1,0 +1,319 @@
+import MacDXcore
+import NetworkExtension
+import os.log
+
+class PacketTunnelProvider: NEPacketTunnelProvider {
+
+    private var logTimer: Timer?
+
+    override init() {
+        super.init()
+        let progressStream = ProgressStreamHandler()
+        MacosSetProgressListener(progressStream)
+    }
+
+    override func startTunnel(
+        options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void
+    ) {
+        os_log("Starting sing-box tunnel...")
+        
+        let success = MacosStartTunnel()
+        
+        if success {
+            os_log("Tunnel started successfully")
+            completionHandler(nil)
+        } else {
+            os_log("Failed to start tunnel")
+            let error = NSError(
+                domain: "PacketTunnelProvider",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to start sing-box tunnel"]
+            )
+            completionHandler(error)
+        }
+    }
+
+    override func stopTunnel(
+        with reason: NEProviderStopReason, completionHandler: @escaping () -> Void
+    ) {
+        os_log("VPN stopped with reason: %d", reason.rawValue)
+        os_log("Stopping VPN tunnel...")
+        MacosStopTunnel()
+        MacosStop()
+        os_log("Tunnel stopped successfully.")
+        completionHandler()
+    }
+
+    override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
+        guard let json = try? JSONSerialization.jsonObject(with: messageData, options: []),
+            let dict = json as? [String: String],
+            let command = dict["command"]
+        else {
+            os_log("Invalid JSON or missing command.")
+            completionHandler?(nil)
+            return
+        }
+
+        os_log("Received command: %@", command)
+
+        switch command {
+        case "START_TUNNEL":
+            let success = MacosStartTunnel()
+            let response = success ? "TUNNEL_STARTED" : "TUNNEL_ERROR"
+            os_log("Tunnel: %{public}@", response)
+            completionHandler?(response.data(using: .utf8))
+
+        case "MEASURE_PING":
+            do {
+                let ping = MacosMeasurePing()
+                let response = String(describing: ping)
+                if let data = response.data(using: .utf8) {
+                    completionHandler?(data)
+                } else {
+                    throw NSError(
+                        domain: "EncodingError", code: -1,
+                        userInfo: [NSLocalizedDescriptionKey: "Failed to encode response to UTF-8"])
+                }
+            } catch {
+                print("Error: \(error.localizedDescription)")
+                completionHandler?(nil)
+            }
+
+        case "GET_FLAG":
+            do {
+                let flag = MacosGetFlag()
+                let response: String = flag
+
+                if let data = response.data(using: .utf8) {
+                    completionHandler?(data)
+                } else {
+                    throw NSError(
+                        domain: "EncodingError", code: -1,
+                        userInfo: [NSLocalizedDescriptionKey: "Failed to encode response to UTF-8"])
+                }
+            } catch {
+                print("Error: \(error.localizedDescription)")
+                completionHandler?(nil)
+            }
+
+        case "START_VPN":
+            do {
+                let cacheDir = dict["cacheDir"] ?? ""
+                let flowLine = dict["flowLine"] ?? ""
+                let pattern = dict["pattern"] ?? ""
+
+                MacosStartVPN(cacheDir, flowLine, pattern)
+
+                let response = "VPN started successfully"
+
+                if let data = response.data(using: .utf8) {
+                    completionHandler?(data)
+                } else {
+                    throw NSError(
+                        domain: "EncodingError", code: -1,
+                        userInfo: [
+                            NSLocalizedDescriptionKey: "Failed to encode response to UTF-8"
+                        ])
+                }
+            } catch {
+                print("Error: \(error.localizedDescription)")
+                completionHandler?(nil)
+            }
+
+        case "STOP_VPN":
+            do {
+                MacosStopVPN()
+                let response = "VPN_STOPPED"
+                if let data = response.data(using: .utf8) {
+                    completionHandler?(data)
+                } else {
+                    throw NSError(
+                        domain: "EncodingError", code: -1,
+                        userInfo: [
+                            NSLocalizedDescriptionKey: "Failed to encode response to UTF-8"
+                        ])
+                }
+            } catch {
+                print("Error: \(error.localizedDescription)")
+                completionHandler?(nil)
+            }
+
+        case "SET_ASN_NAME":
+            do {
+                MacosSetAsnName()
+                let response = "ASN_NAME_SET"
+                if let data = response.data(using: .utf8) {
+                    completionHandler?(data)
+                } else {
+                    throw NSError(
+                        domain: "EncodingError", code: -1,
+                        userInfo: [
+                            NSLocalizedDescriptionKey: "Failed to encode response to UTF-8"
+                        ])
+                }
+            } catch {
+                print("Error: \(error.localizedDescription)")
+                completionHandler?(nil)
+            }
+
+        case "SET_TIMEZONE":
+            do {
+                let timezone = dict["timezone"] ?? "0.0"
+                let timezoneFloat = Float(timezone) ?? 0
+                let success = MacosSetTimeZone(timezoneFloat)
+
+                let response: String
+                if success {
+                    os_log("local time zone set successfully")
+                    response = "LOCAL_TIMEZONE_SET"
+                } else {
+                    os_log(
+                        "Failed to set local time zone: %{public}@", String(describing: success))
+                    response = "LOCAL_TIMEZONE_ERROR: \(success)"
+                }
+
+                if let data = response.data(using: .utf8) {
+                    completionHandler?(data)
+                } else {
+                    throw NSError(
+                        domain: "EncodingError", code: -1,
+                        userInfo: [
+                            NSLocalizedDescriptionKey: "Failed to encode response to UTF-8"
+                        ])
+                }
+            } catch {
+                print("Error: \(error.localizedDescription)")
+                completionHandler?(nil)
+            }
+
+        case "GET_FLOW_LINE":
+            do {
+                let isTime = dict["isTime"] ?? "false"
+                let isTimeBool = Bool(isTime) ?? false
+                let flowLine = MacosGetFlowLine(isTimeBool)
+                let response: String = flowLine
+
+                if let data = response.data(using: .utf8) {
+                    completionHandler?(data)
+                } else {
+                    throw NSError(
+                        domain: "EncodingError",
+                        code: -1,
+                        userInfo: [NSLocalizedDescriptionKey: "Failed to encode response to UTF-8"]
+                    )
+                }
+            } catch {
+                print("Error: \(error.localizedDescription)")
+                completionHandler?(nil)
+            }
+
+        case "GET_CACHED_FLOW_LINE":
+            do {
+                let flowLine = MacosGetCachedFlowLine()
+                let response: String = flowLine
+
+                if let data = response.data(using: .utf8) {
+                    completionHandler?(data)
+                } else {
+                    throw NSError(
+                        domain: "EncodingError",
+                        code: -1,
+                        userInfo: [NSLocalizedDescriptionKey: "Failed to encode response to UTF-8"]
+                    )
+                }
+            } catch {
+                print("Error: \(error.localizedDescription)")
+                completionHandler?(nil)
+            }
+
+        case "DECODE_VERIFY_FLOWLINE":
+            do {
+                let flowLine = dict["flowLine"] ?? ""
+                let decodedFlowLine = MacosDecodeAndVerifyFlowline(flowLine)
+                let response: String = decodedFlowLine
+
+                if let data = response.data(using: .utf8) {
+                    completionHandler?(data)
+                } else {
+                    throw NSError(
+                        domain: "EncodingError",
+                        code: -1,
+                        userInfo: [NSLocalizedDescriptionKey: "Failed to encode response to UTF-8"]
+                    )
+                }
+            } catch {
+                print("Error: \(error.localizedDescription)")
+                completionHandler?(nil)
+            }
+
+        case "SET_CACHE_DIR":
+            do {
+                let cacheDir = dict["cacheDir"] ?? ""
+                MacosSetCacheDir(cacheDir)
+                completionHandler?(Data())
+            } catch {
+                print("Error: \(error.localizedDescription)")
+                completionHandler?(nil)
+            }
+
+        default:
+            os_log("Unknown command received.")
+            completionHandler?(nil)
+        }
+    }
+
+    override func sleep(completionHandler: @escaping () -> Void) {
+        os_log("Tunnel going to sleep...")
+        completionHandler()
+    }
+
+    override func wake() {
+        os_log("Tunnel waking up...")
+    }
+
+    func getLogFilePath() -> String {
+        guard
+            let groupURL = FileManager.default.containerURL(
+                forSecurityApplicationGroupIdentifier: "group.de.unboundtech.defyxvpn")
+        else {
+            os_log("Error getting file path..")
+            return "/dev/null"
+        }
+        let path = groupURL.appendingPathComponent("warp_logs.txt").path
+        os_log("FilePath received %@", path)
+        return path
+    }
+
+    private func saveLogToFile(_ logData: Data) {
+        let fileName = "warp_logs.txt"
+        let fileURL = FileManager.default
+            .urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(fileName)
+
+        do {
+            if FileManager.default.fileExists(atPath: fileURL.path) {
+                let fileHandle = try FileHandle(forWritingTo: fileURL)
+                fileHandle.seekToEndOfFile()
+                fileHandle.write(logData)
+                fileHandle.closeFile()
+            } else {
+                try logData.write(to: fileURL, options: .atomic)
+            }
+        } catch {
+            os_log(
+                "[DXcore] ERROR: Writing Log File: %@", log: .default, type: .error,
+                error.localizedDescription)
+        }
+    }
+}
+
+class ProgressStreamHandler: NSObject, MacosProgressListenerProtocol {
+    func onProgress(_ msg: String?) {
+        if let defaults = UserDefaults(suiteName: "group.de.unboundtech.defyxvpn") {
+            var logs = defaults.stringArray(forKey: "vpn_logs") ?? []
+            logs.append(msg ?? "")
+            defaults.set(logs, forKey: "vpn_logs")
+            defaults.synchronize()
+        }
+    }
+}

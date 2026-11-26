@@ -1,0 +1,1956 @@
+#!/bin/sh
+#
+# Regression tests for volunteer-up.sh.
+#
+# The helper is deliberately a POSIX-sh, curl-to-sh entry point rather than a
+# sourceable library.  These tests therefore exercise it as an operator would:
+# under dash (when available), with a file-backed Docker stub.  A temporary
+# copy changes only the absolute host paths (/etc, /sys, the terminal device)
+# so the suite never needs root, never touches the host's real relay
+# configuration, and never blocks on the developer's own terminal.  A
+# regular file stands in for the terminal: its lines are the operator's
+# answers and the script appends its question to it.
+set -u
+
+HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+SCRIPT=$HERE/volunteer-up.sh
+
+if [ -n "${OPENRUNG_TEST_SHELL:-}" ]; then
+    TEST_SHELL=$OPENRUNG_TEST_SHELL
+elif command -v dash >/dev/null 2>&1; then
+    TEST_SHELL=$(command -v dash)
+else
+    TEST_SHELL=/bin/sh
+fi
+[ -x "$TEST_SHELL" ] || {
+    echo "FAIL: requested test shell is not executable: $TEST_SHELL" >&2
+    exit 1
+}
+
+TEST_TMP=$(mktemp -d "${TMPDIR:-/tmp}/openrung-volunteer-test.XXXXXX") || exit 1
+trap 'rm -rf "$TEST_TMP"' 0
+trap 'exit 1' HUP INT TERM
+
+ENV_FILE=$TEST_TMP/relay.env
+LEGACY_ENV_FILE=$TEST_TMP/volunteer.env
+RUN_SCRIPT=$TEST_TMP/volunteer-up.sh
+LIB_SCRIPT=$TEST_TMP/volunteer-up-lib.sh
+FAKE_BIN=$TEST_TMP/bin
+SIM_DIR=$TEST_TMP/docker
+CONTAINERS=$SIM_DIR/containers
+DOCKER_LOG=$TEST_TMP/docker.log
+FIREWALL_LOG=$TEST_TMP/firewall.log
+DMI_DIR=$TEST_TMP/dmi
+OUTPUT=$TEST_TMP/output
+TTY_FILE=$TEST_TMP/tty
+PASSWD_FILE=$TEST_TMP/passwd
+PROC_NET_IPV4=$TEST_TMP/proc-net-ipv4
+SYSCTL_DIR=$TEST_TMP/sysctl.d
+MODULES_LOAD_DIR=$TEST_TMP/modules-load.d
+TCP_LOG=$TEST_TMP/tcp.log
+EGRESS_LIMIT_BIN=$TEST_TMP/sbin/openrung-egress-limit
+EGRESS_LIMIT_UNIT=$TEST_TMP/systemd/openrung-egress-limit.service
+SYSTEMD_RUN_DIR=$TEST_TMP/run-systemd
+EGRESS_LOG=$TEST_TMP/egress.log
+NFT_INSTALLED=$TEST_TMP/nft-installed
+SYSTEMD_UNIT_DIR=$TEST_TMP/systemd-units
+OPERATOR_HOME=$TEST_TMP/home/alice
+CONTACT_QUESTION='volunteer-up: contact email for this relay (Optional, we will only contact you if there is an issue with your relay)'
+
+mkdir -p "$FAKE_BIN" "$CONTAINERS" || exit 1
+
+# Keep this transformation intentionally narrow.  If the production helper's
+# entry point or path assignments change, fail loudly instead of accidentally
+# running an unmodified root-oriented script from the test suite.
+if [ "$(tail -n 1 "$SCRIPT")" != 'main "$@"' ]; then
+    echo "FAIL: volunteer-up.sh no longer ends with its guarded main entry point" >&2
+    exit 1
+fi
+
+sed \
+    -e "s|^    ENV_FILE=/etc/openrung/relay.env$|    ENV_FILE='$ENV_FILE'|" \
+    -e "s|^    DMI_DIR=/sys/class/dmi/id$|    DMI_DIR='$DMI_DIR'|" \
+    -e "s|^    TTY_DEVICE=/dev/tty$|    TTY_DEVICE='$TTY_FILE'|" \
+    -e "s|^    PASSWD_FILE=/etc/passwd$|    PASSWD_FILE='$PASSWD_FILE'|" \
+    -e "s|^    PROC_NET_IPV4=/proc/sys/net/ipv4$|    PROC_NET_IPV4='$PROC_NET_IPV4'|" \
+    -e "s|^    SYSCTL_DIR=/etc/sysctl.d$|    SYSCTL_DIR='$SYSCTL_DIR'|" \
+    -e "s|^    MODULES_LOAD_DIR=/etc/modules-load.d$|    MODULES_LOAD_DIR='$MODULES_LOAD_DIR'|" \
+    -e "s|^    EGRESS_LIMIT_BIN=/usr/local/sbin/openrung-egress-limit$|    EGRESS_LIMIT_BIN='$EGRESS_LIMIT_BIN'|" \
+    -e "s|^    EGRESS_LIMIT_UNIT=/etc/systemd/system/openrung-egress-limit.service$|    EGRESS_LIMIT_UNIT='$EGRESS_LIMIT_UNIT'|" \
+    -e "s|^    SYSTEMD_RUN_DIR=/run/systemd/system$|    SYSTEMD_RUN_DIR='$SYSTEMD_RUN_DIR'|" \
+    -e "s|^    SYSTEMD_UNIT_DIR=/etc/systemd/system$|    SYSTEMD_UNIT_DIR='$SYSTEMD_UNIT_DIR'|" \
+    -e "s|/etc/openrung/volunteer.env|$LEGACY_ENV_FILE|g" \
+    "$SCRIPT" >"$RUN_SCRIPT" || exit 1
+grep -q "DMI_DIR='$DMI_DIR'" "$RUN_SCRIPT" || {
+    echo "FAIL: volunteer-up.sh no longer assigns DMI_DIR where the suite expects" >&2
+    exit 1
+}
+for expected in "TTY_DEVICE='$TTY_FILE'" "PASSWD_FILE='$PASSWD_FILE'" \
+    "PROC_NET_IPV4='$PROC_NET_IPV4'" "SYSCTL_DIR='$SYSCTL_DIR'" "MODULES_LOAD_DIR='$MODULES_LOAD_DIR'" \
+    "EGRESS_LIMIT_BIN='$EGRESS_LIMIT_BIN'" "EGRESS_LIMIT_UNIT='$EGRESS_LIMIT_UNIT'" "SYSTEMD_RUN_DIR='$SYSTEMD_RUN_DIR'" \
+    "SYSTEMD_UNIT_DIR='$SYSTEMD_UNIT_DIR'"; do
+    grep -qF "$expected" "$RUN_SCRIPT" || {
+        echo "FAIL: volunteer-up.sh no longer assigns ${expected%%=*} where the suite expects" >&2
+        exit 1
+    }
+done
+sed '$d' "$RUN_SCRIPT" >"$LIB_SCRIPT" || exit 1
+
+# The sudo user whose git email the contact question may suggest.
+mkdir -p "$OPERATOR_HOME" || exit 1
+printf 'alice:x:1000:1000::%s:/bin/sh\n' "$OPERATOR_HOME" >"$PASSWD_FILE" || exit 1
+printf '[user]\n\tname = Alice\n\temail = alice@example.org\n' >"$OPERATOR_HOME/.gitconfig" || exit 1
+
+# Deterministic git: only the one read the helper performs.
+cat >"$FAKE_BIN/git" <<'EOF'
+#!/bin/sh
+[ "$1" = config ] && [ "$2" = --file ] && [ "$4" = --get ] && [ "$5" = user.email ] || exit 2
+sed -n 's/^[[:space:]]*email[[:space:]]*=[[:space:]]*//p' "$3" | head -n 1 | grep .
+EOF
+chmod +x "$FAKE_BIN/git" || exit 1
+
+cat >"$FAKE_BIN/id" <<'EOF'
+#!/bin/sh
+printf '0\n'
+EOF
+
+cat >"$FAKE_BIN/sleep" <<'EOF'
+#!/bin/sh
+# Registration timeout tests must not take a real minute.
+exit 0
+EOF
+
+# Host firewall front-ends: present on every run (as on a typical VPS image),
+# inactive unless a test says otherwise, and every call recorded.
+cat >"$FAKE_BIN/ufw" <<'EOF'
+#!/bin/sh
+printf 'ufw %s\n' "$*" >>"$FIREWALL_LOG"
+case "${1:-}" in
+    status)
+        if [ "${SIM_UFW:-inactive}" = active ]; then echo 'Status: active'; else echo 'Status: inactive'; fi
+        ;;
+esac
+exit 0
+EOF
+
+cat >"$FAKE_BIN/firewall-cmd" <<'EOF'
+#!/bin/sh
+printf 'firewall-cmd %s\n' "$*" >>"$FIREWALL_LOG"
+case "${1:-}" in
+    --state)
+        if [ "${SIM_FIREWALLD:-stopped}" = running ]; then echo running; exit 0; fi
+        echo 'not running'
+        exit 252
+        ;;
+esac
+exit 0
+EOF
+
+chmod +x "$FAKE_BIN/ufw" "$FAKE_BIN/firewall-cmd"
+
+# The kernel's TCP keys live in a directory standing in for
+# /proc/sys/net/ipv4. modprobe makes BBR available, as on a stock distro
+# kernel, unless SIM_BBR=absent (a kernel or container without it).
+cat >"$FAKE_BIN/modprobe" <<EOF
+#!/bin/sh
+printf 'modprobe %s\n' "\$*" >>'$TCP_LOG'
+[ "\${SIM_BBR:-module}" = module ] || exit 1
+printf 'reno cubic bbr\n' >'$PROC_NET_IPV4/tcp_available_congestion_control'
+EOF
+chmod +x "$FAKE_BIN/modprobe"
+
+# The host's IPv6 state for the access address. SIM_IPV6 picks the server:
+# none (no IPv6 default route), routed (a global /64 on eth0, as on most VPS
+# providers), single (one /128, as on providers that assign addresses one
+# by one), ula_first (a unique local /64 listed before the public one) or
+# ula_only. Addresses the helper adds live in $SIM_DIR/ip6 as "address flag",
+# flag "deprecated" or "-" (SIM_DEPRECATE=no models a kernel that ignored
+# preferred_lft). Every call is recorded in $SIM_DIR/ip.log.
+cat >"$FAKE_BIN/ip" <<'EOF'
+#!/bin/sh
+printf 'ip %s\n' "$*" >>"$SIM_DIR/ip.log"
+state=$SIM_DIR/ip6
+touch "$state"
+show_added() {
+    while read -r show_addr show_flag; do
+        [ -z "${1:-}" ] || [ "$show_addr" = "$1" ] || continue
+        [ "$show_flag" = - ] && show_flag=''
+        printf '2: eth0    inet6 %s/128 scope global %s\\       valid_lft forever preferred_lft 0sec\n' "$show_addr" "$show_flag"
+    done <"$state"
+}
+drop() {
+    grep -v "^$1 " "$state" >"$state.tmp"
+    mv "$state.tmp" "$state"
+}
+case "$*" in
+    '-6 route show default')
+        [ "${SIM_IPV6:-none}" = none ] || echo 'default via fe80::1 dev eth0 proto static metric 1024 pref medium'
+        ;;
+    '-6 -o address show dev eth0 scope global')
+        case "${SIM_IPV6:-none}" in
+            routed) echo '2: eth0    inet6 2001:db8:a:b::1/64 scope global \       valid_lft forever preferred_lft forever' ;;
+            single) echo '2: eth0    inet6 2001:db8:a:b::1/128 scope global dynamic noprefixroute \       valid_lft 400sec preferred_lft 100sec' ;;
+            ula_first)
+                echo '2: eth0    inet6 FD12:3456:789A:1::1/64 scope global \       valid_lft forever preferred_lft forever'
+                echo '2: eth0    inet6 2001:db8:a:b::1/64 scope global \       valid_lft forever preferred_lft forever'
+                ;;
+            ula_only) echo '2: eth0    inet6 fd12:3456:789a:1::1/64 scope global \       valid_lft forever preferred_lft forever' ;;
+        esac
+        show_added
+        ;;
+    '-6 address add '*'/128 dev eth0 preferred_lft 0 nodad' | '-6 address replace '*'/128 dev eth0 preferred_lft 0 nodad')
+        addr=${4%/128}
+        if [ "$3" = add ] && grep -q "^$addr " "$state"; then exit 2; fi
+        drop "$addr"
+        if [ "${SIM_DEPRECATE:-yes}" = yes ]; then flag=deprecated; else flag=-; fi
+        printf '%s %s\n' "$addr" "$flag" >>"$state"
+        ;;
+    '-6 -o address show to '*'/128')
+        show_added "${6%/128}"
+        ;;
+    '-o address show to '*)
+        show_added "$5"
+        ;;
+    '-6 address delete '*'/128 dev eth0')
+        grep -q "^${4%/128} " "$state" || exit 2
+        drop "${4%/128}"
+        ;;
+    *)
+        echo "unexpected ip call: $*" >&2
+        exit 2
+        ;;
+esac
+EOF
+
+# curl is only used by the access-address probe here (tests pass the public
+# host): SIM_ACCESS_PROBE=ok answers a request bound to an address, anything
+# else times out, and the source address must be on the interface.
+cat >"$FAKE_BIN/curl" <<'EOF'
+#!/bin/sh
+printf 'curl %s\n' "$*" >>"$SIM_DIR/curl.log"
+bound=''
+while [ "$#" -gt 0 ]; do
+    case "$1" in --interface) bound=$2; shift ;; esac
+    shift
+done
+[ -n "$bound" ] || exit 6
+grep -q "^$bound " "$SIM_DIR/ip6" 2>/dev/null || exit 45
+[ "${SIM_ACCESS_PROBE:-ok}" = ok ] || exit 28
+exit 0
+EOF
+
+chmod +x "$FAKE_BIN/ip" "$FAKE_BIN/curl"
+
+# nftables is installed unless SIM_NFT=absent; then the apt-get stub installs
+# it (unless SIM_APT=fail). nft is probed with --version, so a real nft or
+# apt-get later on PATH is never reached. systemctl records its calls;
+# SIM_SYSTEMCTL=fail makes enabling a unit fail.
+cat >"$FAKE_BIN/nft" <<EOF
+#!/bin/sh
+[ "\${SIM_NFT:-present}" = present ] || [ -e '$NFT_INSTALLED' ] || exit 127
+exit 0
+EOF
+cat >"$FAKE_BIN/apt-get" <<EOF
+#!/bin/sh
+printf 'apt-get %s\n' "\$*" >>'$EGRESS_LOG'
+[ "\${SIM_APT:-ok}" = ok ] || exit 100
+case "\$*" in *'install -y nftables'*) : >'$NFT_INSTALLED' ;; esac
+EOF
+cat >"$FAKE_BIN/systemctl" <<EOF
+#!/bin/sh
+printf 'systemctl %s\n' "\$*" >>'$EGRESS_LOG'
+if [ "\${SIM_SYSTEMCTL:-ok}" = fail ] && [ "\${1:-}" = enable ]; then exit 1; fi
+exit 0
+EOF
+chmod +x "$FAKE_BIN/nft" "$FAKE_BIN/apt-get" "$FAKE_BIN/systemctl"
+
+cat >"$FAKE_BIN/docker" <<'EOF'
+#!/bin/sh
+set -u
+
+containers=$SIM_DIR/containers
+log=$DOCKER_LOG
+scenario=${SIM_SCENARIO:-ok}
+label_scenario=${SIM_LABEL_SCENARIO:-ok}
+op=${1:-}
+[ "$#" -gt 0 ] && shift
+
+last_arg() {
+    last=
+    for value do last=$value; done
+    printf '%s' "$last"
+}
+
+read_state() {
+    state_name=$1
+    [ -f "$containers/$state_name" ] || return 1
+    read -r state_running state_restarts state_registered state_generation state_id \
+        <"$containers/$state_name"
+}
+
+resolve_name() {
+    resolve_ref=$1
+    if [ -f "$containers/$resolve_ref" ]; then
+        printf '%s' "$resolve_ref"
+        return 0
+    fi
+    for resolve_path in "$containers"/*; do
+        [ -f "$resolve_path" ] || continue
+        resolve_candidate=${resolve_path##*/}
+        read_state "$resolve_candidate" || continue
+        if [ "$state_id" = "$resolve_ref" ]; then
+            printf '%s' "$resolve_candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+write_state() {
+    printf '%s %s %s %s %s\n' "$2" "$3" "$4" "$5" "$6" >"$containers/$1"
+}
+
+case "$op" in
+    ps)
+        for state_path in "$containers"/*; do
+            [ -f "$state_path" ] || continue
+            printf '%s\n' "${state_path##*/}"
+        done
+        ;;
+    inspect)
+        format=
+        name=
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                -f | --format)
+                    format=$2
+                    shift 2
+                    ;;
+                *)
+                    name=$1
+                    shift
+                    ;;
+            esac
+        done
+        name=$(resolve_name "$name") || exit 1
+        read_state "$name" || exit 1
+        case "$format" in
+            *com.docker.compose.project*)
+                printf '\n'
+                ;;
+            *'{{.Id}}'*)
+                printf '%s\n' "$state_id"
+                ;;
+            *State.Running*RestartCount*)
+                printf '%s %s\n' "$state_running" "$state_restarts"
+                ;;
+            *RestartCount*)
+                printf '%s\n' "$state_restarts"
+                ;;
+            *State.Running*)
+                printf '%s\n' "$state_running"
+                ;;
+            *)
+                printf '\n'
+                ;;
+        esac
+        ;;
+    pull)
+        printf 'pull %s\n' "${1:-}" >>"$log"
+        ;;
+    run)
+        printf 'run %s\n' "$*" >>"$log"
+        # The egress-limit copy-out: a stand-in script that records how the
+        # host runs it (SIM_EGRESS_SCRIPT=missing models an image without
+        # one; SIM_EGRESS_APPLY=fail a ruleset nft refuses).
+        if [ "$#" -eq 9 ] && [ "$1 $2 $3 $4 $5 $6 $7" = '--rm --network none --cap-drop ALL --entrypoint cat' ] \
+            && [ "$9" = /usr/local/bin/egress-limit ]; then
+            [ "${SIM_EGRESS_SCRIPT:-ok}" = ok ] || exit 1
+            cat <<SCRIPT
+#!/bin/sh
+printf 'egress-limit %s\\n' "\$*" >>'${DOCKER_LOG%/*}/egress.log'
+case "\$1" in
+    apply) [ "${SIM_EGRESS_APPLY:-ok}" = ok ] ;;
+    unit) printf '[Unit]\\nDescription=stand-in egress limit\\n' ;;
+esac
+SCRIPT
+            exit 0
+        fi
+        if [ "$#" -ne 5 ] \
+            || [ "$1" != --rm ] \
+            || [ "$2" != --entrypoint ] \
+            || [ "$3" != /usr/local/bin/relay ] \
+            || [ -z "$4" ] \
+            || [ "$5" != -print-label ]; then
+            echo "unexpected docker run arguments: $*" >&2
+            exit 2
+        fi
+        case "$label_scenario" in
+            ok)
+                # Model the current relay image's provisioning-only flag.
+                # Keep this deterministic so unrelated transaction tests do
+                # not depend on /dev/urandom or accidentally exercise fallback.
+                printf 'amber-alpaca\n'
+                ;;
+            unsupported)
+                # Model an image that predates -print-label.
+                exit 2
+                ;;
+            *)
+                echo "unknown label scenario: $label_scenario" >&2
+                exit 2
+                ;;
+        esac
+        ;;
+    stop)
+        stop_ref=$(last_arg "$@")
+        name=$(resolve_name "$stop_ref") || exit 1
+        printf 'stop %s\n' "$stop_ref" >>"$log"
+        read_state "$name" || exit 1
+        write_state "$name" false "$state_restarts" "$state_registered" "$state_generation" "$state_id"
+        ;;
+    rename)
+        source_ref=${1:-}
+        target_name=${2:-}
+        source_name=$(resolve_name "$source_ref") || exit 1
+        printf 'rename %s %s\n' "$source_name" "$target_name" >>"$log"
+        [ -f "$containers/$source_name" ] || exit 1
+        [ ! -e "$containers/$target_name" ] || exit 1
+        mv "$containers/$source_name" "$containers/$target_name"
+        ;;
+    create)
+        name=
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --name)
+                    name=$2
+                    shift 2
+                    ;;
+                --name=*)
+                    name=${1#--name=}
+                    shift
+                    ;;
+                *)
+                    shift
+                    ;;
+            esac
+        done
+        printf 'create %s\n' "$name" >>"$log"
+        [ -n "$name" ] || exit 2
+        [ ! -e "$containers/$name" ] || exit 1
+        if [ "$scenario" = create_fail ]; then
+            # Model a concurrent name-conflict race: create returns no ID, so
+            # the helper must not claim or remove the object that now owns the
+            # requested name.
+            write_state "$name" false 0 no alien id-alien
+            exit 1
+        fi
+        case "$scenario" in
+            crash_loop)
+                write_state "$name" false 1 no candidate id-candidate
+                ;;
+            no_register)
+                write_state "$name" false 0 no candidate id-candidate
+                ;;
+            *)
+                write_state "$name" false 0 yes candidate id-candidate
+                ;;
+        esac
+        printf 'id-candidate\n'
+        ;;
+    logs)
+        logs_ref=$(last_arg "$@")
+        name=$(resolve_name "$logs_ref") || exit 1
+        read_state "$name" || exit 1
+        if [ "$state_registered" = yes ]; then
+            # A broker that cannot reach the port refuses the registration and
+            # the relay logs the refusal verbatim while retrying; the stub
+            # models that with SIM_REACHABILITY=unreachable. opens_after:N
+            # has the broker accept the retry from the Nth logs call on,
+            # modelling a port opened while the script waits.
+            logs_calls=$(cat "$SIM_DIR/logs_calls" 2>/dev/null || echo 0)
+            logs_calls=$((logs_calls + 1))
+            printf '%s\n' "$logs_calls" >"$SIM_DIR/logs_calls"
+            refusal='relay stopped: register with broker: broker /api/v1/relays/register: public endpoint unreachable: the broker could not connect to 8.8.8.8:443 (simulated) — retrying in 2s'
+            case "${SIM_REACHABILITY:-accepted}" in
+                unreachable)
+                    printf '%s\n' "$refusal"
+                    ;;
+                refused_after:*)
+                    # The relay makes three silent registration attempts
+                    # before it logs a refusal; model that delay in logs
+                    # calls (the suite's sleep is instant).
+                    if [ "$logs_calls" -ge "${SIM_REACHABILITY#refused_after:}" ]; then
+                        printf '%s\n' "$refusal"
+                    else
+                        printf 'simulated relay awaiting registration\n'
+                    fi
+                    ;;
+                opens_after:*)
+                    printf '%s\n' "$refusal"
+                    if [ "$logs_calls" -ge "${SIM_REACHABILITY#opens_after:}" ]; then
+                        printf 'registered relay (simulated)\n'
+                    fi
+                    ;;
+                *)
+                    printf 'registered relay (simulated)\n'
+                    ;;
+            esac
+        elif [ "$state_restarts" != 0 ]; then
+            printf 'simulated relay crash\n'
+        else
+            printf 'simulated relay awaiting registration\n'
+        fi
+        ;;
+    rm)
+        status=0
+        for rm_ref do
+            case "$rm_ref" in -*) continue ;; esac
+            name=$(resolve_name "$rm_ref") || {
+                status=1
+                continue
+            }
+            printf 'rm %s\n' "$name" >>"$log"
+            if [ -e "$containers/$name" ]; then
+                rm "$containers/$name"
+            else
+                status=1
+            fi
+        done
+        exit "$status"
+        ;;
+    start)
+        start_ref=$(last_arg "$@")
+        name=$(resolve_name "$start_ref") || exit 1
+        printf 'start %s\n' "$start_ref" >>"$log"
+        read_state "$name" || exit 1
+        if [ "$scenario" = start_fail ] && [ "$state_generation" = candidate ]; then
+            exit 1
+        fi
+        write_state "$name" true "$state_restarts" "$state_registered" "$state_generation" "$state_id"
+        printf '%s\n' "$start_ref"
+        ;;
+    *)
+        echo "unexpected docker operation: $op $*" >&2
+        exit 2
+        ;;
+esac
+EOF
+
+chmod +x "$FAKE_BIN/id" "$FAKE_BIN/sleep" "$FAKE_BIN/docker" || exit 1
+
+PASS=0
+FAIL=0
+
+pass() {
+    PASS=$((PASS + 1))
+}
+
+fail() {
+    echo "FAIL: $*" >&2
+    FAIL=$((FAIL + 1))
+}
+
+assert_nonzero() {
+    if [ "$1" -ne 0 ]; then
+        pass
+    else
+        fail "$2: expected failure, got success"
+    fi
+}
+
+assert_log_has_create() {
+    if grep -q '^create ' "$DOCKER_LOG"; then
+        pass
+    else
+        fail "$1: candidate docker create was not exercised"
+    fi
+}
+
+assert_no_mutating_docker_calls() {
+    if grep -q \
+        -e '^pull ' \
+        -e '^stop ' \
+        -e '^rename ' \
+        -e '^create ' \
+        -e '^rm ' \
+        -e '^start ' \
+        "$DOCKER_LOG"; then
+        fail "$1: rejected configuration reached a Docker mutation"
+    else
+        pass
+    fi
+}
+
+assert_prior_is_live() {
+    if [ ! -f "$CONTAINERS/openrung-relay" ]; then
+        fail "$1: openrung-relay was not restored"
+        return
+    fi
+    read -r restored_running restored_restarts restored_registered restored_generation restored_id \
+        <"$CONTAINERS/openrung-relay"
+    if [ "$restored_running" = true ] \
+        && [ "$restored_generation" = prior ] \
+        && [ "$restored_id" = id-prior ] \
+        && [ ! -e "$CONTAINERS/openrung-relay-old" ] \
+        && [ ! -e "$CONTAINERS/openrung-relay-new" ]; then
+        pass
+    else
+        fail "$1: live state is '$restored_running $restored_restarts $restored_registered $restored_generation $restored_id', expected only the running prior container under the canonical name"
+    fi
+}
+
+assert_candidate_is_live() {
+    if [ ! -f "$CONTAINERS/openrung-relay" ]; then
+        fail "$1: promoted openrung-relay is missing"
+        return
+    fi
+    read -r promoted_running promoted_restarts promoted_registered promoted_generation promoted_id \
+        <"$CONTAINERS/openrung-relay"
+    if [ "$promoted_running" = true ] \
+        && [ "$promoted_restarts" = 0 ] \
+        && [ "$promoted_registered" = yes ] \
+        && [ "$promoted_generation" = candidate ] \
+        && [ "$promoted_id" = id-candidate ] \
+        && [ ! -e "$CONTAINERS/openrung-relay-old" ] \
+        && [ ! -e "$CONTAINERS/openrung-relay-new" ]; then
+        pass
+    else
+        fail "$1: live state is '$promoted_running $promoted_restarts $promoted_registered $promoted_generation $promoted_id', expected only the verified candidate under the canonical name"
+    fi
+}
+
+assert_prior_and_unowned_candidate_are_preserved() {
+    if [ ! -f "$CONTAINERS/openrung-relay" ] \
+        || [ ! -f "$CONTAINERS/openrung-relay-new" ] \
+        || [ -e "$CONTAINERS/openrung-relay-old" ]; then
+        fail "$1: expected restored canonical relay plus untouched unowned name-conflict container"
+        return
+    fi
+    read -r _ _ _ conflict_generation conflict_id \
+        <"$CONTAINERS/openrung-relay-new"
+    read -r restored_running restored_restarts restored_registered restored_generation restored_id \
+        <"$CONTAINERS/openrung-relay"
+    if [ "$restored_running" = true ] \
+        && [ "$restored_generation" = prior ] \
+        && [ "$restored_id" = id-prior ] \
+        && [ "$conflict_generation" = alien ] \
+        && [ "$conflict_id" = id-alien ]; then
+        pass
+    else
+        fail "$1: create failure claimed or disturbed a container ID it did not create"
+    fi
+}
+
+reset_simulation() {
+    rm -rf "$CONTAINERS"
+    mkdir -p "$CONTAINERS"
+    printf 'true 0 yes prior id-prior\n' >"$CONTAINERS/openrung-relay"
+    : >"$DOCKER_LOG"
+    : >"$FIREWALL_LOG"
+    rm -f "$LEGACY_ENV_FILE" "$SIM_DIR/logs_calls" "$TTY_FILE"
+    rm -rf "$DMI_DIR"
+    mkdir -p "$DMI_DIR"
+    rm -rf "$PROC_NET_IPV4" "$SYSCTL_DIR" "$MODULES_LOAD_DIR"
+    mkdir -p "$PROC_NET_IPV4"
+    printf 'cubic\n' >"$PROC_NET_IPV4/tcp_congestion_control"
+    printf 'reno cubic\n' >"$PROC_NET_IPV4/tcp_available_congestion_control"
+    printf '1\n' >"$PROC_NET_IPV4/tcp_slow_start_after_idle"
+    : >"$TCP_LOG"
+    rm -rf "${EGRESS_LIMIT_BIN%/*}" "${EGRESS_LIMIT_UNIT%/*}" "$SYSTEMD_RUN_DIR" "$NFT_INSTALLED"
+    mkdir -p "${EGRESS_LIMIT_UNIT%/*}" "$SYSTEMD_RUN_DIR"
+    : >"$EGRESS_LOG"
+    rm -rf "$SYSTEMD_UNIT_DIR"
+    mkdir -p "$SYSTEMD_UNIT_DIR"
+    rm -f "$SIM_DIR/ip6" "$SIM_DIR/ip.log" "$SIM_DIR/curl.log"
+}
+
+write_env() {
+    {
+        printf 'OPENRUNG_BROKER_URL=https://broker-origin.openrung.org\n'
+        printf 'OPENRUNG_PUBLIC_HOST=8.8.8.8\n'
+        printf 'OPENRUNG_IDENTITY_SEED=test-identity-seed\n'
+        while [ "$#" -gt 0 ]; do
+            printf '%s\n' "$1"
+            shift
+        done
+    } >"$ENV_FILE"
+}
+
+run_volunteer_up() {
+    run_scenario=$1
+    shift
+    if env "$@" \
+        PATH="$FAKE_BIN:$PATH" \
+        SIM_DIR="$SIM_DIR" \
+        DOCKER_LOG="$DOCKER_LOG" \
+        FIREWALL_LOG="$FIREWALL_LOG" \
+        SIM_SCENARIO="$run_scenario" \
+        "$TEST_SHELL" "$RUN_SCRIPT" >"$OUTPUT" 2>&1; then
+        RUN_RC=0
+    else
+        RUN_RC=$?
+    fi
+}
+
+run_volunteer_up_first_run() {
+    # First-run path: no env file, no prior container. OPENRUNG_PUBLIC_HOST
+    # skips public-IP detection. The contact question is asked only when
+    # $TTY_FILE exists (a test writes the answers into it first).
+    run_scenario=$1
+    shift
+    if env "$@" \
+        OPENRUNG_PUBLIC_HOST=8.8.8.8 \
+        PATH="$FAKE_BIN:$PATH" \
+        SIM_DIR="$SIM_DIR" \
+        DOCKER_LOG="$DOCKER_LOG" \
+        FIREWALL_LOG="$FIREWALL_LOG" \
+        SIM_SCENARIO="$run_scenario" \
+        "$TEST_SHELL" "$RUN_SCRIPT" >"$OUTPUT" 2>&1; then
+        RUN_RC=0
+    else
+        RUN_RC=$?
+    fi
+}
+
+run_volunteer_up_with_host_foundation_token() {
+    run_scenario=$1
+    if OPENRUNG_FOUNDATION_TOKEN=host-foundation-secret \
+        PATH="$FAKE_BIN:$PATH" \
+        SIM_DIR="$SIM_DIR" \
+        DOCKER_LOG="$DOCKER_LOG" \
+        FIREWALL_LOG="$FIREWALL_LOG" \
+        SIM_SCENARIO="$run_scenario" \
+        "$TEST_SHELL" "$RUN_SCRIPT" >"$OUTPUT" 2>&1; then
+        RUN_RC=0
+    else
+        RUN_RC=$?
+    fi
+}
+
+test_foundation_env_is_refused_before_mutation() {
+    reset_simulation
+    write_env 'OPENRUNG_FOUNDATION_TOKEN=foundation-secret'
+    run_volunteer_up ok
+    assert_nonzero "$RUN_RC" "Foundation-owned env"
+    assert_no_mutating_docker_calls "Foundation-owned env"
+    if grep -qi 'foundation' "$OUTPUT"; then
+        pass
+    else
+        fail "Foundation-owned env: refusal does not explain Foundation ownership"
+    fi
+    assert_prior_is_live "Foundation-owned env"
+}
+
+test_foundation_token_duplicates_fail_closed() {
+    # Docker --env-file gives the last duplicate to the container, but this
+    # helper cannot safely infer volunteer ownership from a blank or ambiguous
+    # Foundation assignment.  Treat every occurrence as a fail-closed
+    # Foundation ownership marker, regardless of ordering.
+    reset_simulation
+    write_env \
+        'OPENRUNG_FOUNDATION_TOKEN=' \
+        'OPENRUNG_FOUNDATION_TOKEN=last-value-is-usable'
+    run_volunteer_up create_fail
+    assert_nonzero "$RUN_RC" "last non-empty Foundation token"
+    assert_no_mutating_docker_calls "last non-empty Foundation token"
+    assert_prior_is_live "last non-empty Foundation token"
+
+    reset_simulation
+    write_env \
+        'OPENRUNG_FOUNDATION_TOKEN=shadowed-value' \
+        'OPENRUNG_FOUNDATION_TOKEN='
+    run_volunteer_up create_fail
+    assert_nonzero "$RUN_RC" "last empty Foundation token"
+    assert_no_mutating_docker_calls "last empty Foundation token"
+    assert_prior_is_live "last empty Foundation token"
+}
+
+test_bare_foundation_marker_is_refused() {
+    reset_simulation
+    write_env 'OPENRUNG_FOUNDATION_TOKEN'
+    run_volunteer_up_with_host_foundation_token create_fail
+    assert_nonzero "$RUN_RC" "bare Foundation token marker"
+    assert_no_mutating_docker_calls "bare Foundation token marker"
+    if grep -qi 'foundation' "$OUTPUT"; then
+        pass
+    else
+        fail "bare Foundation token marker: refusal does not explain Foundation ownership"
+    fi
+    assert_prior_is_live "bare Foundation token marker"
+}
+
+test_failed_candidate_create_preserves_unowned_conflict() {
+    reset_simulation
+    write_env
+    run_volunteer_up create_fail
+    assert_nonzero "$RUN_RC" "candidate create failure"
+    assert_log_has_create "candidate create failure"
+    assert_prior_and_unowned_candidate_are_preserved "candidate create failure"
+    if grep -q '^rm openrung-relay-new$' "$DOCKER_LOG"; then
+        fail "candidate create failure: removed the unowned name-conflict container"
+    else
+        pass
+    fi
+}
+
+test_failed_candidate_start_restores_prior() {
+    reset_simulation
+    write_env
+    run_volunteer_up start_fail
+    assert_nonzero "$RUN_RC" "candidate start failure"
+    assert_log_has_create "candidate start failure"
+    if grep -q '^start id-candidate$' "$DOCKER_LOG"; then
+        pass
+    else
+        fail "candidate start failure: candidate was not started by its exact create ID"
+    fi
+    assert_prior_is_live "candidate start failure"
+}
+
+test_crash_looping_candidate_restores_prior() {
+    reset_simulation
+    write_env
+    run_volunteer_up crash_loop
+    assert_nonzero "$RUN_RC" "candidate crash loop"
+    assert_log_has_create "candidate crash loop"
+    assert_prior_is_live "candidate crash loop"
+}
+
+test_unregistered_candidate_restores_prior() {
+    reset_simulation
+    write_env
+    run_volunteer_up no_register
+    assert_nonzero "$RUN_RC" "candidate registration timeout"
+    assert_log_has_create "candidate registration timeout"
+    assert_prior_is_live "candidate registration timeout"
+}
+
+test_successful_update_promotes_candidate() {
+    reset_simulation
+    write_env
+    run_volunteer_up ok
+    if [ "$RUN_RC" -eq 0 ]; then
+        pass
+    else
+        fail "successful candidate update: expected success, got exit $RUN_RC"
+    fi
+    assert_log_has_create "successful candidate update"
+    assert_candidate_is_live "successful candidate update"
+    promotion_line=$(sed -n '/^rename openrung-relay-new openrung-relay$/=' "$DOCKER_LOG" | head -1)
+    backup_rm_line=$(sed -n '/^rm openrung-relay-old$/=' "$DOCKER_LOG" | head -1)
+    if [ -n "$promotion_line" ] \
+        && [ -n "$backup_rm_line" ] \
+        && [ "$promotion_line" -lt "$backup_rm_line" ]; then
+        pass
+    else
+        fail "successful candidate update: candidate was not promoted before the old container was removed"
+    fi
+    # The suite's env files carry no label — exactly the legacy shape — so a
+    # successful update must backfill a pinned generated name (otherwise the
+    # relay binary draws a fresh random name every restart), keep the identity
+    # line untouched, and close with the banner plus the by-name thanks last.
+    backfilled_label=$(sed -n 's/^OPENRUNG_LABEL=//p' "$ENV_FILE" | tail -1)
+    if [ -n "$backfilled_label" ] \
+        && grep -Eq '^OPENRUNG_LABEL=[a-z]+-[a-z]+$' "$ENV_FILE" \
+        && grep -q '^OPENRUNG_IDENTITY_SEED=test-identity-seed$' "$ENV_FILE" \
+        && tail -n 1 "$OUTPUT" | grep -q "thank you for running '$backfilled_label', together we will make the internet open again" \
+        && grep -qF '| (_) | |_) |' "$OUTPUT"; then
+        pass
+    else
+        fail "successful candidate update: unnamed env was not backfilled with a pinned name, or banner/final line is wrong"
+    fi
+}
+
+test_update_pins_override_label_and_respects_existing() {
+    reset_simulation
+    write_env
+    boundary_label=$(printf '%063d' 0 | tr '0' 'b')
+    run_volunteer_up ok "OPENRUNG_LABEL=$boundary_label"
+    if [ "$RUN_RC" -eq 0 ] \
+        && grep -qxF "OPENRUNG_LABEL=$boundary_label" "$ENV_FILE" \
+        && tail -n 1 "$OUTPUT" | grep -q "thank you for running '$boundary_label'"; then
+        pass
+    else
+        fail "backfill override: a 63-character OPENRUNG_LABEL was not pinned verbatim into the unnamed env (exit $RUN_RC)"
+    fi
+    # A named env file is authoritative: a later override is noted and ignored,
+    # and no duplicate label line is appended.
+    reset_simulation
+    run_volunteer_up ok OPENRUNG_LABEL=other-name
+    if [ "$RUN_RC" -eq 0 ] \
+        && grep -qxF "OPENRUNG_LABEL=$boundary_label" "$ENV_FILE" \
+        && ! grep -q '^OPENRUNG_LABEL=other-name$' "$ENV_FILE" \
+        && [ "$(grep -c '^OPENRUNG_LABEL=' "$ENV_FILE")" -eq 1 ] \
+        && grep -q 'does not change an existing name' "$OUTPUT"; then
+        pass
+    else
+        fail "named env: OPENRUNG_LABEL override was not ignored with a note (exit $RUN_RC)"
+    fi
+}
+
+test_overlong_label_is_refused_before_mutation() {
+    # relay.NormalizeLabel caps labels at 63 characters and the relay exits on
+    # longer ones; the helper must refuse before persisting anything, or the
+    # bad label would crash-loop every later run.
+    reset_simulation
+    write_env
+    overlong_label=$(printf '%064d' 0 | tr '0' 'c')
+    run_volunteer_up ok "OPENRUNG_LABEL=$overlong_label"
+    assert_nonzero "$RUN_RC" "64-character label"
+    assert_no_mutating_docker_calls "64-character label"
+    assert_prior_is_live "64-character label"
+    if grep -q '63' "$OUTPUT"; then
+        pass
+    else
+        fail "64-character label: refusal does not mention the 63-character limit"
+    fi
+}
+
+test_first_run_generates_label_and_promotes() {
+    reset_simulation
+    rm -f "$CONTAINERS/openrung-relay" "$ENV_FILE"
+    run_volunteer_up_first_run ok
+    if [ "$RUN_RC" -eq 0 ]; then
+        pass
+    else
+        fail "first run: expected success, got exit $RUN_RC"
+    fi
+    if grep -Eq '^OPENRUNG_LABEL=[a-z]+-[a-z]+$' "$ENV_FILE" \
+        && grep -q '^OPENRUNG_PUBLIC_HOST=8.8.8.8$' "$ENV_FILE" \
+        && grep -Eq '^OPENRUNG_IDENTITY_SEED=..*' "$ENV_FILE"; then
+        pass
+    else
+        fail "first run: env file is missing the generated label, public host, or identity seed"
+    fi
+    assert_candidate_is_live "first run"
+    if grep -q '^stop ' "$DOCKER_LOG" || grep -q '^rm ' "$DOCKER_LOG"; then
+        fail "first run: stopped or removed a container that did not exist"
+    else
+        pass
+    fi
+    first_run_label=$(sed -n 's/^OPENRUNG_LABEL=//p' "$ENV_FILE" | tail -1)
+    if tail -n 1 "$OUTPUT" | grep -q "thank you for running '$first_run_label', together we will make the internet open again"; then
+        pass
+    else
+        fail "first run: the final line does not thank the volunteer by relay name"
+    fi
+    # The openrung banner precedes the thank-you (fixed strings: the art is
+    # full of regex metacharacters).
+    if grep -qF '| (_) | |_) |' "$OUTPUT"; then
+        pass
+    else
+        fail "first run: the openrung ASCII banner is missing"
+    fi
+    if grep -q '^run --rm --entrypoint /usr/local/bin/relay .* -print-label$' "$DOCKER_LOG"; then
+        pass
+    else
+        fail "first run: the relay image's -print-label path was not exercised"
+    fi
+}
+
+test_first_run_falls_back_for_flagless_image() {
+    reset_simulation
+    rm -f "$CONTAINERS/openrung-relay" "$ENV_FILE"
+    run_volunteer_up_first_run ok SIM_LABEL_SCENARIO=unsupported
+    if [ "$RUN_RC" -eq 0 ] && grep -Eq '^OPENRUNG_LABEL=relay-[0-9a-f]{8}$' "$ENV_FILE"; then
+        pass
+    else
+        fail "flagless image fallback: expected a persisted relay-<8 hex digits> label (exit $RUN_RC)"
+    fi
+    assert_candidate_is_live "flagless image fallback"
+}
+
+test_first_run_honors_explicit_label() {
+    reset_simulation
+    rm -f "$CONTAINERS/openrung-relay" "$ENV_FILE"
+    run_volunteer_up_first_run ok OPENRUNG_LABEL=my.relay_1
+    if [ "$RUN_RC" -eq 0 ] && grep -q '^OPENRUNG_LABEL=my.relay_1$' "$ENV_FILE"; then
+        pass
+    else
+        fail "explicit label: OPENRUNG_LABEL was not written verbatim (exit $RUN_RC)"
+    fi
+    if tail -n 1 "$OUTPUT" | grep -q "thank you for running 'my.relay_1', together we will make the internet open again"; then
+        pass
+    else
+        fail "explicit label: the final line does not thank the volunteer by relay name"
+    fi
+}
+
+contact_in_env() {
+    sed -n 's/^OPENRUNG_OPERATOR_CONTACT=//p' "$ENV_FILE" | tail -1
+}
+
+first_run_with_terminal() { # answers [env assignments...]
+    reset_simulation
+    rm -f "$CONTAINERS/openrung-relay" "$ENV_FILE"
+    printf '%b' "$1" >"$TTY_FILE"
+    shift
+    run_volunteer_up_first_run ok "$@"
+}
+
+test_contact_prompt_stores_typed_answer() {
+    first_run_with_terminal 'ops@example.net\n' HOME="$TEST_TMP/nohome" SUDO_USER=
+    if [ "$RUN_RC" -eq 0 ] && [ "$(contact_in_env)" = ops@example.net ]; then
+        pass
+    else
+        fail "contact prompt: typed answer was not stored (exit $RUN_RC, contact '$(contact_in_env)')"
+    fi
+    if grep -qF "$CONTACT_QUESTION: " "$TTY_FILE"; then
+        pass
+    else
+        fail "contact prompt: the exact question was not asked on the terminal"
+    fi
+    if grep -q 'ops@example.net' "$OUTPUT" && grep -q 'never published' "$OUTPUT"; then
+        pass
+    else
+        fail "contact prompt: the stored contact and its privacy are not reported"
+    fi
+    assert_candidate_is_live "contact prompt"
+}
+
+test_contact_prompt_enter_confirms_suggestion() {
+    first_run_with_terminal '\n' SUDO_USER=alice
+    if grep -qF "$CONTACT_QUESTION [alice@example.org]: " "$TTY_FILE"; then
+        pass
+    else
+        fail "contact suggestion: the sudo user's git email was not shown in brackets"
+    fi
+    if [ "$RUN_RC" -eq 0 ] && [ "$(contact_in_env)" = alice@example.org ]; then
+        pass
+    else
+        fail "contact suggestion: Enter did not confirm the suggestion (exit $RUN_RC, contact '$(contact_in_env)')"
+    fi
+}
+
+test_contact_prompt_typed_answer_replaces_suggestion() {
+    first_run_with_terminal 'relay-ops@example.com\n' SUDO_USER=alice
+    if [ "$RUN_RC" -eq 0 ] && [ "$(contact_in_env)" = relay-ops@example.com ]; then
+        pass
+    else
+        fail "contact replacement: typed answer did not replace the suggestion (contact '$(contact_in_env)')"
+    fi
+}
+
+test_contact_prompt_empty_answer_skips() {
+    first_run_with_terminal '\n' HOME="$TEST_TMP/nohome" SUDO_USER=
+    if [ "$RUN_RC" -eq 0 ] && grep -qF "$CONTACT_QUESTION: " "$TTY_FILE" \
+        && ! grep -q '^OPENRUNG_OPERATOR_CONTACT' "$ENV_FILE"; then
+        pass
+    else
+        fail "contact skip: Enter without a suggestion must skip and store nothing (exit $RUN_RC)"
+    fi
+    assert_candidate_is_live "contact skip"
+}
+
+test_contact_prompt_end_of_input_ignores_suggestion() {
+    # Closing the terminal input is not a confirmation: the suggestion is
+    # never stored unless the operator saw it and pressed Enter.
+    first_run_with_terminal '' SUDO_USER=alice
+    if [ "$RUN_RC" -eq 0 ] && ! grep -q '^OPENRUNG_OPERATOR_CONTACT' "$ENV_FILE"; then
+        pass
+    else
+        fail "contact end of input: the unconfirmed suggestion was stored (contact '$(contact_in_env)')"
+    fi
+}
+
+test_contact_prompt_reasks_after_invalid_answer() {
+    first_run_with_terminal 'not an email\nops@example.net\n' HOME="$TEST_TMP/nohome" SUDO_USER=
+    if [ "$RUN_RC" -eq 0 ] && [ "$(contact_in_env)" = ops@example.net ] \
+        && grep -q 'does not look like an email address' "$TTY_FILE"; then
+        pass
+    else
+        fail "contact re-ask: an invalid answer was not refused and re-asked (contact '$(contact_in_env)')"
+    fi
+}
+
+test_contact_prompt_gives_up_after_three_invalid_answers() {
+    first_run_with_terminal 'a b\nc d\ne f\nops@example.net\n' HOME="$TEST_TMP/nohome" SUDO_USER=
+    if [ "$RUN_RC" -eq 0 ] && ! grep -q '^OPENRUNG_OPERATOR_CONTACT' "$ENV_FILE" \
+        && grep -q 'skipping the contact' "$TTY_FILE"; then
+        pass
+    else
+        fail "contact give-up: three invalid answers must skip the contact (exit $RUN_RC, contact '$(contact_in_env)')"
+    fi
+    assert_candidate_is_live "contact give-up"
+}
+
+test_contact_from_env_is_not_asked() {
+    first_run_with_terminal '' SUDO_USER=alice OPENRUNG_OPERATOR_CONTACT=env-ops@example.net
+    if [ "$RUN_RC" -eq 0 ] && [ "$(contact_in_env)" = env-ops@example.net ] && [ ! -s "$TTY_FILE" ]; then
+        pass
+    else
+        fail "contact env: OPENRUNG_OPERATOR_CONTACT must be stored without asking (exit $RUN_RC, contact '$(contact_in_env)')"
+    fi
+    first_run_with_terminal '' SUDO_USER=alice OPENRUNG_OPERATOR_CONTACT=
+    if [ "$RUN_RC" -eq 0 ] && ! grep -q '^OPENRUNG_OPERATOR_CONTACT' "$ENV_FILE" && [ ! -s "$TTY_FILE" ]; then
+        pass
+    else
+        fail "contact env: an empty OPENRUNG_OPERATOR_CONTACT must skip the question"
+    fi
+}
+
+test_contact_without_terminal_is_not_asked() {
+    # No terminal (cloud-init, pipes): nothing is asked and nothing found on
+    # the host is stored on the operator's behalf.
+    reset_simulation
+    rm -f "$CONTAINERS/openrung-relay" "$ENV_FILE"
+    run_volunteer_up_first_run ok SUDO_USER=alice
+    if [ "$RUN_RC" -eq 0 ] && ! grep -q '^OPENRUNG_OPERATOR_CONTACT' "$ENV_FILE" \
+        && ! grep -q 'contact email' "$OUTPUT"; then
+        pass
+    else
+        fail "contact without terminal: expected no question and no stored contact (exit $RUN_RC)"
+    fi
+}
+
+test_contact_is_never_asked_again() {
+    reset_simulation
+    write_env 'OPENRUNG_LABEL=amber-alpaca'
+    printf 'later@example.net\n' >"$TTY_FILE"
+    run_volunteer_up ok SUDO_USER=alice
+    if [ "$RUN_RC" -eq 0 ] && ! grep -q 'contact email' "$TTY_FILE" \
+        && ! grep -q '^OPENRUNG_OPERATOR_CONTACT' "$ENV_FILE"; then
+        pass
+    else
+        fail "contact re-run: an existing relay.env must not trigger the question (exit $RUN_RC)"
+    fi
+    assert_candidate_is_live "contact re-run"
+
+    # A relay set up before contacts existed takes the override once...
+    reset_simulation
+    write_env 'OPENRUNG_LABEL=amber-alpaca'
+    run_volunteer_up ok OPENRUNG_OPERATOR_CONTACT=late@example.net
+    if [ "$RUN_RC" -eq 0 ] && [ "$(contact_in_env)" = late@example.net ]; then
+        pass
+    else
+        fail "contact re-run: OPENRUNG_OPERATOR_CONTACT was not pinned into a contactless relay.env (contact '$(contact_in_env)')"
+    fi
+    # ...and an existing contact is authoritative.
+    reset_simulation
+    write_env 'OPENRUNG_LABEL=amber-alpaca' 'OPENRUNG_OPERATOR_CONTACT=first@example.net'
+    run_volunteer_up ok OPENRUNG_OPERATOR_CONTACT=second@example.net
+    if [ "$RUN_RC" -eq 0 ] && [ "$(contact_in_env)" = first@example.net ] \
+        && grep -q 'does not change an existing contact' "$OUTPUT"; then
+        pass
+    else
+        fail "contact re-run: an existing contact was changed or the note is missing (contact '$(contact_in_env)')"
+    fi
+}
+
+test_invalid_contact_is_refused_before_mutation() {
+    for bad_contact in 'two words@example.net' 'no-at-sign.example.net' \
+        'ops@example' 'ops@.example.net' 'ops@example.net.' 'a@b@example.net' \
+        '@example.net' 'opérateur@example.net' \
+        "$(printf 'ops@example.net\tx')" "$(printf 'ops@example.net\rx')" \
+        "$(printf '%0129d' 0 | tr 0 a)@example.net"; do
+        reset_simulation
+        write_env
+        run_volunteer_up ok "OPENRUNG_OPERATOR_CONTACT=$bad_contact"
+        assert_nonzero "$RUN_RC" "invalid contact '$bad_contact'"
+        assert_no_mutating_docker_calls "invalid contact '$bad_contact'"
+        assert_prior_is_live "invalid contact '$bad_contact'"
+    done
+}
+
+test_contact_with_embedded_newline_cannot_inject_settings() {
+    # Every line of this value is valid on its own; a line-by-line check
+    # would let the second line land in relay.env as its own setting.
+    injected='ops@example.net
+OPENRUNG_EXTRA=injected'
+    reset_simulation
+    write_env 'OPENRUNG_LABEL=amber-alpaca'
+    run_volunteer_up ok "OPENRUNG_OPERATOR_CONTACT=$injected"
+    assert_nonzero "$RUN_RC" "newline contact on re-run"
+    assert_no_mutating_docker_calls "newline contact on re-run"
+    assert_prior_is_live "newline contact on re-run"
+    if grep -q 'OPENRUNG_EXTRA\|OPENRUNG_OPERATOR_CONTACT' "$ENV_FILE"; then
+        fail "newline contact on re-run: relay.env was modified"
+    else
+        pass
+    fi
+
+    reset_simulation
+    rm -f "$CONTAINERS/openrung-relay" "$ENV_FILE"
+    run_volunteer_up_first_run ok "OPENRUNG_OPERATOR_CONTACT=$injected"
+    assert_nonzero "$RUN_RC" "newline contact on first run"
+    if [ -e "$ENV_FILE" ]; then
+        fail "newline contact on first run: relay.env was written"
+    else
+        pass
+    fi
+
+    # shellcheck disable=SC2016
+    if "$TEST_SHELL" -c '. "$1"; validate_contact "$2"' sh "$LIB_SCRIPT" "$injected" >"$OUTPUT" 2>&1; then
+        fail "validate_contact accepted a value with an embedded newline"
+    else
+        pass
+    fi
+}
+
+expect_public_ipv4() {
+    # The selected child shell, not this harness, must expand its positional
+    # parameters after sourcing the helper library.
+    # shellcheck disable=SC2016
+    if "$TEST_SHELL" -c '. "$1"; is_public_ipv4 "$2"' sh "$LIB_SCRIPT" "$1" \
+        >"$OUTPUT" 2>&1; then
+        pass
+    else
+        fail "is_public_ipv4 rejected known public address $1"
+    fi
+}
+
+expect_non_public_ipv4() {
+    # shellcheck disable=SC2016
+    if "$TEST_SHELL" -c '. "$1"; is_public_ipv4 "$2"' sh "$LIB_SCRIPT" "$1" \
+        >"$OUTPUT" 2>&1; then
+        fail "is_public_ipv4 accepted non-global address $1"
+    else
+        pass
+    fi
+}
+
+assert_output_has() { # label pattern
+    if grep -q -- "$2" "$OUTPUT"; then
+        pass
+    else
+        fail "$1: output lacks '$2'"
+    fi
+}
+
+assert_output_lacks() { # label pattern
+    if grep -q -- "$2" "$OUTPUT"; then
+        fail "$1: output unexpectedly contains '$2'"
+    else
+        pass
+    fi
+}
+
+# The host firewall is opened before the relay registers, only through a
+# front-end that is actually on, and never fatally: the docker transaction
+# proceeds regardless of what ufw/firewalld answered.
+test_host_firewall_opened_only_when_active() {
+    reset_simulation
+    write_env
+    run_volunteer_up ok SIM_UFW=inactive SIM_FIREWALLD=stopped
+    if [ "$RUN_RC" -eq 0 ] && ! grep -q 'ufw allow' "$FIREWALL_LOG" && ! grep -q 'add-port' "$FIREWALL_LOG"; then
+        pass
+    else
+        fail "inactive host firewalls: expected no allow/add-port calls, got: $(cat "$FIREWALL_LOG")"
+    fi
+
+    reset_simulation
+    write_env
+    run_volunteer_up ok SIM_UFW=active SIM_FIREWALLD=running
+    if [ "$RUN_RC" -eq 0 ] \
+        && grep -q '^ufw allow 443/tcp$' "$FIREWALL_LOG" \
+        && grep -q '^firewall-cmd --add-port=443/tcp$' "$FIREWALL_LOG" \
+        && grep -q '^firewall-cmd --permanent --add-port=443/tcp$' "$FIREWALL_LOG" \
+        && ! grep -q -- '--reload' "$FIREWALL_LOG"; then
+        pass
+    else
+        fail "active host firewalls: expected ufw allow + firewalld runtime and permanent add-port (no reload), got: $(cat "$FIREWALL_LOG")"
+    fi
+    assert_output_has "active host firewalls" 'host firewall: ufw allows 443/tcp'
+    assert_output_has "active host firewalls" 'host firewall: firewalld allows 443/tcp'
+    # Ordering: the firewall is opened before the candidate is created, so the
+    # broker's registration-time probe already sees the open port.
+    firewall_line=$(grep -n 'ufw allow' "$FIREWALL_LOG" | head -1 | cut -d: -f1)
+    if [ -n "$firewall_line" ] && grep -q '^create ' "$DOCKER_LOG"; then
+        pass
+    else
+        fail "active host firewalls: firewall not opened before the candidate was created"
+    fi
+}
+
+test_accepted_registration_is_reported_as_serving() {
+    reset_simulation
+    write_env
+    run_volunteer_up ok
+    assert_candidate_is_live "accepted registration"
+    assert_output_has "accepted registration" 'done — this host is now serving as a volunteer-class OpenRung relay (the broker connected to its public port 443 before accepting it)'
+    assert_output_lacks "accepted registration" 'WARNING'
+}
+
+# A refused registration never fails the run and never rolls back: the
+# candidate is healthy and retrying, so it is promoted, the provider's fix is
+# printed, and with no wait the script moves on.
+test_unreachable_prints_provider_fix_and_promotes() {
+    reset_simulation
+    write_env
+    printf 'Amazon EC2\n' >"$DMI_DIR/sys_vendor"
+    run_volunteer_up ok SIM_REACHABILITY=unreachable OPENRUNG_REACHABILITY_WAIT=0
+    if [ "$RUN_RC" -eq 0 ]; then
+        pass
+    else
+        fail "unreachable (aws): expected success, got exit $RUN_RC"
+    fi
+    assert_candidate_is_live "unreachable (aws)"
+    assert_output_has "unreachable (aws)" 'the broker refused its registration because its public port is unreachable'
+    assert_output_has "unreachable (aws)" 'WARNING: the broker could not connect to this relay on TCP 443 and refused its registration'
+    assert_output_has "unreachable (aws)" 'aws lightsail open-instance-public-ports'
+    assert_output_has "unreachable (aws)" 'aws ec2 authorize-security-group-ingress'
+    assert_output_lacks "unreachable (aws)" 'hcloud firewall'
+    assert_output_has "unreachable (aws)" 'registers by itself once the port opens'
+    assert_output_lacks "unreachable (aws)" 'now serving'
+    if tail -n 1 "$OUTPUT" | grep -q 'thank you for running'; then
+        pass
+    else
+        fail "unreachable (aws): the closing thanks must still end the run"
+    fi
+
+    reset_simulation
+    write_env
+    printf 'Hetzner\n' >"$DMI_DIR/sys_vendor"
+    run_volunteer_up ok SIM_REACHABILITY=unreachable OPENRUNG_REACHABILITY_WAIT=0
+    assert_output_has "unreachable (hetzner)" 'hcloud firewall add-rule'
+    assert_output_lacks "unreachable (hetzner)" 'aws lightsail'
+
+    reset_simulation
+    write_env
+    printf '7783-7084-3265-9085-8269-3286-77\n' >"$DMI_DIR/chassis_asset_tag"
+    printf 'Microsoft Corporation\n' >"$DMI_DIR/sys_vendor"
+    run_volunteer_up ok SIM_REACHABILITY=unreachable OPENRUNG_REACHABILITY_WAIT=0
+    assert_output_has "unreachable (azure)" 'az network nsg rule create'
+
+    reset_simulation
+    write_env
+    run_volunteer_up ok SIM_REACHABILITY=unreachable OPENRUNG_REACHABILITY_WAIT=0
+    assert_output_has "unreachable (unknown provider)" "Your provider's console"
+}
+
+# While waiting, the verdict is re-read from the log and a port opened in the
+# meantime ends the wait with the good news; a port that stays closed ends it
+# with the warning repeated, still exit 0.
+test_unreachable_wait_sees_the_port_open() {
+    reset_simulation
+    write_env
+    # Candidate verification (1) and the pre-commit check (2) read the log
+    # before the first answer is read (3); the broker accepts on the second
+    # wait poll (5), so the first report must be the warning.
+    run_volunteer_up ok SIM_REACHABILITY=opens_after:5 OPENRUNG_REACHABILITY_WAIT=120
+    if [ "$RUN_RC" -eq 0 ]; then
+        pass
+    else
+        fail "wait then open: expected success, got exit $RUN_RC"
+    fi
+    assert_candidate_is_live "wait then open"
+    assert_output_has "wait then open" 'WARNING: the broker could not connect to this relay on TCP 443'
+    assert_output_has "wait then open" 'waiting up to 120s for the port to open'
+    assert_output_has "wait then open" 'done — the broker accepted this relay now'
+    assert_output_lacks "wait then open" 'still unreachable after 120s'
+
+    reset_simulation
+    write_env
+    run_volunteer_up ok SIM_REACHABILITY=unreachable OPENRUNG_REACHABILITY_WAIT=120
+    if [ "$RUN_RC" -eq 0 ]; then
+        pass
+    else
+        fail "wait times out: expected success, got exit $RUN_RC"
+    fi
+    assert_candidate_is_live "wait times out"
+    assert_output_has "wait times out" 'still unreachable after 60s'
+    assert_output_has "wait times out" 'WARNING: still unreachable after 120s'
+    assert_output_lacks "wait times out" 'now serving'
+}
+
+# The relay logs a refusal only after its startup registration attempts, so
+# candidate verification must outlast them: a refusal that appears late in
+# the window still ends in promotion and the provider fix, never a rollback.
+test_late_refusal_is_still_promoted() {
+    reset_simulation
+    write_env
+    # The verification loop reads the log once per iteration for up to 60
+    # iterations; a refusal first visible on the 45th would have been past
+    # the old 30-iteration window.
+    run_volunteer_up ok SIM_REACHABILITY=refused_after:45 OPENRUNG_REACHABILITY_WAIT=0
+    if [ "$RUN_RC" -eq 0 ]; then
+        pass
+    else
+        fail "late refusal: expected success, got exit $RUN_RC"
+    fi
+    assert_candidate_is_live "late refusal"
+    assert_output_has "late refusal" 'the broker refused its registration because its public port is unreachable'
+    assert_output_lacks "late refusal" 'did not register within'
+
+    # Past the window with neither answer, the update still rolls back.
+    reset_simulation
+    write_env
+    run_volunteer_up ok SIM_REACHABILITY=refused_after:70
+    assert_nonzero "$RUN_RC" "refusal past the window"
+    assert_prior_is_live "refusal past the window"
+    assert_output_has "refusal past the window" 'did not register within 120s'
+}
+
+test_bad_wait_value_is_refused_before_mutation() {
+    reset_simulation
+    write_env
+    run_volunteer_up ok OPENRUNG_REACHABILITY_WAIT=soon
+    assert_nonzero "$RUN_RC" "bad wait value"
+    assert_no_mutating_docker_calls "bad wait value"
+    assert_output_has "bad wait value" 'OPENRUNG_REACHABILITY_WAIT must be a whole number'
+}
+
+tcp_key() { # key
+    cat "$PROC_NET_IPV4/$1"
+}
+
+assert_tcp_untouched() { # label
+    if [ "$(tcp_key tcp_slow_start_after_idle)" = 1 ] \
+        && [ ! -e "$SYSCTL_DIR" ] && [ ! -e "$MODULES_LOAD_DIR" ]; then
+        pass
+    else
+        fail "$1: host TCP settings were changed or persisted"
+    fi
+}
+
+# The default run loads BBR, applies it with no slow start after idle, and
+# persists both; a re-run finds them in place and leaves the same files.
+test_tcp_tuning_enables_and_persists_bbr() {
+    reset_simulation
+    write_env
+    run_volunteer_up ok
+    expected_sysctl=$(printf 'net.ipv4.tcp_congestion_control = bbr\nnet.ipv4.tcp_slow_start_after_idle = 0')
+    if [ "$RUN_RC" -eq 0 ] \
+        && [ "$(tcp_key tcp_congestion_control)" = bbr ] \
+        && [ "$(tcp_key tcp_slow_start_after_idle)" = 0 ] \
+        && [ "$(cat "$SYSCTL_DIR/90-openrung-tcp.conf")" = "$expected_sysctl" ] \
+        && [ "$(cat "$MODULES_LOAD_DIR/openrung-tcp.conf")" = tcp_bbr ] \
+        && [ "$(cat "$TCP_LOG")" = 'modprobe tcp_bbr' ]; then
+        pass
+    else
+        fail "TCP tuning: expected bbr applied and persisted, got cc=$(tcp_key tcp_congestion_control) rc=$RUN_RC log=$(cat "$TCP_LOG")"
+    fi
+    assert_output_has "TCP tuning" 'TCP congestion control: bbr'
+    assert_candidate_is_live "TCP tuning"
+
+    run_volunteer_up ok
+    if [ "$RUN_RC" -eq 0 ] \
+        && [ "$(tcp_key tcp_congestion_control)" = bbr ] \
+        && [ "$(cat "$SYSCTL_DIR/90-openrung-tcp.conf")" = "$expected_sysctl" ] \
+        && [ "$(cat "$TCP_LOG")" = 'modprobe tcp_bbr' ]; then
+        pass
+    else
+        fail "TCP tuning re-run: expected the same settings without another modprobe, got cc=$(tcp_key tcp_congestion_control) log=$(cat "$TCP_LOG")"
+    fi
+}
+
+test_tcp_tuning_opt_out_leaves_host_alone() {
+    reset_simulation
+    write_env
+    run_volunteer_up ok OPENRUNG_TCP_TUNING=0
+    if [ "$RUN_RC" -eq 0 ] && [ "$(tcp_key tcp_congestion_control)" = cubic ] && [ ! -s "$TCP_LOG" ]; then
+        pass
+    else
+        fail "TCP tuning opt-out: expected cubic and no modprobe, got cc=$(tcp_key tcp_congestion_control) rc=$RUN_RC"
+    fi
+    assert_tcp_untouched "TCP tuning opt-out"
+    assert_output_has "TCP tuning opt-out" 'TCP tuning: skipped'
+}
+
+# A congestion control other than the kernel defaults is the operator's choice.
+test_tcp_tuning_keeps_operator_choice() {
+    reset_simulation
+    write_env
+    printf 'htcp\n' >"$PROC_NET_IPV4/tcp_congestion_control"
+    run_volunteer_up ok
+    if [ "$RUN_RC" -eq 0 ] && [ "$(tcp_key tcp_congestion_control)" = htcp ] && [ ! -s "$TCP_LOG" ]; then
+        pass
+    else
+        fail "TCP operator choice: expected htcp kept, got cc=$(tcp_key tcp_congestion_control) rc=$RUN_RC"
+    fi
+    assert_tcp_untouched "TCP operator choice"
+    assert_output_has "TCP operator choice" "leaving congestion control 'htcp'"
+}
+
+# A kernel without BBR warns and still installs the relay.
+test_tcp_tuning_without_bbr_still_installs() {
+    reset_simulation
+    write_env
+    run_volunteer_up ok SIM_BBR=absent
+    if [ "$RUN_RC" -eq 0 ] && [ "$(tcp_key tcp_congestion_control)" = cubic ]; then
+        pass
+    else
+        fail "TCP without BBR: expected success with cubic kept, got cc=$(tcp_key tcp_congestion_control) rc=$RUN_RC"
+    fi
+    assert_tcp_untouched "TCP without BBR"
+    assert_output_has "TCP without BBR" 'offers no BBR congestion control'
+    assert_candidate_is_live "TCP without BBR"
+}
+
+# Host TCP settings change only after every refusal check has passed.
+test_tcp_tuning_waits_for_preflight() {
+    reset_simulation
+    write_env
+    run_volunteer_up ok OPENRUNG_TCP_TUNING=yes
+    assert_nonzero "$RUN_RC" "bad TCP tuning value"
+    assert_no_mutating_docker_calls "bad TCP tuning value"
+    assert_output_has "bad TCP tuning value" 'OPENRUNG_TCP_TUNING must be 0 or 1'
+    assert_tcp_untouched "bad TCP tuning value"
+
+    reset_simulation
+    write_env 'OPENRUNG_FOUNDATION_TOKEN=foundation-secret'
+    run_volunteer_up ok
+    assert_nonzero "$RUN_RC" "Foundation-owned env"
+    if [ "$(tcp_key tcp_congestion_control)" = cubic ]; then pass; else fail "Foundation-owned env: host TCP settings changed before the refusal"; fi
+    assert_tcp_untouched "Foundation-owned env"
+}
+
+# --- IPv6 access address ---------------------------------------------------
+
+access_env_line() {
+    grep '^OPENRUNG_ACCESS_HOST=' "$ENV_FILE"
+}
+
+assert_no_access_address() { # label
+    if ! grep -q '^OPENRUNG_ACCESS_HOST=' "$ENV_FILE" \
+        && [ ! -s "$SIM_DIR/ip6" ] \
+        && [ -z "$(ls -A "$SYSTEMD_UNIT_DIR")" ]; then
+        pass
+    else
+        fail "$1: expected no access address, env line, or units; env='$(access_env_line)' ip6='$(cat "$SIM_DIR/ip6" 2>/dev/null)' units='$(ls "$SYSTEMD_UNIT_DIR")'"
+    fi
+}
+
+test_access_address_added_on_routed_ipv6() {
+    reset_simulation
+    mkdir -p "$SYSTEMD_RUN_DIR"
+    write_env
+    run_volunteer_up ok OPENRUNG_ACCESS_ADDRESS=1 SIM_IPV6=routed
+    access_line=$(access_env_line)
+    access_addr=${access_line#OPENRUNG_ACCESS_HOST=}
+    case "$access_addr" in
+        2001:db8:a:b:[0-9a-f][0-9a-f][0-9a-f][0-9a-f]:[0-9a-f][0-9a-f][0-9a-f][0-9a-f]:[0-9a-f][0-9a-f][0-9a-f][0-9a-f]:[0-9a-f][0-9a-f][0-9a-f][0-9a-f]) pass ;;
+        *) fail "access address: expected a random address in 2001:db8:a:b::/64 in the env file, got '$access_line' (rc=$RUN_RC)" ;;
+    esac
+    if [ "$(cat "$SIM_DIR/ip6")" = "$access_addr deprecated" ]; then
+        pass
+    else
+        fail "access address: expected exactly '$access_addr deprecated' on the interface, got '$(cat "$SIM_DIR/ip6")'"
+    fi
+    if grep -qx "ExecStart=$FAKE_BIN/ip -6 address replace $access_addr/128 dev eth0 preferred_lft 0 nodad" \
+            "$SYSTEMD_UNIT_DIR/openrung-access-address.service" \
+        && grep -q '^Before=docker.service$' "$SYSTEMD_UNIT_DIR/openrung-access-address.service" \
+        && grep -q "show to $access_addr/128 | grep -q deprecated" "$SYSTEMD_UNIT_DIR/openrung-access-address-reassert.service" \
+        && grep -q '^OnUnitActiveSec=1min$' "$SYSTEMD_UNIT_DIR/openrung-access-address-reassert.timer" \
+        && grep -qx 'systemctl enable --now openrung-access-address-reassert.timer' "$EGRESS_LOG" \
+        && grep -q -- "--interface $access_addr" "$SIM_DIR/curl.log"; then
+        pass
+    else
+        fail "access address: units, timer, or routing probe missing; systemctl='$(cat "$EGRESS_LOG" 2>/dev/null)'"
+    fi
+    assert_output_has "access address" "IPv6 access address: $access_addr on eth0"
+    assert_candidate_is_live "access address"
+
+    # A re-run keeps the recorded address: no new address, no second line.
+    reset_simulation_containers_only
+    run_volunteer_up ok OPENRUNG_ACCESS_ADDRESS=1 SIM_IPV6=routed
+    if [ "$(grep -c '^OPENRUNG_ACCESS_HOST=' "$ENV_FILE")" = 1 ] \
+        && [ "$(access_env_line)" = "$access_line" ] \
+        && ! grep -q 'address add' "$SIM_DIR/ip.log"; then
+        pass
+    else
+        fail "access address re-run: expected the recorded address kept, got '$(access_env_line)'"
+    fi
+    assert_output_has "access address re-run" "IPv6 access address: $access_addr\$"
+}
+
+# Keeps the env file, the host's addresses and units; resets containers and logs.
+reset_simulation_containers_only() {
+    rm -rf "$CONTAINERS"
+    mkdir -p "$CONTAINERS"
+    printf 'true 0 yes prior id-prior\n' >"$CONTAINERS/openrung-relay"
+    : >"$DOCKER_LOG"
+    : >"$SIM_DIR/ip.log"
+    rm -f "$SIM_DIR/logs_calls"
+}
+
+test_access_address_unrouted_is_removed() {
+    reset_simulation
+    mkdir -p "$SYSTEMD_RUN_DIR"
+    write_env
+    run_volunteer_up ok OPENRUNG_ACCESS_ADDRESS=1 SIM_IPV6=routed SIM_ACCESS_PROBE=timeout
+    assert_no_access_address "unrouted access address"
+    assert_output_has "unrouted access address" 'IPv6 access address: none (the provider does not route'
+    assert_candidate_is_live "unrouted access address"
+}
+
+test_access_address_not_deprecated_is_removed() {
+    reset_simulation
+    mkdir -p "$SYSTEMD_RUN_DIR"
+    write_env
+    run_volunteer_up ok OPENRUNG_ACCESS_ADDRESS=1 SIM_IPV6=routed SIM_DEPRECATE=no
+    assert_no_access_address "non-deprecated access address"
+    if [ -f "$SIM_DIR/curl.log" ]; then fail "non-deprecated access address: probed before removing"; else pass; fi
+    assert_candidate_is_live "non-deprecated access address"
+}
+
+test_access_address_unit_failure_is_removed() {
+    reset_simulation
+    mkdir -p "$SYSTEMD_RUN_DIR"
+    write_env
+    run_volunteer_up ok OPENRUNG_ACCESS_ADDRESS=1 SIM_IPV6=routed SIM_SYSTEMCTL=fail
+    assert_no_access_address "access unit failure"
+    assert_output_has "access unit failure" 'could not install the systemd units'
+    assert_candidate_is_live "access unit failure"
+}
+
+test_access_address_needs_routed_prefix() {
+    reset_simulation
+    mkdir -p "$SYSTEMD_RUN_DIR"
+    write_env
+    run_volunteer_up ok OPENRUNG_ACCESS_ADDRESS=1 SIM_IPV6=single
+    assert_no_access_address "single IPv6 address"
+    assert_output_has "single IPv6 address" 'IPv6 access address: none (no global IPv6 /64 on eth0)'
+
+    reset_simulation
+    mkdir -p "$SYSTEMD_RUN_DIR"
+    write_env
+    run_volunteer_up ok OPENRUNG_ACCESS_ADDRESS=1 SIM_IPV6=none
+    assert_no_access_address "no IPv6"
+    assert_output_has "no IPv6" 'IPv6 access address: none (no IPv6 default route)'
+
+    # Without systemd the address would not survive a reboot.
+    reset_simulation
+    write_env
+    rm -rf "$SYSTEMD_RUN_DIR"
+    run_volunteer_up ok OPENRUNG_ACCESS_ADDRESS=1 SIM_IPV6=routed
+    assert_no_access_address "no systemd"
+    assert_output_has "no systemd" 'needs systemd'
+    assert_candidate_is_live "no systemd"
+}
+
+# The access address is on by default: the broker checks it from outside and
+# hands IPv6 clients the public address while it does not accept connections.
+# OPENRUNG_ACCESS_ADDRESS=0 turns it off and records that, so a later run
+# without the variable does not add one.
+test_access_address_default_and_opt_out() {
+    reset_simulation
+    mkdir -p "$SYSTEMD_RUN_DIR"
+    write_env
+    run_volunteer_up ok SIM_IPV6=routed SIM_ACCESS_PROBE=ok
+    case "$(access_env_line)" in
+        OPENRUNG_ACCESS_HOST=2001:db8:a:b:*) pass ;;
+        *) fail "access default on: expected an address in 2001:db8:a:b::/64, got '$(access_env_line)' (rc=$RUN_RC)" ;;
+    esac
+    assert_output_has "access default on" 'the broker checks, and hands them the public address otherwise'
+    assert_candidate_is_live "access default on"
+
+    reset_simulation
+    mkdir -p "$SYSTEMD_RUN_DIR"
+    write_env
+    run_volunteer_up ok OPENRUNG_ACCESS_ADDRESS=0 SIM_IPV6=routed SIM_ACCESS_PROBE=ok
+    if [ "$(access_env_line)" = 'OPENRUNG_ACCESS_HOST=' ] && [ ! -s "$SIM_DIR/ip6" ] \
+        && [ ! -f "$SIM_DIR/curl.log" ] && ! grep -q 'address add' "$SIM_DIR/ip.log" 2>/dev/null \
+        && [ -z "$(ls -A "$SYSTEMD_UNIT_DIR")" ]; then
+        pass
+    else
+        fail "access opt-out: expected an empty recorded value and the host untouched, got '$(access_env_line)'"
+    fi
+    assert_output_has "access opt-out" 'IPv6 access address: off (recorded as an empty OPENRUNG_ACCESS_HOST'
+    assert_candidate_is_live "access opt-out"
+
+    # The recorded opt-out holds on a later run without the variable.
+    reset_simulation_containers_only
+    run_volunteer_up ok SIM_IPV6=routed SIM_ACCESS_PROBE=ok
+    if [ "$(grep -c '^OPENRUNG_ACCESS_HOST=' "$ENV_FILE")" = 1 ] && [ "$(access_env_line)" = 'OPENRUNG_ACCESS_HOST=' ] \
+        && [ ! -s "$SIM_DIR/ip6" ]; then
+        pass
+    else
+        fail "access opt-out re-run: expected the empty value kept and no address, got '$(access_env_line)'"
+    fi
+
+    # An empty recorded value (the documented removal) wins over an explicit 1.
+    reset_simulation
+    write_env 'OPENRUNG_ACCESS_HOST='
+    run_volunteer_up ok OPENRUNG_ACCESS_ADDRESS=1 SIM_IPV6=routed
+    if [ "$(access_env_line)" = 'OPENRUNG_ACCESS_HOST=' ] && [ ! -s "$SIM_DIR/ip6" ]; then
+        pass
+    else
+        fail "access recorded none: expected the empty value kept and no address, got '$(access_env_line)'"
+    fi
+    assert_candidate_is_live "access recorded none"
+}
+
+test_access_address_skips_unique_local_prefix() {
+    reset_simulation
+    write_env
+    run_volunteer_up ok OPENRUNG_ACCESS_ADDRESS=1 SIM_IPV6=ula_first
+    case "$(access_env_line)" in
+        OPENRUNG_ACCESS_HOST=2001:db8:a:b:*) pass ;;
+        *) fail "ULA before public /64: expected an address in the public /64, got '$(access_env_line)'" ;;
+    esac
+
+    reset_simulation
+    write_env
+    run_volunteer_up ok OPENRUNG_ACCESS_ADDRESS=1 SIM_IPV6=ula_only
+    assert_no_access_address "ULA only"
+    assert_output_has "ULA only" 'no global IPv6 /64 on eth0'
+}
+
+# A hand-edited env file may end without a newline; appended settings must
+# still land on lines of their own.
+test_env_append_ends_unterminated_last_line() {
+    reset_simulation
+    printf 'OPENRUNG_BROKER_URL=https://broker-origin.openrung.org\nOPENRUNG_PUBLIC_HOST=8.8.8.8\nOPENRUNG_IDENTITY_SEED=test-identity-seed\nOPENRUNG_LISTEN_PORT=443' >"$ENV_FILE"
+    run_volunteer_up ok OPENRUNG_ACCESS_ADDRESS=1 SIM_IPV6=routed
+    if grep -qx 'OPENRUNG_LISTEN_PORT=443' "$ENV_FILE" \
+        && grep -qx 'OPENRUNG_LABEL=amber-alpaca' "$ENV_FILE" \
+        && grep -Eqx 'OPENRUNG_ACCESS_HOST=2001:db8:a:b:[0-9a-f:]+' "$ENV_FILE" \
+        && [ "$(tail -c 1 "$ENV_FILE" | od -An -c | tr -d ' ')" = '\n' ]; then
+        pass
+    else
+        fail "unterminated env file: appended settings merged into the last line: $(cat "$ENV_FILE")"
+    fi
+    assert_candidate_is_live "unterminated env file"
+
+    reset_simulation
+    printf 'OPENRUNG_BROKER_URL=https://broker-origin.openrung.org\nOPENRUNG_PUBLIC_HOST=8.8.8.8\nOPENRUNG_IDENTITY_SEED=test-identity-seed\nOPENRUNG_LABEL=kept\nOPENRUNG_LISTEN_PORT=443' >"$ENV_FILE"
+    run_volunteer_up ok OPENRUNG_OPERATOR_CONTACT=ops@example.org
+    if grep -qx 'OPENRUNG_LISTEN_PORT=443' "$ENV_FILE" \
+        && grep -qx 'OPENRUNG_OPERATOR_CONTACT=ops@example.org' "$ENV_FILE"; then
+        pass
+    else
+        fail "unterminated env file (contact): appended setting merged into the last line: $(cat "$ENV_FILE")"
+    fi
+}
+
+test_access_address_skips_customised_relay() {
+    reset_simulation
+    mkdir -p "$SYSTEMD_RUN_DIR"
+    write_env 'OPENRUNG_CONNECTION_LOG=true'
+    run_volunteer_up ok OPENRUNG_ACCESS_ADDRESS=1 SIM_IPV6=routed
+    assert_no_access_address "connection logging relay"
+    reset_simulation
+    mkdir -p "$SYSTEMD_RUN_DIR"
+    write_env 'OPENRUNG_LISTEN_HOST=203.0.113.9'
+    run_volunteer_up ok OPENRUNG_ACCESS_ADDRESS=1 SIM_IPV6=routed
+    assert_no_access_address "literal listen host relay"
+}
+
+test_bad_access_value_is_refused_before_mutation() {
+    reset_simulation
+    write_env
+    run_volunteer_up ok OPENRUNG_ACCESS_ADDRESS=yes
+    assert_nonzero "$RUN_RC" "bad access value"
+    assert_no_mutating_docker_calls "bad access value"
+    assert_output_has "bad access value" 'OPENRUNG_ACCESS_ADDRESS must be 0 or 1'
+}
+
+expect_expanded_ipv6() { # input expected
+    got=$("$TEST_SHELL" -c '. "$1"; expand_ipv6 "$2"' sh "$LIB_SCRIPT" "$1" 2>/dev/null) || got='<fail>'
+    if [ "$got" = "$2" ]; then pass; else fail "expand_ipv6 '$1': expected '$2', got '$got'"; fi
+}
+
+test_expand_ipv6() {
+    expect_expanded_ipv6 2001:db8:a:b::1 2001:db8:a:b:0:0:0:1
+    expect_expanded_ipv6 2a01:4f8:c17::1 2a01:4f8:c17:0:0:0:0:1
+    expect_expanded_ipv6 1:2:3:4:5:6:7:8 1:2:3:4:5:6:7:8
+    expect_expanded_ipv6 fe80:: fe80:0:0:0:0:0:0:0
+    expect_expanded_ipv6 '' '<fail>'
+    expect_expanded_ipv6 1:2:3:4:5:6:7 '<fail>'
+    expect_expanded_ipv6 1::2::3 '<fail>'
+    expect_expanded_ipv6 1:::2 '<fail>'
+    expect_expanded_ipv6 ::ffff:1.2.3.4 '<fail>'
+    expect_expanded_ipv6 12345::1 '<fail>'
+    expect_expanded_ipv6 1:2:3:4:5:6:7:8::9 '<fail>'
+}
+
+egress_log_is() { # label expected
+    if [ "$(cat "$EGRESS_LOG")" = "$2" ]; then
+        pass
+    else
+        fail "$1: host egress-limit calls were '$(cat "$EGRESS_LOG")', expected '$2'"
+    fi
+}
+
+# A verified update loads the image's limit with the host's nft and enables its
+# boot unit, after the candidate is promoted.
+test_egress_limit_loaded_after_promotion() {
+    reset_simulation
+    write_env
+    run_volunteer_up ok
+    egress_log_is "egress limit" "$(printf 'egress-limit apply 10\negress-limit unit\nsystemctl daemon-reload\nsystemctl enable openrung-egress-limit.service')"
+    if [ "$RUN_RC" -eq 0 ] \
+        && [ -x "$EGRESS_LIMIT_BIN" ] && head -n 1 "$EGRESS_LIMIT_BIN" | grep -qx '#!/bin/sh' \
+        && grep -qx 'Description=stand-in egress limit' "$EGRESS_LIMIT_UNIT" \
+        && [ ! -e "$EGRESS_LIMIT_BIN.new" ] && [ ! -e "$EGRESS_LIMIT_UNIT.new" ]; then
+        pass
+    else
+        fail "egress limit: expected the script and its boot unit installed, rc=$RUN_RC"
+    fi
+    if grep -qx 'run --rm --network none --cap-drop ALL --entrypoint cat ghcr.io/openrung/openrung-relay:main /usr/local/bin/egress-limit' "$DOCKER_LOG"; then
+        pass
+    else
+        fail "egress limit: the script was not copied out of the image by a capability-less, network-less container"
+    fi
+    promotion_line=$(sed -n '/^rename openrung-relay-new openrung-relay$/=' "$DOCKER_LOG" | head -1)
+    copy_line=$(sed -n '/--entrypoint cat/=' "$DOCKER_LOG" | head -1)
+    if [ -n "$promotion_line" ] && [ -n "$copy_line" ] && [ "$promotion_line" -lt "$copy_line" ]; then
+        pass
+    else
+        fail "egress limit: loaded before the verified candidate was promoted"
+    fi
+    assert_output_has "egress limit" 'new-destination limit: 10/s'
+}
+
+test_egress_limit_rate_and_off() {
+    reset_simulation
+    write_env
+    run_volunteer_up ok OPENRUNG_NEW_DEST_RATE=25
+    egress_log_is "egress rate 25" "$(printf 'egress-limit apply 25\negress-limit unit\nsystemctl daemon-reload\nsystemctl enable openrung-egress-limit.service')"
+    assert_output_has "egress rate 25" 'new-destination limit: 25/s'
+
+    reset_simulation
+    write_env
+    run_volunteer_up ok OPENRUNG_NEW_DEST_RATE=off
+    egress_log_is "egress off" 'egress-limit apply off'
+    assert_output_has "egress off" 'new-destination limit: off (removed)'
+    if [ "$RUN_RC" -eq 0 ] && [ ! -s "$EGRESS_LIMIT_UNIT" ]; then pass; else fail "egress off: expected success without a boot unit"; fi
+
+    reset_simulation
+    write_env
+    run_volunteer_up ok OPENRUNG_NEW_DEST_RATE=fast
+    assert_nonzero "$RUN_RC" "bad egress rate"
+    assert_no_mutating_docker_calls "bad egress rate"
+    assert_output_has "bad egress rate" "OPENRUNG_NEW_DEST_RATE must be a positive whole number or 'off'"
+    egress_log_is "bad egress rate" ''
+}
+
+# A rolled-back update never touches the host firewall.
+test_egress_limit_skipped_on_rollback() {
+    reset_simulation
+    write_env
+    run_volunteer_up start_fail
+    assert_nonzero "$RUN_RC" "egress on rollback"
+    egress_log_is "egress on rollback" ''
+    if grep -q -- '--entrypoint cat' "$DOCKER_LOG" || [ -e "$EGRESS_LIMIT_BIN" ]; then
+        fail "egress on rollback: the limit was installed although the update rolled back"
+    else
+        pass
+    fi
+}
+
+test_egress_limit_installs_missing_nftables() {
+    reset_simulation
+    write_env
+    run_volunteer_up ok SIM_NFT=absent
+    egress_log_is "nftables install" "$(printf 'apt-get -o DPkg::Lock::Timeout=300 update\napt-get -o DPkg::Lock::Timeout=300 install -y nftables\negress-limit apply 10\negress-limit unit\nsystemctl daemon-reload\nsystemctl enable openrung-egress-limit.service')"
+    assert_output_has "nftables install" 'installing nftables'
+
+    reset_simulation
+    write_env
+    run_volunteer_up ok SIM_NFT=absent SIM_APT=fail
+    if [ "$RUN_RC" -eq 0 ] && ! grep -q '^egress-limit ' "$EGRESS_LOG" && [ ! -e "$EGRESS_LIMIT_BIN" ]; then
+        pass
+    else
+        fail "nftables unavailable: expected success without loading the limit, got rc=$RUN_RC log=$(cat "$EGRESS_LOG")"
+    fi
+    assert_output_has "nftables unavailable" 'nftables is not installed'
+    assert_candidate_is_live "nftables unavailable"
+}
+
+# Every egress failure warns and leaves the verified relay serving.
+test_egress_limit_failures_only_warn() {
+    reset_simulation
+    write_env
+    run_volunteer_up ok SIM_EGRESS_SCRIPT=missing
+    if [ "$RUN_RC" -eq 0 ] && [ ! -s "$EGRESS_LOG" ] && [ ! -e "$EGRESS_LIMIT_BIN" ]; then pass; else fail "image without egress-limit: expected success, nothing installed"; fi
+    assert_output_has "image without egress-limit" 'carries no egress-limit script'
+    assert_candidate_is_live "image without egress-limit"
+
+    reset_simulation
+    write_env
+    run_volunteer_up ok SIM_EGRESS_APPLY=fail
+    egress_log_is "egress apply failure" 'egress-limit apply 10'
+    assert_output_has "egress apply failure" 'new-destination limit could not be loaded'
+    if [ "$RUN_RC" -eq 0 ]; then pass; else fail "egress apply failure: run failed (rc=$RUN_RC)"; fi
+    assert_candidate_is_live "egress apply failure"
+
+    reset_simulation
+    write_env
+    rm -rf "$SYSTEMD_RUN_DIR"
+    run_volunteer_up ok
+    egress_log_is "egress without systemd" 'egress-limit apply 10'
+    assert_output_has "egress without systemd" 'until the next reboot'
+    if [ "$RUN_RC" -eq 0 ] && [ ! -e "$EGRESS_LIMIT_UNIT" ]; then pass; else fail "egress without systemd: expected success without a boot unit"; fi
+}
+
+test_special_ipv4_ranges() {
+    expect_public_ipv4 1.1.1.1
+    expect_public_ipv4 8.8.8.8
+
+    # RFC 5737 documentation networks (TEST-NET-1/2/3).
+    expect_non_public_ipv4 192.0.2.1
+    expect_non_public_ipv4 198.51.100.1
+    expect_non_public_ipv4 203.0.113.1
+
+    # IETF protocol-assignment and deprecated 6to4-relay anycast space.
+    expect_non_public_ipv4 192.0.0.1
+    expect_non_public_ipv4 192.88.99.1
+
+    # RFC 2544 benchmarking network (the full 198.18.0.0/15).
+    expect_non_public_ipv4 198.18.0.1
+    expect_non_public_ipv4 198.19.255.254
+}
+
+test_foundation_env_is_refused_before_mutation
+test_foundation_token_duplicates_fail_closed
+test_bare_foundation_marker_is_refused
+test_failed_candidate_create_preserves_unowned_conflict
+test_failed_candidate_start_restores_prior
+test_crash_looping_candidate_restores_prior
+test_unregistered_candidate_restores_prior
+test_successful_update_promotes_candidate
+test_update_pins_override_label_and_respects_existing
+test_overlong_label_is_refused_before_mutation
+test_first_run_generates_label_and_promotes
+test_first_run_falls_back_for_flagless_image
+test_first_run_honors_explicit_label
+test_contact_prompt_stores_typed_answer
+test_contact_prompt_enter_confirms_suggestion
+test_contact_prompt_typed_answer_replaces_suggestion
+test_contact_prompt_empty_answer_skips
+test_contact_prompt_end_of_input_ignores_suggestion
+test_contact_prompt_reasks_after_invalid_answer
+test_contact_prompt_gives_up_after_three_invalid_answers
+test_contact_from_env_is_not_asked
+test_contact_without_terminal_is_not_asked
+test_contact_is_never_asked_again
+test_invalid_contact_is_refused_before_mutation
+test_contact_with_embedded_newline_cannot_inject_settings
+test_special_ipv4_ranges
+test_host_firewall_opened_only_when_active
+test_accepted_registration_is_reported_as_serving
+test_unreachable_prints_provider_fix_and_promotes
+test_unreachable_wait_sees_the_port_open
+test_late_refusal_is_still_promoted
+test_bad_wait_value_is_refused_before_mutation
+test_tcp_tuning_enables_and_persists_bbr
+test_tcp_tuning_opt_out_leaves_host_alone
+test_tcp_tuning_keeps_operator_choice
+test_tcp_tuning_without_bbr_still_installs
+test_tcp_tuning_waits_for_preflight
+test_egress_limit_loaded_after_promotion
+test_egress_limit_rate_and_off
+test_egress_limit_skipped_on_rollback
+test_egress_limit_installs_missing_nftables
+test_egress_limit_failures_only_warn
+test_access_address_added_on_routed_ipv6
+test_access_address_unrouted_is_removed
+test_access_address_not_deprecated_is_removed
+test_access_address_unit_failure_is_removed
+test_access_address_needs_routed_prefix
+test_access_address_default_and_opt_out
+test_access_address_skips_unique_local_prefix
+test_env_append_ends_unterminated_last_line
+test_access_address_skips_customised_relay
+test_bad_access_value_is_refused_before_mutation
+test_expand_ipv6
+
+if [ "$FAIL" -ne 0 ]; then
+    echo "volunteer-up tests: $PASS passed, $FAIL failed" >&2
+    exit 1
+fi
+
+echo "volunteer-up tests: $PASS passed"

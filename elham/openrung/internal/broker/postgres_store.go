@@ -1,0 +1,1192 @@
+package broker
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"openrung/internal/relay"
+)
+
+const descriptorColumns = `
+	id,
+	public_host,
+	public_port,
+	protocol,
+	client_id,
+	reality_public_key,
+	short_id,
+	server_name,
+	flow,
+	exit_mode,
+	max_sessions,
+	max_mbps,
+	volunteer_version,
+	registered_at,
+	last_heartbeat_at,
+	expires_at,
+	label,
+	transport,
+	punch_capable,
+	punch_endpoint,
+	city,
+	country,
+	country_code,
+	latitude,
+	longitude,
+	exit_host,
+	node_class,
+	identity_public_key,
+	lease_token,
+	wss_fronts,
+	lease_capable,
+	reachable,
+	reachability_checked_at,
+	operator_contact,
+	access_host,
+	access_reachable,
+	access_reachability_checked_at
+`
+
+const postgresOperationTimeout = 5 * time.Second
+
+// relaySessionPruneBatch caps the sessions one Prune deletes, so a backlog
+// drains over successive passes instead of outrunning the operation timeout.
+// A variable so tests can exercise the cap with a handful of rows.
+var relaySessionPruneBatch = 20000
+
+const postgresSchema = `
+CREATE TABLE IF NOT EXISTS relay_descriptors (
+	id text PRIMARY KEY,
+	public_host text NOT NULL,
+	public_port integer NOT NULL CHECK (public_port BETWEEN 1 AND 65535),
+	protocol text NOT NULL,
+	client_id text NOT NULL,
+	reality_public_key text NOT NULL,
+	short_id text NOT NULL,
+	server_name text NOT NULL,
+	flow text NOT NULL,
+	exit_mode text NOT NULL,
+	max_sessions integer NOT NULL CHECK (max_sessions > 0),
+	max_mbps integer NOT NULL CHECK (max_mbps > 0),
+	volunteer_version text NOT NULL,
+	registered_at timestamptz NOT NULL,
+	last_heartbeat_at timestamptz NOT NULL,
+	expires_at timestamptz NOT NULL,
+	label text NOT NULL DEFAULT '',
+	is_ipv6 boolean NOT NULL,
+	transport text NOT NULL DEFAULT 'direct',
+	punch_capable boolean NOT NULL DEFAULT false,
+	punch_endpoint text NOT NULL DEFAULT '',
+	city text NOT NULL DEFAULT '',
+	country text NOT NULL DEFAULT '',
+	country_code text NOT NULL DEFAULT '',
+	latitude double precision NOT NULL DEFAULT 0,
+	longitude double precision NOT NULL DEFAULT 0,
+	exit_host text NOT NULL DEFAULT '',
+	node_class text NOT NULL DEFAULT 'volunteer',
+	identity_public_key text NOT NULL DEFAULT '',
+	lease_token text NOT NULL DEFAULT '',
+	wss_fronts jsonb NOT NULL DEFAULT '[]'::jsonb,
+	attributes jsonb NOT NULL DEFAULT '{}'::jsonb,
+	UNIQUE (public_host, public_port)
+);
+
+ALTER TABLE relay_descriptors
+	ADD COLUMN IF NOT EXISTS attributes jsonb NOT NULL DEFAULT '{}'::jsonb;
+
+ALTER TABLE relay_descriptors
+	ADD COLUMN IF NOT EXISTS label text NOT NULL DEFAULT '';
+
+ALTER TABLE relay_descriptors
+	ADD COLUMN IF NOT EXISTS transport text NOT NULL DEFAULT 'direct';
+
+ALTER TABLE relay_descriptors
+	ADD COLUMN IF NOT EXISTS punch_capable boolean NOT NULL DEFAULT false;
+
+ALTER TABLE relay_descriptors
+	ADD COLUMN IF NOT EXISTS punch_endpoint text NOT NULL DEFAULT '';
+
+ALTER TABLE relay_descriptors
+	ADD COLUMN IF NOT EXISTS city text NOT NULL DEFAULT '';
+
+ALTER TABLE relay_descriptors
+	ADD COLUMN IF NOT EXISTS country text NOT NULL DEFAULT '';
+
+ALTER TABLE relay_descriptors
+	ADD COLUMN IF NOT EXISTS country_code text NOT NULL DEFAULT '';
+
+ALTER TABLE relay_descriptors
+	ADD COLUMN IF NOT EXISTS latitude double precision NOT NULL DEFAULT 0;
+
+ALTER TABLE relay_descriptors
+	ADD COLUMN IF NOT EXISTS longitude double precision NOT NULL DEFAULT 0;
+
+ALTER TABLE relay_descriptors
+	ADD COLUMN IF NOT EXISTS exit_host text NOT NULL DEFAULT '';
+
+ALTER TABLE relay_descriptors
+	ADD COLUMN IF NOT EXISTS node_class text NOT NULL DEFAULT 'volunteer';
+
+ALTER TABLE relay_descriptors
+	ADD COLUMN IF NOT EXISTS identity_public_key text NOT NULL DEFAULT '';
+
+ALTER TABLE relay_descriptors
+	ADD COLUMN IF NOT EXISTS lease_token text NOT NULL DEFAULT '';
+
+ALTER TABLE relay_descriptors
+	ADD COLUMN IF NOT EXISTS wss_fronts jsonb NOT NULL DEFAULT '[]'::jsonb;
+
+CREATE INDEX IF NOT EXISTS relay_descriptors_active_idx
+	ON relay_descriptors (expires_at DESC, last_heartbeat_at DESC);
+
+CREATE TABLE IF NOT EXISTS relay_sessions (
+	session_id text PRIMARY KEY,
+	client_id text NOT NULL,
+	relay_id text NOT NULL,
+	last_heartbeat_at timestamptz NOT NULL,
+	terminal_at timestamptz,
+	updated_at timestamptz NOT NULL,
+	attributes jsonb NOT NULL DEFAULT '{}'::jsonb
+);
+
+ALTER TABLE relay_sessions
+	ADD COLUMN IF NOT EXISTS attributes jsonb NOT NULL DEFAULT '{}'::jsonb;
+
+-- relay_sessions carries no secondary index. Prune keeps it down to the
+-- sessions of the last rankingWindow, which every reader scans whole, and
+-- every heartbeat rewrites last_heartbeat_at: the index earlier versions kept
+-- on (relay_id, last_heartbeat_at) was never chosen and grew with each one.
+DROP INDEX IF EXISTS relay_sessions_active_by_relay_idx;
+
+-- ttfb_ms, download_mbps_milli and speed_test_count are no longer written or
+-- read: speed tests stopped feeding the ranking. They stay so that a broker
+-- from before that change can still run against this schema.
+CREATE TABLE IF NOT EXISTS relay_metrics (
+	event_id text PRIMARY KEY,
+	relay_id text NOT NULL,
+	observed_at timestamptz NOT NULL,
+	success_count integer NOT NULL DEFAULT 0,
+	failure_count integer NOT NULL DEFAULT 0,
+	tcp_ms bigint,
+	tunnel_start_ms bigint,
+	internet_probe_ms bigint,
+	ttfb_ms bigint,
+	download_mbps_milli bigint,
+	speed_test_count integer NOT NULL DEFAULT 0,
+	measurements jsonb NOT NULL DEFAULT '{}'::jsonb
+);
+
+ALTER TABLE relay_metrics
+	ADD COLUMN IF NOT EXISTS measurements jsonb NOT NULL DEFAULT '{}'::jsonb;
+
+CREATE INDEX IF NOT EXISTS relay_metrics_recent_by_relay_idx
+	ON relay_metrics (relay_id, observed_at DESC);
+
+CREATE TABLE IF NOT EXISTS relay_ranking_weights (
+	relay_id text PRIMARY KEY,
+	weight double precision NOT NULL CHECK (weight >= 0 AND weight <= 1),
+	updated_at timestamptz NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS users (
+	id text PRIMARY KEY,
+	public_key text NOT NULL UNIQUE,
+	status text NOT NULL DEFAULT 'enabled' CHECK (status IN ('enabled', 'disabled')),
+	created_at timestamptz NOT NULL,
+	last_auth_at timestamptz NOT NULL,
+	disabled_at timestamptz,
+	disabled_reason text NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS user_enrollment_counters (
+	source_key text NOT NULL,
+	window_name text NOT NULL,
+	window_start timestamptz NOT NULL,
+	window_seconds bigint NOT NULL CHECK (window_seconds > 0),
+	count integer NOT NULL,
+	PRIMARY KEY (source_key, window_name)
+);
+
+ALTER TABLE relay_descriptors
+	ADD COLUMN IF NOT EXISTS lease_capable boolean NOT NULL DEFAULT false;
+
+ALTER TABLE relay_descriptors
+	ADD COLUMN IF NOT EXISTS reachable boolean NOT NULL DEFAULT false;
+
+ALTER TABLE relay_descriptors
+	ADD COLUMN IF NOT EXISTS reachability_checked_at timestamptz;
+
+ALTER TABLE relay_descriptors
+	ADD COLUMN IF NOT EXISTS operator_contact text NOT NULL DEFAULT '';
+
+ALTER TABLE relay_descriptors
+	ADD COLUMN IF NOT EXISTS access_host text NOT NULL DEFAULT '';
+
+ALTER TABLE relay_descriptors
+	ADD COLUMN IF NOT EXISTS access_reachable boolean NOT NULL DEFAULT false;
+
+ALTER TABLE relay_descriptors
+	ADD COLUMN IF NOT EXISTS access_reachability_checked_at timestamptz;
+
+CREATE TABLE IF NOT EXISTS access_leases (
+	id text PRIMARY KEY,
+	user_id text NOT NULL REFERENCES users (id),
+	relay_id text NOT NULL,
+	credential text NOT NULL,
+	created_at timestamptz NOT NULL,
+	renewed_at timestamptz NOT NULL,
+	expires_at timestamptz NOT NULL,
+	revoked_at timestamptz,
+	revision bigint NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS access_leases_relay_revision_idx
+	ON access_leases (relay_id, revision);
+
+CREATE INDEX IF NOT EXISTS access_leases_live_by_user_idx
+	ON access_leases (user_id, expires_at)
+	WHERE revoked_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS access_leases_live_by_relay_idx
+	ON access_leases (relay_id, expires_at)
+	WHERE revoked_at IS NULL;
+
+-- Every retained lease of one user, revoked ones included: the operator
+-- user directory's per-user lease counters (a lateral aggregate per listed
+-- user) and the user detail's most-recent-first lease list.
+CREATE INDEX IF NOT EXISTS access_leases_by_user_idx
+	ON access_leases (user_id, created_at);
+
+CREATE TABLE IF NOT EXISTS relay_lease_state (
+	relay_id text PRIMARY KEY,
+	revision bigint NOT NULL DEFAULT 0,
+	applied_revision bigint NOT NULL DEFAULT 0,
+	updated_at timestamptz NOT NULL
+);
+`
+
+type PostgresStore struct {
+	pool *pgxpool.Pool
+}
+
+func NewPostgresStore(ctx context.Context, databaseURL string) (*PostgresStore, error) {
+	if strings.TrimSpace(databaseURL) == "" {
+		return nil, errors.New("relay database URL is required")
+	}
+	pool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("open relay database: %w", err)
+	}
+	store := &PostgresStore{pool: pool}
+	if err := store.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	if err := store.migrate(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return store, nil
+}
+
+func (s *PostgresStore) Register(req relay.RegisterRequest, now time.Time, ttl time.Duration) (relay.Descriptor, error) {
+	ctx, cancel := postgresOperationContext()
+	defer cancel()
+
+	// Verification lives in the store, not the handler, so no future caller
+	// can register an identity-bearing request without the possession proof —
+	// the derived ID is only ever handed to a registrant holding the private
+	// key. Legacy requests (no identity fields) return a nil key and keep the
+	// random mint below.
+	identityKey, err := relay.VerifyIdentity(req, now)
+	if err != nil {
+		return relay.Descriptor{}, err
+	}
+	if err := relay.VerifyWSSCapability(req, now); err != nil {
+		return relay.Descriptor{}, err
+	}
+	var id string
+	if identityKey != nil {
+		id = relay.DeriveRelayID(identityKey)
+	} else if id, err = newRelayID(); err != nil {
+		return relay.Descriptor{}, err
+	}
+	var leaseToken string
+	if identityKey != nil {
+		leaseToken, err = newRelayLeaseToken()
+		if err != nil {
+			return relay.Descriptor{}, err
+		}
+	}
+	desc := relay.Descriptor{
+		ID:                id,
+		IdentityPublicKey: req.IdentityPublicKey,
+		LeaseToken:        leaseToken,
+		LeaseCapable:      req.AccessLeases && identityKey != nil,
+		Label:             req.Label,
+		OperatorContact:   req.OperatorContact,
+		NodeClass:         normalizeNodeClass(req.NodeClass),
+		PublicHost:        req.PublicHost,
+		PublicPort:        req.PublicPort,
+		ExitHost:          req.ExitHost,
+		Protocol:          req.Protocol,
+		ClientID:          req.ClientID,
+		RealityPublicKey:  req.RealityPublicKey,
+		ShortID:           req.ShortID,
+		ServerName:        req.ServerName,
+		Flow:              req.Flow,
+		ExitMode:          req.ExitMode,
+		MaxSessions:       req.MaxSessions,
+		MaxMbps:           req.MaxMbps,
+		RelayVersion:      req.RelayVersion,
+		Transport:         normalizeTransport(req.Transport),
+		PunchCapable:      req.PunchCapable,
+		PunchEndpoint:     req.PunchEndpoint,
+		WSSFronts:         append([]relay.WSSFrontDescriptor(nil), req.WSSFronts...),
+		RegisteredAt:      now,
+		LastHeartbeatAt:   now,
+		ExpiresAt:         now.Add(ttl),
+	}
+	// Like the lease capability, an access host is honoured only on an
+	// identity-bearing registration; a legacy one's is dropped.
+	if identityKey != nil {
+		desc.AccessHost = req.AccessHost
+	}
+	wssFrontsJSON, err := json.Marshal(desc.WSSFronts)
+	if err != nil {
+		return relay.Descriptor{}, fmt.Errorf("encode WSS fronts: %w", err)
+	}
+
+	// Geo columns are deliberately absent from the INSERT: a re-registration
+	// at the same host:port keeps its previously resolved location until the
+	// handler's next successful UpdateGeo — except when the exit host changed
+	// (a hub port reused by a different relay), where the upsert clears
+	// the stale location so the handler resolves the new exit. The
+	// reachability columns are absent too, and the upsert resets them: a
+	// registration is a new incarnation of the endpoint, and the handler
+	// probes it afresh before anything reads the row.
+	//
+	// The DO UPDATE WHERE guards a LIVE foundation endpoint: a foundation row
+	// may only be overwritten by another foundation-class registration.
+	// public_host:public_port is client-supplied and foundation endpoints are
+	// public in the signed list, so without this guard an anonymous
+	// registration could seize a foundation relay's row (new id, attacker's
+	// keys, downgraded class) and knock the real relay into a re-registration
+	// race. The handler already gates node_class=foundation behind the
+	// foundation token, so "EXCLUDED.node_class = foundation" can only be true
+	// for a token-authorized caller. The expires_at disjunct keeps this to
+	// live rows — an already-expired foundation row (not yet pruned) is
+	// reclaimable, matching the in-memory Store's ExpiresAt.After(now) guard.
+	// A suppressed update returns no row (pgx.ErrNoRows), which we map to
+	// ErrNodeClassForbidden.
+	//
+	// Identity registrations run inside a transaction so a relay moving to a
+	// new endpoint atomically abandons its old row: the id is the PRIMARY KEY,
+	// so without the DELETE the insert at the new endpoint would collide with
+	// the relay's own previous row. The DELETE can only ever remove rows owned
+	// by this identity (the id is derived from the key the registrant just
+	// proved possession of), and a rollback — e.g. the foundation-endpoint
+	// guard suppressing the upsert — preserves the old row untouched.
+	querier := pgxQuerier(s.pool)
+	if identityKey != nil {
+		tx, err := s.pool.Begin(ctx)
+		if err != nil {
+			return relay.Descriptor{}, fmt.Errorf("begin relay registration: %w", err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		// A stable identity re-registering from a new endpoint abandons its old
+		// row. Tunnel relays hit this on most reconnects (the hub round-robins
+		// their public port), and the upsert below can still be refused and
+		// rolled back by the foundation-endpoint guard, so this is deliberately
+		// silent — logging here would be both noisy and, on a rollback, false.
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM relay_descriptors
+			WHERE id = $1 AND (public_host <> $2 OR public_port <> $3)`,
+			id, desc.PublicHost, desc.PublicPort); err != nil {
+			return relay.Descriptor{}, fmt.Errorf("evict moved relay identity: %w", err)
+		}
+		querier = tx
+	}
+	desc, err = scanDescriptor(querier.QueryRow(ctx, `
+		INSERT INTO relay_descriptors (
+			id,
+			public_host,
+			public_port,
+			protocol,
+			client_id,
+			reality_public_key,
+			short_id,
+			server_name,
+			flow,
+			exit_mode,
+			max_sessions,
+			max_mbps,
+			volunteer_version,
+			registered_at,
+			last_heartbeat_at,
+			expires_at,
+			is_ipv6,
+			label,
+			transport,
+			punch_capable,
+			punch_endpoint,
+			exit_host,
+			node_class,
+			identity_public_key,
+			lease_token,
+			wss_fronts,
+			lease_capable,
+			operator_contact,
+			access_host
+		) VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $28, $29, $30
+		)
+		ON CONFLICT (public_host, public_port) DO UPDATE SET
+			id = EXCLUDED.id,
+			protocol = EXCLUDED.protocol,
+			client_id = EXCLUDED.client_id,
+			reality_public_key = EXCLUDED.reality_public_key,
+			short_id = EXCLUDED.short_id,
+			server_name = EXCLUDED.server_name,
+			flow = EXCLUDED.flow,
+			exit_mode = EXCLUDED.exit_mode,
+			max_sessions = EXCLUDED.max_sessions,
+			max_mbps = EXCLUDED.max_mbps,
+			volunteer_version = EXCLUDED.volunteer_version,
+			registered_at = EXCLUDED.registered_at,
+			last_heartbeat_at = EXCLUDED.last_heartbeat_at,
+			expires_at = EXCLUDED.expires_at,
+			is_ipv6 = EXCLUDED.is_ipv6,
+			label = EXCLUDED.label,
+			transport = EXCLUDED.transport,
+			punch_capable = EXCLUDED.punch_capable,
+			punch_endpoint = EXCLUDED.punch_endpoint,
+			city = CASE WHEN relay_descriptors.exit_host = EXCLUDED.exit_host THEN relay_descriptors.city ELSE '' END,
+			country = CASE WHEN relay_descriptors.exit_host = EXCLUDED.exit_host THEN relay_descriptors.country ELSE '' END,
+			country_code = CASE WHEN relay_descriptors.exit_host = EXCLUDED.exit_host THEN relay_descriptors.country_code ELSE '' END,
+			latitude = CASE WHEN relay_descriptors.exit_host = EXCLUDED.exit_host THEN relay_descriptors.latitude ELSE 0 END,
+			longitude = CASE WHEN relay_descriptors.exit_host = EXCLUDED.exit_host THEN relay_descriptors.longitude ELSE 0 END,
+			exit_host = EXCLUDED.exit_host,
+			node_class = EXCLUDED.node_class,
+			identity_public_key = EXCLUDED.identity_public_key,
+			lease_token = EXCLUDED.lease_token,
+			wss_fronts = EXCLUDED.wss_fronts,
+			lease_capable = EXCLUDED.lease_capable,
+			operator_contact = EXCLUDED.operator_contact,
+			access_host = EXCLUDED.access_host,
+			reachable = false,
+			reachability_checked_at = NULL,
+			access_reachable = false,
+			access_reachability_checked_at = NULL
+		WHERE relay_descriptors.node_class <> $27
+			OR EXCLUDED.node_class = $27
+			OR relay_descriptors.expires_at <= EXCLUDED.registered_at
+		RETURNING `+descriptorColumns,
+		desc.ID,
+		desc.PublicHost,
+		desc.PublicPort,
+		desc.Protocol,
+		desc.ClientID,
+		desc.RealityPublicKey,
+		desc.ShortID,
+		desc.ServerName,
+		desc.Flow,
+		desc.ExitMode,
+		desc.MaxSessions,
+		desc.MaxMbps,
+		desc.RelayVersion,
+		desc.RegisteredAt,
+		desc.LastHeartbeatAt,
+		desc.ExpiresAt,
+		relay.IsIPv6Host(desc.PublicHost),
+		desc.Label,
+		desc.Transport,
+		desc.PunchCapable,
+		desc.PunchEndpoint,
+		desc.ExitHost,
+		desc.NodeClass,
+		desc.IdentityPublicKey,
+		desc.LeaseToken,
+		wssFrontsJSON,
+		relay.NodeClassFoundation,
+		desc.LeaseCapable,
+		desc.OperatorContact,
+		desc.AccessHost,
+	))
+	if errors.Is(err, pgx.ErrNoRows) {
+		// The upsert matched an existing row but the WHERE suppressed the
+		// update: the endpoint is held by a foundation relay and this
+		// (non-foundation) registration may not take it over.
+		return relay.Descriptor{}, ErrNodeClassForbidden
+	}
+	if err != nil {
+		return relay.Descriptor{}, err
+	}
+	if tx, ok := querier.(pgx.Tx); ok {
+		// A new lease token means a new relay session that has applied no
+		// lease set yet: reset applied_revision (keeping revision) so the
+		// relay's first poll re-installs every live lease before any is relied
+		// upon. The row is keyed by the stable ID and is never deleted with a
+		// descriptor — neither by the endpoint-move DELETE above nor by Prune.
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO relay_lease_state (relay_id, revision, applied_revision, updated_at)
+			VALUES ($1, 0, 0, $2)
+			ON CONFLICT (relay_id) DO UPDATE SET applied_revision = 0, updated_at = EXCLUDED.updated_at`,
+			desc.ID, now); err != nil {
+			return relay.Descriptor{}, fmt.Errorf("reset relay lease state: %w", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return relay.Descriptor{}, fmt.Errorf("commit relay registration: %w", err)
+		}
+	}
+	return desc, nil
+}
+
+// pgxQuerier is the intersection of pgxpool.Pool and pgx.Tx that Register
+// needs, so the identity path can run its statements inside a transaction
+// while the legacy path keeps hitting the pool directly.
+type pgxQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+func (s *PostgresStore) Heartbeat(id, leaseToken, maxClass, clientID string, now time.Time, ttl time.Duration) (relay.Descriptor, error) {
+	ctx, cancel := postgresOperationContext()
+	defer cancel()
+
+	// The class guard lives inside the UPDATE's WHERE so an unauthorized
+	// heartbeat never extends the lease, not even transiently. The credential
+	// rides the same guarded UPDATE: an empty $7 keeps the stored value, and so
+	// does a legacy identityless row, whose tokenless renewal must not be able
+	// to change what the directory serves.
+	desc, err := scanDescriptor(s.pool.QueryRow(ctx, `
+		UPDATE relay_descriptors
+		SET last_heartbeat_at = $3, expires_at = $4,
+			client_id = CASE WHEN $7 = '' OR identity_public_key = '' THEN client_id ELSE $7 END
+		WHERE id = $1
+			AND (identity_public_key = '' OR (lease_token <> '' AND lease_token = $2))
+			AND (node_class <> $5 OR $6)
+		RETURNING `+descriptorColumns,
+		id,
+		leaseToken,
+		now,
+		now.Add(ttl),
+		relay.NodeClassFoundation,
+		maxClass == relay.NodeClassFoundation,
+		clientID,
+	))
+	if errors.Is(err, pgx.ErrNoRows) {
+		// No row updated: either the relay is gone or the guard blocked a
+		// foundation row. Distinguish so the handler can answer 403 vs 404
+		// (the 404 drives client re-registration and must stay accurate).
+		return relay.Descriptor{}, heartbeatMissError(
+			s.pool.QueryRow(ctx, `
+				SELECT EXISTS (SELECT 1 FROM relay_descriptors WHERE id = $1),
+					EXISTS (SELECT 1 FROM relay_descriptors WHERE id = $1 AND node_class = $2)`,
+				id, relay.NodeClassFoundation),
+			maxClass,
+		)
+	}
+	return desc, err
+}
+
+func heartbeatMissError(row pgx.Row, maxClass string) error {
+	var exists, foundation bool
+	if err := row.Scan(&exists, &foundation); err != nil {
+		return err
+	}
+	if exists && foundation && maxClass != relay.NodeClassFoundation {
+		return ErrNodeClassForbidden
+	}
+	return ErrRelayNotFound
+}
+
+func (s *PostgresStore) UpdateGeo(id, leaseToken string, geo relay.GeoLocation) error {
+	ctx, cancel := postgresOperationContext()
+	defer cancel()
+
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE relay_descriptors
+		SET city = $3, country = $4, country_code = $5, latitude = $6, longitude = $7
+		WHERE id = $1
+			AND (identity_public_key = '' OR (lease_token <> '' AND lease_token = $2))
+	`, id, leaseToken, geo.City, geo.Country, geo.CountryCode, geo.Latitude, geo.Longitude)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrRelayNotFound
+	}
+	return nil
+}
+
+func (s *PostgresStore) UpdateReachability(id, leaseToken string, reachable bool, checkedAt time.Time) error {
+	ctx, cancel := postgresOperationContext()
+	defer cancel()
+
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE relay_descriptors
+		SET reachable = $3, reachability_checked_at = $4
+		WHERE id = $1
+			AND (identity_public_key = '' OR (lease_token <> '' AND lease_token = $2))
+	`, id, leaseToken, reachable, checkedAt)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrRelayNotFound
+	}
+	return nil
+}
+
+func (s *PostgresStore) UpdateAccessReachability(id, leaseToken string, reachable bool, checkedAt time.Time) error {
+	ctx, cancel := postgresOperationContext()
+	defer cancel()
+
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE relay_descriptors
+		SET access_reachable = $3, access_reachability_checked_at = $4
+		WHERE id = $1
+			AND (identity_public_key = '' OR (lease_token <> '' AND lease_token = $2))
+	`, id, leaseToken, reachable, checkedAt)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrRelayNotFound
+	}
+	return nil
+}
+
+func (s *PostgresStore) List(now time.Time, limit int) ([]relay.Descriptor, error) {
+	relays, _, err := s.ListRanked(now, limit)
+	return relays, err
+}
+
+func (s *PostgresStore) ListRanked(now time.Time, limit int) ([]relay.Descriptor, RankingInputs, error) {
+	ctx, cancel := postgresOperationContext()
+	defer cancel()
+
+	rows, err := s.pool.Query(ctx, `SELECT `+descriptorColumns+` FROM relay_descriptors WHERE expires_at > $1`, now)
+	if err != nil {
+		return nil, RankingInputs{}, err
+	}
+	defer rows.Close()
+
+	var relays []relay.Descriptor
+	for rows.Next() {
+		desc, err := scanDescriptor(rows)
+		if err != nil {
+			return nil, RankingInputs{}, err
+		}
+		relays = append(relays, desc)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, RankingInputs{}, err
+	}
+
+	snapshots, weights, err := s.metricSnapshots(ctx, now)
+	if err != nil {
+		return nil, RankingInputs{}, err
+	}
+	sortRelayCandidates(relays, snapshots, weights, rankingUniform)
+	inputs := RankingInputs{Weights: weights, Snapshots: snapshots}
+	if limit > 0 && len(relays) > limit {
+		return relays[:limit], inputs, nil
+	}
+	return relays, inputs, nil
+}
+
+func (s *PostgresStore) RelayByID(id string, now time.Time) (relay.Descriptor, error) {
+	ctx, cancel := postgresOperationContext()
+	defer cancel()
+	desc, err := scanDescriptor(s.pool.QueryRow(ctx,
+		`SELECT `+descriptorColumns+` FROM relay_descriptors WHERE id = $1 AND expires_at > $2`,
+		id, now))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return relay.Descriptor{}, ErrRelayNotFound
+	}
+	return desc, err
+}
+
+func (s *PostgresStore) RelayNodeClasses(parent context.Context, ids []string, now time.Time) (map[string]string, error) {
+	classes := make(map[string]string, len(ids))
+	if len(ids) == 0 {
+		return classes, nil
+	}
+
+	ctx, cancel := context.WithTimeout(parent, postgresOperationTimeout)
+	defer cancel()
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, node_class
+		FROM relay_descriptors
+		WHERE id = ANY($1) AND expires_at > $2
+	`, ids, now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, nodeClass string
+		if err := rows.Scan(&id, &nodeClass); err != nil {
+			return nil, err
+		}
+		classes[id] = nodeClass
+	}
+	return classes, rows.Err()
+}
+
+func (s *PostgresStore) Stats(now time.Time) (StoreStats, error) {
+	ctx, cancel := postgresOperationContext()
+	defer cancel()
+
+	var active int
+	var capacity sql.NullInt64
+	if err := s.pool.QueryRow(ctx, `
+		SELECT COUNT(*), COALESCE(SUM(max_sessions), 0)::bigint
+		FROM relay_descriptors
+		WHERE expires_at > $1
+	`, now).Scan(&active, &capacity); err != nil {
+		return StoreStats{}, err
+	}
+	return StoreStats{ActiveRelays: active, AdvertisedSessionCapacity: int(capacity.Int64)}, nil
+}
+
+// Prune drops expired descriptors, out-of-window metrics and sessions that
+// ended or went quiet before the ranking window. relay_ranking_weights
+// is deliberately untouched: weights are operator intent about a relay
+// identity, not lease state, and must still apply when the relay returns.
+func (s *PostgresStore) Prune(now time.Time) ([]relay.Descriptor, error) {
+	ctx, cancel := postgresOperationContext()
+	defer cancel()
+
+	rows, err := s.pool.Query(ctx, `DELETE FROM relay_descriptors WHERE expires_at <= $1 RETURNING `+descriptorColumns, now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var expired []relay.Descriptor
+	for rows.Next() {
+		desc, err := scanDescriptor(rows)
+		if err != nil {
+			return nil, err
+		}
+		expired = append(expired, desc)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	cutoff := now.Add(-rankingWindow)
+	if _, err := s.pool.Exec(ctx, `DELETE FROM relay_metrics WHERE observed_at < $1`, cutoff); err != nil {
+		return nil, err
+	}
+	// A session ages out by its terminal event, or by its last heartbeat when
+	// it ended without one (the client went away): neither is counted active
+	// past activeSessionTimeout, and a later heartbeat inserts it afresh.
+	if _, err := s.pool.Exec(ctx, `
+		DELETE FROM relay_sessions
+		WHERE session_id IN (
+			SELECT session_id FROM relay_sessions
+			WHERE COALESCE(terminal_at, last_heartbeat_at) < $1
+			LIMIT $2
+		)
+	`, cutoff, relaySessionPruneBatch); err != nil {
+		return nil, err
+	}
+	if err := s.pruneEnrollmentCounters(ctx, now); err != nil {
+		return nil, err
+	}
+	if err := s.pruneLeases(ctx, now); err != nil {
+		return nil, err
+	}
+	return expired, nil
+}
+
+// RecordRelayTelemetry stores the ranking-relevant events of one upload as a
+// single pipelined batch: one round trip, run by Postgres as one implicit
+// transaction, so an upload is still all-or-nothing. Uploads without such
+// events (most of them) never touch the database.
+func (s *PostgresStore) RecordRelayTelemetry(ctx context.Context, records []TelemetryRecord, now time.Time) error {
+	batch := &pgx.Batch{}
+	for _, record := range records {
+		queueRelayTelemetry(batch, record, now)
+	}
+	if batch.Len() == 0 {
+		return nil
+	}
+	return s.pool.SendBatch(ctx, batch).Close()
+}
+
+func (s *PostgresStore) RelayRankingWeights(parent context.Context) (map[string]float64, error) {
+	ctx, cancel := context.WithTimeout(parent, postgresOperationTimeout)
+	defer cancel()
+	return s.rankingWeights(ctx)
+}
+
+func (s *PostgresStore) SetRelayRankingWeight(parent context.Context, id string, weight float64) (float64, error) {
+	if err := validateRankingWeight(weight); err != nil {
+		return 0, err
+	}
+	return s.updateRankingWeight(parent, id, func(ctx context.Context, tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO relay_ranking_weights (relay_id, weight, updated_at)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (relay_id) DO UPDATE SET
+				weight = EXCLUDED.weight,
+				updated_at = EXCLUDED.updated_at
+		`, id, weight, time.Now().UTC())
+		return err
+	})
+}
+
+func (s *PostgresStore) DeleteRelayRankingWeight(parent context.Context, id string) (float64, error) {
+	return s.updateRankingWeight(parent, id, func(ctx context.Context, tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `DELETE FROM relay_ranking_weights WHERE relay_id = $1`, id)
+		return err
+	})
+}
+
+// updateRankingWeight runs one weight mutation as read-previous-then-write
+// inside a transaction that first takes a per-relay advisory lock. The lock is
+// what makes the returned previous value truthful under concurrency: two
+// setters racing on the same relay each see the other's write as their
+// predecessor (or as their successor), never the same stale snapshot — a
+// single-statement CTE cannot promise that, because the reading CTE observes
+// the statement's snapshot while the upsert waits for and then overwrites the
+// concurrent row. The audit log and the response depend on the chain of
+// previous values being exact, so this pays the round trips.
+func (s *PostgresStore) updateRankingWeight(parent context.Context, id string, mutate func(context.Context, pgx.Tx) error) (float64, error) {
+	ctx, cancel := context.WithTimeout(parent, postgresOperationTimeout)
+	defer cancel()
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("begin relay ranking weight update: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	// Two-key form: the first key namespaces this lock class so it cannot
+	// collide with any other advisory lock a future feature hashes an ID into.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('relay_ranking_weights'), hashtext($1))`, id); err != nil {
+		return 0, fmt.Errorf("lock relay ranking weight: %w", err)
+	}
+	var previous float64
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE((SELECT weight FROM relay_ranking_weights WHERE relay_id = $1), $2::double precision)
+	`, id, defaultRankingWeight).Scan(&previous); err != nil {
+		return 0, fmt.Errorf("read relay ranking weight: %w", err)
+	}
+	if err := mutate(ctx, tx); err != nil {
+		return 0, fmt.Errorf("update relay ranking weight: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit relay ranking weight update: %w", err)
+	}
+	return previous, nil
+}
+
+func (s *PostgresStore) rankingWeights(ctx context.Context) (map[string]float64, error) {
+	rows, err := s.pool.Query(ctx, `SELECT relay_id, weight FROM relay_ranking_weights`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	weights := make(map[string]float64)
+	for rows.Next() {
+		var relayID string
+		var weight float64
+		if err := rows.Scan(&relayID, &weight); err != nil {
+			return nil, err
+		}
+		weights[relayID] = weight
+	}
+	return weights, rows.Err()
+}
+
+func (s *PostgresStore) Ping(ctx context.Context) error {
+	if err := s.pool.Ping(ctx); err != nil {
+		return fmt.Errorf("ping relay database: %w", err)
+	}
+	return nil
+}
+
+func (s *PostgresStore) Close() error {
+	s.pool.Close()
+	return nil
+}
+
+func (s *PostgresStore) migrate(ctx context.Context) error {
+	if _, err := s.pool.Exec(ctx, postgresSchema); err != nil {
+		return fmt.Errorf("migrate relay database: %w", err)
+	}
+	return nil
+}
+
+// metricSnapshots builds the ranking inputs: the 30-minute telemetry snapshot
+// per relay plus, as a parallel map, the operator ranking-weight overrides (a
+// relay without telemetry has no snapshot entry, so the weight cannot ride
+// inside it without its zero value reading as weight 0). Each latency is the
+// median of the window's positive values; nulls and values <= 0 are not
+// measurements. A positive tcp_ms is one measured TCP handshake.
+func (s *PostgresStore) metricSnapshots(ctx context.Context, now time.Time) (map[string]RelayMetricsSnapshot, map[string]float64, error) {
+	weights, err := s.rankingWeights(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	snapshots := make(map[string]RelayMetricsSnapshot)
+	activeRows, err := s.pool.Query(ctx, `
+		SELECT relay_id, COUNT(*)::bigint
+		FROM relay_sessions
+		WHERE terminal_at IS NULL AND last_heartbeat_at > $1
+		GROUP BY relay_id
+	`, now.Add(-activeSessionTimeout))
+	if err != nil {
+		return nil, nil, err
+	}
+	for activeRows.Next() {
+		var relayID string
+		var active int64
+		if err := activeRows.Scan(&relayID, &active); err != nil {
+			activeRows.Close()
+			return nil, nil, err
+		}
+		snapshot := snapshots[relayID]
+		snapshot.ActiveSessions = int(active)
+		snapshots[relayID] = snapshot
+	}
+	if err := activeRows.Err(); err != nil {
+		activeRows.Close()
+		return nil, nil, err
+	}
+	activeRows.Close()
+
+	metricRows, err := s.pool.Query(ctx, `
+		SELECT
+			relay_id,
+			COALESCE(SUM(success_count), 0)::bigint,
+			COALESCE(SUM(failure_count), 0)::bigint,
+			COALESCE(percentile_cont(0.5) WITHIN GROUP (ORDER BY tcp_ms::double precision) FILTER (WHERE tcp_ms > 0), 0),
+			COALESCE(percentile_cont(0.5) WITHIN GROUP (ORDER BY internet_probe_ms::double precision) FILTER (WHERE internet_probe_ms > 0), 0),
+			COUNT(*) FILTER (WHERE tcp_ms > 0)::bigint,
+			COUNT(*) FILTER (WHERE tcp_ms >= $3)::bigint
+		FROM relay_metrics
+		WHERE observed_at >= $1 AND observed_at <= $2
+		GROUP BY relay_id
+	`, now.Add(-rankingWindow), now, int64(rankingHandshakeResentMS))
+	if err != nil {
+		return nil, nil, err
+	}
+	defer metricRows.Close()
+	for metricRows.Next() {
+		var relayID string
+		var successes, failures int64
+		var tcpMedian, internetMedian float64
+		var handshakes, handshakesResent int64
+		if err := metricRows.Scan(
+			&relayID,
+			&successes,
+			&failures,
+			&tcpMedian,
+			&internetMedian,
+			&handshakes,
+			&handshakesResent,
+		); err != nil {
+			return nil, nil, err
+		}
+		snapshot := snapshots[relayID]
+		snapshot.Successes = int(successes)
+		snapshot.Failures = int(failures)
+		snapshot.TCPMS = tcpMedian
+		snapshot.InternetProbeMS = internetMedian
+		snapshot.TCPHandshakes = int(handshakes)
+		snapshot.TCPHandshakesResent = int(handshakesResent)
+		snapshots[relayID] = snapshot
+	}
+	return snapshots, weights, metricRows.Err()
+}
+
+func queueRelayTelemetry(batch *pgx.Batch, record TelemetryRecord, now time.Time) {
+	event := record.Event
+	observedAt := record.ReceivedAt
+	if observedAt.IsZero() {
+		observedAt = event.OccurredAt
+	}
+	if observedAt.IsZero() {
+		observedAt = now
+	}
+
+	switch event.Event {
+	case "session_heartbeat":
+		if event.SessionID == "" || event.RelayID == "" {
+			return
+		}
+		batch.Queue(`
+			INSERT INTO relay_sessions (session_id, client_id, relay_id, last_heartbeat_at, terminal_at, updated_at)
+			VALUES ($1, $2, $3, $4, NULL, $5)
+			ON CONFLICT (session_id) DO UPDATE SET
+				client_id = EXCLUDED.client_id,
+				relay_id = EXCLUDED.relay_id,
+				last_heartbeat_at = GREATEST(relay_sessions.last_heartbeat_at, EXCLUDED.last_heartbeat_at),
+				terminal_at = CASE
+					WHEN relay_sessions.terminal_at IS NOT NULL
+						AND relay_sessions.terminal_at >= EXCLUDED.last_heartbeat_at
+					THEN relay_sessions.terminal_at
+					ELSE NULL
+				END,
+				updated_at = EXCLUDED.updated_at
+		`, event.SessionID, event.ClientID, event.RelayID, observedAt, now)
+	case "connection_succeeded", "relay_failover":
+		if event.RelayID != "" {
+			queueMetric(batch, event.EventID, event.RelayID, observedAt, true, false, event.Measurements)
+		}
+	case "relay_attempt_failed":
+		if event.RelayID != "" {
+			queueMetric(batch, event.EventID, event.RelayID, observedAt, false, true, event.Measurements)
+		}
+	case "connection_ended", "tunnel_stopped", "connection_failed":
+		queueSessionTerminal(batch, event, observedAt, now)
+	}
+}
+
+func queueMetric(batch *pgx.Batch, eventID, relayID string, observedAt time.Time, success, failure bool, measurements map[string]int64) {
+	successCount, failureCount := 0, 0
+	if success {
+		successCount = 1
+	}
+	if failure {
+		failureCount = 1
+	}
+
+	batch.Queue(`
+		INSERT INTO relay_metrics (
+			event_id,
+			relay_id,
+			observed_at,
+			success_count,
+			failure_count,
+			tcp_ms,
+			tunnel_start_ms,
+			internet_probe_ms
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (event_id) DO NOTHING
+	`,
+		eventID,
+		relayID,
+		observedAt,
+		successCount,
+		failureCount,
+		positiveInt64(measurements["relay_tcp_ms"]),
+		positiveInt64(measurements["tunnel_start_ms"]),
+		positiveInt64(measurements["internet_probe_ms"]),
+	)
+}
+
+func queueSessionTerminal(batch *pgx.Batch, event TelemetryEvent, observedAt, now time.Time) {
+	if event.SessionID == "" {
+		return
+	}
+	if event.RelayID == "" {
+		batch.Queue(`
+			UPDATE relay_sessions
+			SET terminal_at = CASE
+					WHEN terminal_at IS NULL OR terminal_at < $2 THEN $2
+					ELSE terminal_at
+				END,
+				updated_at = $3
+			WHERE session_id = $1
+		`, event.SessionID, observedAt, now)
+		return
+	}
+
+	batch.Queue(`
+		INSERT INTO relay_sessions (session_id, client_id, relay_id, last_heartbeat_at, terminal_at, updated_at)
+		VALUES ($1, $2, $3, $4, $4, $5)
+		ON CONFLICT (session_id) DO UPDATE SET
+			client_id = CASE WHEN EXCLUDED.client_id = '' THEN relay_sessions.client_id ELSE EXCLUDED.client_id END,
+			relay_id = CASE WHEN EXCLUDED.relay_id = '' THEN relay_sessions.relay_id ELSE EXCLUDED.relay_id END,
+			terminal_at = CASE
+				WHEN relay_sessions.terminal_at IS NULL OR relay_sessions.terminal_at < EXCLUDED.terminal_at
+				THEN EXCLUDED.terminal_at
+				ELSE relay_sessions.terminal_at
+			END,
+			updated_at = EXCLUDED.updated_at
+	`, event.SessionID, event.ClientID, event.RelayID, observedAt, now)
+}
+
+func scanDescriptor(row pgx.Row) (relay.Descriptor, error) {
+	var desc relay.Descriptor
+	var wssFrontsJSON []byte
+	var reachabilityCheckedAt, accessReachabilityCheckedAt sql.NullTime
+	err := row.Scan(
+		&desc.ID,
+		&desc.PublicHost,
+		&desc.PublicPort,
+		&desc.Protocol,
+		&desc.ClientID,
+		&desc.RealityPublicKey,
+		&desc.ShortID,
+		&desc.ServerName,
+		&desc.Flow,
+		&desc.ExitMode,
+		&desc.MaxSessions,
+		&desc.MaxMbps,
+		&desc.RelayVersion,
+		&desc.RegisteredAt,
+		&desc.LastHeartbeatAt,
+		&desc.ExpiresAt,
+		&desc.Label,
+		&desc.Transport,
+		&desc.PunchCapable,
+		&desc.PunchEndpoint,
+		&desc.City,
+		&desc.Country,
+		&desc.CountryCode,
+		&desc.Latitude,
+		&desc.Longitude,
+		&desc.ExitHost,
+		&desc.NodeClass,
+		&desc.IdentityPublicKey,
+		&desc.LeaseToken,
+		&wssFrontsJSON,
+		&desc.LeaseCapable,
+		&desc.Reachable,
+		&reachabilityCheckedAt,
+		&desc.OperatorContact,
+		&desc.AccessHost,
+		&desc.AccessReachable,
+		&accessReachabilityCheckedAt,
+	)
+	if err != nil {
+		return relay.Descriptor{}, err
+	}
+	if reachabilityCheckedAt.Valid {
+		desc.ReachabilityCheckedAt = reachabilityCheckedAt.Time
+	}
+	if accessReachabilityCheckedAt.Valid {
+		desc.AccessReachabilityCheckedAt = accessReachabilityCheckedAt.Time
+	}
+	if len(wssFrontsJSON) != 0 {
+		if err := json.Unmarshal(wssFrontsJSON, &desc.WSSFronts); err != nil {
+			return relay.Descriptor{}, fmt.Errorf("decode stored WSS fronts: %w", err)
+		}
+	}
+	return desc, nil
+}
+
+func positiveInt64(value int64) any {
+	if value <= 0 {
+		return nil
+	}
+	return value
+}
+
+func postgresOperationContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), postgresOperationTimeout)
+}

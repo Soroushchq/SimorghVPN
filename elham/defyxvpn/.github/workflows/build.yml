@@ -1,0 +1,37 @@
+name: Android & iOS & Linux & Windows Build with Store Uploads
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches:
+      - release
+
+jobs:
+  android:
+    uses: ./.github/workflows/android.yml
+    secrets: inherit
+
+  ios:
+    if: false
+    uses: ./.github/workflows/ios.yml
+    secrets: inherit
+
+  windows:
+    uses: ./.github/workflows/windows.yml
+    secrets: inherit
+
+  linux:
+    uses: ./.github/workflows/linux.yml
+    secrets: inherit
+
+  release-to-telegram:
+    needs: [android, windows, linux]
+    uses: ./.github/workflows/telegram.yml
+    secrets: inherit
+
+  release:
+    needs: [android, windows, linux]
+    uses: ./.github/workflows/release.yml
+    secrets: inherit

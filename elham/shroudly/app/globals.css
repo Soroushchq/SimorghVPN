@@ -1,0 +1,635 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Shroudly design tokens — a calm "obsidian" security tool.
+   Cool blue-black depth, one confident cyan→blue accent reserved for the
+   protected state, quiet slate everywhere else. Every colour used by the UI
+   lives here; components only reference these variables.
+   ───────────────────────────────────────────────────────────────────────── */
+:root {
+  --bg:            #0b0f17;
+  --bg-sunk:       #080b12;
+  --surface:       #121826;
+  /* What floats above everything else (menus, toasts, the tour card): never
+     see-through, whatever the surface style. */
+  --surface-pop:   #151c2b;
+  --surface-2:     #161d2e;
+  --surface-hover: #1d2638;
+  --surface-press: #222c40;
+  --line:          rgba(148, 163, 184, 0.12);
+  --line-strong:   rgba(148, 163, 184, 0.22);
+
+  --text:          #e8edf6;
+  --text-dim:      #a3afc4;   /* ≈ 8:1 on --surface */
+  --text-faint:    #7d89a1;   /* ≈ 5:1 on --surface (AA for small text) */
+
+  --accent:        #38bdf8;
+  --accent-hover:  #5ccafa;
+  --accent-deep:   #2563eb;
+  --accent-soft:   rgba(56, 189, 248, 0.12);
+  --accent-line:   rgba(56, 189, 248, 0.38);
+  --on-accent:     #06111d;   /* text on solid accent */
+
+  --ok:          #34d399;
+  --ok-soft:     rgba(52, 211, 153, 0.12);
+  --ok-line:     rgba(52, 211, 153, 0.32);
+  --warn:        #fbbf24;
+  --warn-hover:  #fcca4a;
+  --warn-soft:   rgba(251, 191, 36, 0.10);
+  --warn-line:   rgba(251, 191, 36, 0.32);
+  --on-warn:     #1a1200;
+  --danger:      #f87171;
+  --danger-soft: rgba(248, 113, 113, 0.12);
+  --danger-line: rgba(248, 113, 113, 0.36);
+  --on-danger:   #ffffff;
+  --danger-solid:#dc2626;
+
+  --knob:        #ffffff;
+  --shadow-pop:  0 18px 48px rgba(0, 0, 0, 0.55), 0 2px 8px rgba(0, 0, 0, 0.35);
+  --selection:   rgba(56, 189, 248, 0.32);
+  /* Windows and Linux draw their own caption buttons on a solid strip, and
+     Electron needs a concrete colour for it. Keeping it here means the strip
+     follows the theme instead of staying the one colour it was born with. */
+  --titlebar:    #0b0f17;
+
+  --radius:    16px;
+  --radius-sm: 11px;
+  --radius-lg: 22px;
+
+  /* System fonts that cover every UI language on Windows, macOS and Linux:
+     Segoe UI (Latin, Cyrillic, Arabic script), Nirmala UI (Devanagari,
+     Bengali), Microsoft YaHei / Yu Gothic (CJK), then Apple and Noto. */
+  --font-sans: 'Segoe UI Variable Text', 'Segoe UI', system-ui, -apple-system, BlinkMacSystemFont,
+    'Nirmala UI', 'Microsoft YaHei UI', 'Microsoft YaHei', 'Yu Gothic UI', 'Meiryo UI',
+    'PingFang SC', 'Hiragino Sans', 'Kohinoor Bangla', 'Kohinoor Devanagari', 'Geeza Pro',
+    Roboto, 'Noto Sans', 'Noto Sans Arabic', 'Noto Sans Devanagari', 'Noto Sans Bengali',
+    'Noto Sans CJK SC', 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: ui-monospace, 'Cascadia Mono', Consolas, 'SF Mono', Menlo, 'DejaVu Sans Mono', monospace;
+
+  color-scheme: dark;
+}
+
+/* Per-script font priorities so the right glyphs win (e.g. Japanese kanji
+   are not rendered with the Chinese font, Urdu/Persian use Arabic-script
+   UI fonts). */
+:lang(zh) { --font-sans: 'Microsoft YaHei UI', 'Microsoft YaHei', 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans CJK SC', 'Segoe UI', system-ui, sans-serif; }
+:lang(ja) { --font-sans: 'Yu Gothic UI', 'Meiryo UI', 'Meiryo', 'Hiragino Sans', 'Hiragino Kaku Gothic ProN', 'Noto Sans CJK JP', 'Segoe UI', system-ui, sans-serif; }
+:lang(hi) { --font-sans: 'Nirmala UI', 'Kohinoor Devanagari', 'Devanagari Sangam MN', 'Noto Sans Devanagari', 'Segoe UI', system-ui, sans-serif; }
+:lang(bn) { --font-sans: 'Nirmala UI', 'Vrinda', 'Kohinoor Bangla', 'Bangla Sangam MN', 'Noto Sans Bengali', 'Segoe UI', system-ui, sans-serif; }
+:lang(ar), :lang(fa), :lang(ur), :lang(ps) {
+  --font-sans: 'Segoe UI Variable Text', 'Segoe UI', 'Geeza Pro', 'Noto Sans Arabic', Tahoma, system-ui, sans-serif;
+}
+:lang(he) { --font-sans: 'Segoe UI Variable Text', 'Segoe UI', 'Arial Hebrew', 'Noto Sans Hebrew', Arial, system-ui, sans-serif; }
+:lang(th) { --font-sans: 'Leelawadee UI', 'Leelawadee', 'Thonburi', 'Noto Sans Thai', 'Segoe UI', system-ui, sans-serif; }
+:lang(my) { --font-sans: 'Myanmar Text', 'Myanmar Sangam MN', 'Noto Sans Myanmar', 'Padauk', 'Segoe UI', system-ui, sans-serif; }
+/* Latin words (Shroudly, version numbers) in the system face; Ge'ez from
+   the first font that has it. */
+:lang(am) { --font-sans: 'Segoe UI Variable Text', 'Segoe UI', -apple-system, BlinkMacSystemFont, 'Ebrima', 'Nyala', 'Kefa', 'Noto Sans Ethiopic', 'Abyssinica SIL', system-ui, sans-serif; }
+
+/* Tailwind's preflight defaults borders/dividers to a light gray; use the
+   dark palette's hairline instead so `border-t` / `divide-y` match. */
+*, ::before, ::after { box-sizing: border-box; margin: 0; padding: 0; border-color: var(--line); }
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  -webkit-text-size-adjust: 100%;
+}
+/* :lang() sets the variable on <html>; re-read it on body so it applies. */
+body { font-family: var(--font-sans); color: var(--text); background: var(--bg); }
+
+/* Scripts with tall stacked marks / no word spaces need a little more room. */
+:lang(hi) body, :lang(bn) body, :lang(ur) body { line-height: 1.6; }
+:lang(zh) body, :lang(ja) body { line-break: strict; word-break: normal; }
+/* Devanagari / Bengali / Urdu have tall vowel marks above and below the
+   line: relax the tight Tailwind leadings so marks are never clipped or
+   collide between lines (also inside truncate / line-clamp boxes). */
+:lang(hi) :is(.leading-none, .leading-tight, .leading-snug),
+:lang(bn) :is(.leading-none, .leading-tight, .leading-snug),
+:lang(ur) :is(.leading-none, .leading-tight, .leading-snug) { line-height: 1.55; }
+/* Burmese stacks its vowel signs and asat far above and below the line, and
+   the overflow of truncate and line-clamp boxes cut them off (the tabs, the
+   status badge, the tagline, dropdown values): words then read wrongly.
+   Thai and Amharic get a little more room too, and a single-line Arabic,
+   Persian, Pashto or Urdu value keeps the mark over a shadda. */
+:lang(my) body { line-height: 1.8; }
+:lang(my) :is(.leading-none, .leading-tight, .leading-snug, .leading-normal, .truncate) { line-height: 1.9; }
+:lang(th) body, :lang(am) body { line-height: 1.6; }
+:lang(th) :is(.leading-none, .leading-tight, .leading-snug, .truncate),
+:lang(am) :is(.leading-none, .leading-tight, .leading-snug, .truncate) { line-height: 1.6; }
+:lang(ar) .truncate, :lang(fa) .truncate, :lang(ps) .truncate, :lang(ur) .truncate { line-height: 1.7; }
+/* An element in another language (the language list's names) takes that
+   language's font: Japanese in a Japanese font, not a Chinese one. */
+[lang] { font-family: var(--font-sans); }
+
+::selection { background: var(--selection); color: var(--text); }
+
+button, [role='button'], [role='switch'], [role='option'] { cursor: pointer; user-select: none; -webkit-user-select: none; }
+button:disabled { cursor: default; }
+button { font: inherit; color: inherit; background: none; border: 0; text-align: inherit; }
+
+.num {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+  letter-spacing: -0.01em;
+}
+.mono { font-family: var(--font-mono); font-size: 0.92em; }
+
+.shell {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  background:
+    radial-gradient(120% 60% at 50% -10%, rgba(37, 99, 235, 0.10), transparent 60%),
+    radial-gradient(90% 50% at 50% 115%, rgba(56, 189, 248, 0.06), transparent 60%),
+    var(--bg);
+  transition: opacity 0.18s ease;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.card-2 {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+
+.drag    { -webkit-app-region: drag; }
+.no-drag { -webkit-app-region: no-drag; }
+
+/* ── scrollbars (all scrollable areas) ── */
+/* Visible enough to say there is more below (the long Settings page): the
+   line colour gave the thumb about 1.3:1. The standard properties are the
+   ones Chromium uses once they are set. */
+* { scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--text-faint) 65%, transparent) transparent; }
+
+/* ── form controls ── */
+input, textarea, select {
+  font: inherit;
+  color: var(--text);
+  background: var(--surface-2);
+  caret-color: var(--accent);
+}
+input::placeholder { color: var(--text-faint); opacity: 1; }
+.field {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  transition: border-color 0.15s, background-color 0.15s, box-shadow 0.15s;
+}
+.field:hover { border-color: var(--line-strong); }
+.field:focus, .field:focus-visible, .field[aria-expanded='true'] {
+  outline: none;
+  border-color: var(--accent-line);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+/* The keyboard's focus plainly seen; the soft glow stays for the mouse. */
+.field:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* Text boxes with an edge one can see, and an inside apart from the card
+   (the glass theme's was the same as around it). */
+input.field, textarea.field { border-color: var(--line-strong); background: color-mix(in srgb, var(--bg) 55%, var(--surface-2)); }
+
+/* ── focus ring for keyboard users ── */
+:focus { outline: none; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* ── buttons ── */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  min-width: 0;
+  text-align: center;
+  line-height: 1.25;
+  transition: background-color 0.15s, color 0.15s, border-color 0.15s, opacity 0.15s, transform 0.1s;
+}
+.btn:active:not(:disabled) { transform: scale(0.985); }
+.btn:disabled { opacity: 0.55; }
+.btn-primary { background: var(--accent); color: var(--on-accent); border: 1px solid transparent; }
+.btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
+.btn-danger { background: var(--danger-soft); color: var(--danger); border: 1px solid var(--danger-line); }
+.btn-danger:hover:not(:disabled) { background: rgba(248, 113, 113, 0.2); }
+.btn-warn { background: var(--warn); color: var(--on-warn); border: 1px solid transparent; }
+.btn-warn:hover:not(:disabled) { background: var(--warn-hover); }
+.btn-ghost { background: var(--surface-2); color: var(--text-dim); border: 1px solid var(--line); }
+.btn-ghost:hover:not(:disabled) { background: var(--surface-hover); color: var(--text); border-color: var(--line-strong); }
+
+.chip { background: var(--surface-2); color: var(--text-dim); border: 1px solid var(--line); transition: background-color 0.15s, color 0.15s, border-color 0.15s; }
+.chip:hover { background: var(--surface-hover); color: var(--text); }
+.chip[aria-pressed='true'] { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-line); }
+
+/* Settings' tabs (SettingsPanel.js): quiet until chosen, then the chips' accent. */
+.tab { background: transparent; color: var(--text-dim); border: 1px solid transparent; transition: background-color 0.15s, color 0.15s, border-color 0.15s; }
+.tab:hover { background: var(--surface-hover); color: var(--text); }
+.tab[aria-selected='true'] { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-line); }
+
+.row-hover { transition: background-color 0.15s; }
+.row-hover:hover { background: var(--surface-hover); }
+
+/* title-bar window buttons */
+.win-btn { color: var(--text-faint); transition: background-color 0.12s, color 0.12s; }
+.win-btn:hover { background: var(--surface-hover); color: var(--text); }
+.win-btn:active { background: var(--surface-press); }
+.win-btn-close:hover { background: var(--danger-solid); color: var(--on-danger); }
+.win-btn:focus-visible { outline-offset: -2px; }
+
+/* bottom navigation */
+.nav-btn { color: var(--text-faint); transition: color 0.15s, background-color 0.15s; }
+.nav-btn { position: relative; }
+/* The hover wash is a rounded inset, not a full-height block. Against the
+   translucent navigation of the glass theme a square tint reads as a
+   misplaced rectangle rather than a highlight. */
+.nav-btn:hover { color: var(--text-dim); }
+.nav-btn:hover::before {
+  content: '';
+  position: absolute;
+  inset: 4px 6px;
+  border-radius: 10px;
+  background: rgba(148, 163, 184, 0.07);
+  pointer-events: none;
+}
+.nav-btn[aria-current='page'] { color: var(--accent); }
+/* Not by hue alone: the current tab's icon sits on a soft pill and carries a bar. */
+.nav-btn[aria-current='page']::before {
+  content: '';
+  position: absolute;
+  inset: 6px 18%;
+  border-radius: 12px;
+  background: var(--accent-soft);
+  pointer-events: none;
+}
+.nav-btn[aria-current='page']::after {
+  content: '';
+  position: absolute;
+  inset-inline: 30%;
+  top: 0;
+  height: 2px;
+  border-radius: 0 0 2px 2px;
+  background: currentColor;
+  pointer-events: none;
+}
+.nav-btn:focus-visible { outline-offset: -3px; border-radius: 10px; }
+
+/* switch */
+.switch-track { background: var(--surface-press); border: 1px solid var(--line-strong); transition: background-color 0.2s, border-color 0.2s; }
+.switch-track[data-on='true'] { background: var(--accent); border-color: transparent; }
+.switch-knob { background: var(--knob); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4); transition: transform 0.2s cubic-bezier(0.22, 1, 0.36, 1); }
+/* Unavailable: the label and the switch dimmed, the reason kept readable. */
+[role='switch']:disabled { cursor: default; }
+[role='switch']:disabled .switch-track { opacity: 0.45; }
+[role='switch']:disabled .toggle-label { opacity: 0.55; }
+
+/* dropdown listbox */
+.listbox {
+  background: var(--surface-pop);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-pop);
+}
+.option { color: var(--text); transition: background-color 0.1s; }
+.option[data-active='true'] { background: var(--surface-hover); box-shadow: inset 0 0 0 1px var(--accent-line); }
+.option[aria-selected='true'] { color: var(--accent); }
+
+/* Text inside narrow containers: wrap long words (German compounds, URLs). */
+.wrap-anywhere { overflow-wrap: anywhere; word-break: normal; }
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.rise { animation: rise 0.28s cubic-bezier(0.22, 1, 0.36, 1); }
+
+@keyframes pop {
+  from { opacity: 0; transform: translateY(-4px) scale(0.98); }
+  to   { opacity: 1; transform: none; }
+}
+.pop { animation: pop 0.14s ease-out; }
+
+@keyframes halo {
+  0%, 100% { opacity: 0.5; transform: scale(1); }
+  50%      { opacity: 0.95; transform: scale(1.03); }
+}
+.halo { animation: halo 3.4s ease-in-out infinite; }
+
+/* One notice at a time above the content: the first that renders
+   (app/page.js puts them in order). The others keep listening, out of
+   sight, and come up when it goes. */
+.notices > :not(:first-child) { display: none; }
+
+/* The Protection panel, by the room the content area has (data-room, which
+   ControlPanel works out from these same sizes): where a notice above, the
+   smallest window, large text or a long language leaves it short, the
+   shield shrinks, then goes, and the support link after it, so the status
+   and the Start/Stop button stay on screen without scrolling. */
+.power-panel { gap: 28px; padding-block: 24px; }
+.power-shield { --shield: 150px; }
+.power-shield { --tint: var(--state); width: var(--shield); height: var(--shield); }
+.power-shield[data-look='warn'] { --tint: var(--warn); }
+/* The orb (components/ControlPanel.js; the same in the Apple and Android
+   apps): dark glass lit from above with a fine bright edge, Shroudly's logo
+   in it, its eye shut while off and open once on. Calm: a still light round
+   it while on, a thin arc turning while starting or stopping. */
+.power-disc {
+  width: var(--shield); height: var(--shield); overflow: hidden;
+  background:
+    radial-gradient(ellipse 80% 50% at 50% 0%, rgba(255, 255, 255, 0.07), transparent 70%),
+    linear-gradient(180deg, var(--surface-hover), var(--surface));
+  box-shadow: inset 0 0 0 1.2px rgba(255, 255, 255, 0.10), 0 12px 30px rgba(0, 0, 0, 0.45);
+  transition: background 0.5s ease, box-shadow 0.5s ease;
+}
+.power-shield:is([data-look='on'], [data-look='warn']) .power-disc {
+  background:
+    radial-gradient(ellipse 80% 50% at 50% 0%, rgba(255, 255, 255, 0.07), transparent 70%),
+    linear-gradient(180deg, color-mix(in srgb, var(--tint) 20%, var(--surface)), var(--surface));
+  box-shadow: inset 0 0 0 1.2px color-mix(in srgb, var(--tint) 50%, transparent), 0 12px 30px rgba(0, 0, 0, 0.45);
+}
+/* A soft light round the disc while protected, as from a lamp behind it:
+ * blurred shadows, which fade out with no edge and no rings (a radial
+ * gradient on the dark background showed both). */
+.power-glow {
+  inset: 2%; opacity: 0; transition: opacity 0.5s ease;
+  box-shadow: 0 0 calc(var(--shield) * 0.22) calc(var(--shield) * 0.05) color-mix(in srgb, var(--tint) 34%, transparent),
+              0 0 calc(var(--shield) * 0.5) calc(var(--shield) * 0.12) color-mix(in srgb, var(--tint) 15%, transparent);
+}
+.power-shield:is([data-look='on'], [data-look='warn']) .power-glow { opacity: 1; }
+.power-mark { width: 56%; height: 56%; object-fit: contain; transition: opacity 0.5s ease; filter: drop-shadow(0 4px 10px rgba(0, 0, 0, 0.5)); }
+.power-mark-open { opacity: 0; }
+.power-shield:not([data-look='off']) .power-mark-open { opacity: 1; }
+.power-shield:not([data-look='off']) .power-mark-closed { opacity: 0; }
+/* Another logo chosen: the logo itself, dimmed and greyed while off. */
+.power-logo { transition: opacity 0.5s ease, filter 0.5s ease; }
+.power-shield[data-look='off'] .power-logo { opacity: 0.5; filter: grayscale(0.7) drop-shadow(0 4px 10px rgba(0, 0, 0, 0.5)); }
+.power-turn {
+  width: calc(var(--shield) + 8px); height: calc(var(--shield) + 8px);
+  border: 2px solid transparent; border-top-color: var(--tint);
+  animation: spin 1.1s linear infinite;
+}
+.power-panel[data-room='compact'] { gap: 16px; padding-block: 16px; }
+.power-panel[data-room='compact'] .power-shield { --shield: 96px; }
+.power-panel:is([data-room='tight'], [data-room='min']) { gap: 12px; padding-block: 12px; }
+.power-panel:is([data-room='tight'], [data-room='min']) .power-shield { display: none; }
+.power-panel[data-room='min'] .power-support { display: none; }
+
+@keyframes spin { to { transform: rotate(360deg); } }
+.spin { animation: spin 0.9s linear infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  .rise, .halo, .pop { animation: none; }
+  .spin { animation-duration: 2.4s; }
+}
+
+/* "A Codeshare product" footer link */
+.footer-link { text-decoration: none; border-radius: 4px; transition: color 120ms ease; }
+.footer-link:hover { color: var(--accent) !important; text-decoration: underline; text-underline-offset: 2px; }
+.footer-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* "Online now" pulse */
+@keyframes live-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+.live-dot { animation: live-pulse 2s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) { .live-dot { animation: none; } }
+
+/* First-run tour: the dimmed area around the control being pointed at. */
+.tour-dim {
+  background: color-mix(in srgb, var(--bg) 78%, transparent);
+  backdrop-filter: blur(2px);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Accent colours.
+
+   Only the accent family is swappable; the greys, the status colours and the
+   contrast ratios stay exactly as they were, so no choice here can produce
+   unreadable text. Each set keeps the same relationships as the default:
+   a bright primary, a lighter hover, a deeper shade for gradients, a 12%
+   wash, a 38% line, and a near-black ink for text that sits on the solid
+   colour.
+   ───────────────────────────────────────────────────────────────────────── */
+:root[data-accent="violet"] {
+  --accent: #a78bfa; --accent-hover: #c0aafc; --accent-deep: #7c3aed;
+  --accent-soft: rgba(167, 139, 250, 0.14); --accent-line: rgba(167, 139, 250, 0.38);
+  --on-accent: #140a26; --selection: rgba(167, 139, 250, 0.32);
+}
+:root[data-accent="emerald"] {
+  --accent: #34d399; --accent-hover: #5ee0b0; --accent-deep: #059669;
+  --accent-soft: rgba(52, 211, 153, 0.14); --accent-line: rgba(52, 211, 153, 0.38);
+  --on-accent: #022c1c; --selection: rgba(52, 211, 153, 0.32);
+}
+:root[data-accent="amber"] {
+  --accent: #fbbf24; --accent-hover: #fcd34d; --accent-deep: #d97706;
+  --accent-soft: rgba(251, 191, 36, 0.14); --accent-line: rgba(251, 191, 36, 0.38);
+  --on-accent: #231704; --selection: rgba(251, 191, 36, 0.30);
+}
+:root[data-accent="rose"] {
+  --accent: #fb7185; --accent-hover: #fda4af; --accent-deep: #e11d48;
+  --accent-soft: rgba(251, 113, 133, 0.14); --accent-line: rgba(251, 113, 133, 0.38);
+  --on-accent: #2a0710; --selection: rgba(251, 113, 133, 0.30);
+}
+:root[data-accent="pink"] {
+  --accent: #f472b6; --accent-hover: #f9a8d4; --accent-deep: #db2777;
+  --accent-soft: rgba(244, 114, 182, 0.14); --accent-line: rgba(244, 114, 182, 0.38);
+  --on-accent: #2a0518; --selection: rgba(244, 114, 182, 0.30);
+}
+:root[data-accent="teal"] {
+  --accent: #2dd4bf; --accent-hover: #5eead4; --accent-deep: #0d9488;
+  --accent-soft: rgba(45, 212, 191, 0.14); --accent-line: rgba(45, 212, 191, 0.38);
+  --on-accent: #032b27; --selection: rgba(45, 212, 191, 0.32);
+}
+:root[data-accent="indigo"] {
+  --accent: #818cf8; --accent-hover: #a5b4fc; --accent-deep: #4f46e5;
+  --accent-soft: rgba(129, 140, 248, 0.14); --accent-line: rgba(129, 140, 248, 0.38);
+  --on-accent: #0c1030; --selection: rgba(129, 140, 248, 0.32);
+}
+/* What says "protected" (the shield, its heading, Start) keeps a colour of
+   its own: with the amber, rose or pink accent it was the warning or the
+   danger colour, and someone who knows nothing read a red or amber
+   "Protected" as a problem. Those three leave it in the brand blue. */
+:root { --state: var(--accent); --state-hover: var(--accent-hover); --state-deep: var(--accent-deep); --state-soft: var(--accent-soft); --state-line: var(--accent-line); --on-state: var(--on-accent); }
+:root[data-accent="amber"], :root[data-accent="rose"], :root[data-accent="pink"] {
+  --state: #38bdf8; --state-hover: #5ccafa; --state-deep: #2563eb; --state-soft: rgba(56, 189, 248, 0.12); --state-line: rgba(56, 189, 248, 0.38); --on-state: #06111d;
+}
+.btn-state { background: var(--state); color: var(--on-state); border: 1px solid transparent; }
+.btn-state:hover:not(:disabled) { background: var(--state-hover); }
+:root[data-accent="lime"] {
+  --accent: #a3e635; --accent-hover: #bef264; --accent-deep: #65a30d;
+  --accent-soft: rgba(163, 230, 53, 0.14); --accent-line: rgba(163, 230, 53, 0.38);
+  --on-accent: #16210a; --selection: rgba(163, 230, 53, 0.28);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Liquid glass.
+
+   One hue, not a palette. Depth comes from how far the accent is carried
+   between a pale tint and a deep shade, not from mixing in other colours —
+   several hues at once reads as a smear, and it drags text contrast down with
+   it. The steps are interpolated in OKLab so the run from light to dark stays
+   even instead of dipping through grey in the middle.
+
+   The wash is deliberately restrained. Everything here sits behind text, and
+   measured contrast for body copy is the limit it has to respect; glass that
+   looks impressive and cannot be read is not a trade worth making.
+   ───────────────────────────────────────────────────────────────────────── */
+:root[data-surface="glass"] {
+  /* A dark scrim, not a white one. With a pale accent — lime, amber — a panel
+     that brightens what is behind it leaves light text on a light field, and
+     measured contrast falls below the readable threshold. What makes this read
+     as glass is the blur and the lit edge below, not the fill. */
+  --surface:       rgba(9, 13, 22, 0.42);
+  --surface-2:     rgba(9, 13, 22, 0.30);
+  /* Glass panels can be see-through because they sit on the backdrop. A menu
+     or a toast sits on top of other text, and seen through it would read as
+     one jumble with it: those stay solid. */
+  --surface-pop:   color-mix(in oklab, var(--accent-deep) 6%, #0f1422);
+  --surface-hover: rgba(30, 40, 60, 0.52);
+  --surface-press: rgba(40, 52, 76, 0.58);
+  --line:          rgba(255, 255, 255, 0.11);
+  --line-strong:   rgba(255, 255, 255, 0.20);
+  --bg-sunk:       rgba(255, 255, 255, 0.03);
+  --glass-blur:    30px;
+  /* The strips at the very top (window buttons) and bottom (the footer) are
+     plain, opaque chrome: the light belongs to the content between them, not
+     to the frame around it. The title bar colour is also what Windows and
+     Linux paint behind their caption buttons (Appearance sends it). */
+  --titlebar:      #0a0e18;
+}
+
+:root[data-surface="glass"] .shell {
+  background:
+    /* grain, so the wide fields do not band on 8-bit panels */
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E"),
+    /* the same hue, carried from a light tint down to a deep shade: one light
+       falling from the top centre, as the one below rises from the bottom
+       centre. (Two lights in the top corners read as two separate effects
+       with a dark gap between them.) The tint and the shade share a centre,
+       so they blend into a single glow. */
+    radial-gradient(66% 34% at 50% -8%,
+      color-mix(in oklab, var(--accent) 26%, transparent) 0%, transparent 64%),
+    radial-gradient(120% 54% at 50% -12%,
+      color-mix(in oklab, var(--accent-deep) 30%, transparent) 0%, transparent 66%),
+    radial-gradient(100% 52% at 50% 106%,
+      color-mix(in oklab, var(--accent-deep) 22%, transparent) 0%, transparent 66%),
+    linear-gradient(170deg,
+      color-mix(in oklab, var(--accent-deep) 10%, #0d1220) 0%,
+      #080b12 58%) !important;
+}
+
+:root[data-surface="glass"] .card,
+:root[data-surface="glass"] .card-2 {
+  backdrop-filter: blur(var(--glass-blur)) saturate(150%);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(150%);
+  border-color: var(--line);
+  /* A bright hairline where light lands, a dark one where it does not, and the
+     panel lifted off the backdrop by a wide, soft shadow. */
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.20),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.26),
+    0 14px 44px rgba(0, 0, 0, 0.40);
+}
+
+/* The chrome is the same material, denser, so text over it never depends on
+   what the backdrop happens to be doing underneath. */
+:root[data-surface="glass"] header,
+:root[data-surface="glass"] nav {
+  background: rgba(8, 11, 20, 0.62) !important;
+  backdrop-filter: blur(26px) saturate(150%);
+  -webkit-backdrop-filter: blur(26px) saturate(150%);
+}
+/* The bottom of the frame is one piece, plain like the title-bar strip at the
+   top: the tab bar and the footer share its colour, and the light stays in
+   the content above them. */
+:root[data-surface="glass"] nav,
+:root[data-surface="glass"] footer {
+  background: var(--titlebar) !important;
+}
+:root[data-surface="glass"] header { box-shadow: inset 0 -1px 0 rgba(255, 255, 255, 0.06); }
+:root[data-surface="glass"] nav    { box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06); }
+
+/* The gradient ends short of the deepest shade, so the dark text keeps
+   4.5:1 to its bottom edge (indigo's measured 4.39:1). */
+:root[data-surface="glass"] .btn-primary {
+  background: linear-gradient(180deg,
+    color-mix(in oklab, var(--accent-hover) 92%, white 8%), color-mix(in oklab, var(--accent-deep) 55%, var(--accent)));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.32),
+    0 8px 22px color-mix(in oklab, var(--accent) 34%, transparent);
+}
+:root[data-surface="glass"] .btn-state {
+  background: linear-gradient(180deg,
+    color-mix(in oklab, var(--state-hover) 92%, white 8%), color-mix(in oklab, var(--state-deep) 55%, var(--state)));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.32),
+    0 8px 22px color-mix(in oklab, var(--state) 34%, transparent);
+}
+
+/* Someone who asked for less transparency gets the colour without the cost. */
+/* A Windows Contrast theme (forced colours) paints every background in the
+ * theme's own colour: dots and bars drawn with a background colour alone
+ * (the status dot, the onboarding steps) vanished. They keep a mark in the
+ * theme's text colour. */
+@media (forced-colors: active) {
+  .forced-mark { forced-color-adjust: none; background: CanvasText !important; border-color: Canvas !important; }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  :root[data-surface="glass"] .card,
+  :root[data-surface="glass"] .card-2,
+  :root[data-surface="glass"] header,
+  :root[data-surface="glass"] nav {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+  :root[data-surface="glass"] {
+    --surface: #141b2c; --surface-2: #121829; --bg-sunk: #0a0e18;
+  }
+}
+
+/* ── Windows contrast themes (forced colours) ──
+   State carried by background colours alone vanished: every switch the
+   same empty pill, the accent swatches blank, the current tab like the
+   others, the status and log dots gone. Drawn with the theme's own
+   colours instead. */
+@media (forced-colors: active) {
+  .switch-track { forced-color-adjust: none; background: Canvas; border-color: CanvasText; }
+  .switch-track[data-on='true'] { background: Highlight; border-color: Highlight; }
+  .switch-knob { forced-color-adjust: none; background: CanvasText; box-shadow: none; }
+  .switch-track[data-on='true'] .switch-knob { background: HighlightText; }
+  .nav-btn[aria-current='page']::before { forced-color-adjust: none; background: transparent; border: 2px solid Highlight; }
+  .nav-btn[aria-current='page']::after { background: Highlight; }
+  .option[data-active='true'] { forced-color-adjust: none; background: Highlight; color: HighlightText; }
+  .swatch, .dot { forced-color-adjust: none; border: 1px solid CanvasText; }
+  .swatch[aria-pressed='true'] { outline: 2px solid Highlight; outline-offset: 2px; }
+}
+
+/* ── Windows 7 and 8 (the legacy build, Electron 22 = Chromium 108) ──
+   color-mix() came in Chromium 111. Where it is missing, a declaration that
+   uses it with var() still parses, then turns into nothing when computed: a
+   button without its fill, a field without its inside. Plain colours stand in
+   there; where color-mix() is known this whole block is skipped, so the
+   current build looks exactly as above. */
+@supports not (color: color-mix(in srgb, red, blue)) {
+  * { scrollbar-color: var(--text-faint) transparent; }
+  input.field, textarea.field { background: var(--surface-2); }
+  .tour-dim { background: rgba(8, 11, 18, 0.78); }
+  :root[data-surface="glass"] { --surface-pop: #121a2c; }
+  :root[data-surface="glass"] .shell {
+    background: linear-gradient(170deg, #0d1220 0%, #080b12 58%) !important;
+  }
+  :root[data-surface="glass"] .btn-primary {
+    background: linear-gradient(180deg, var(--accent-hover), var(--accent));
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.32);
+  }
+  :root[data-surface="glass"] .btn-state {
+    background: linear-gradient(180deg, var(--state-hover), var(--state));
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.32);
+  }
+}

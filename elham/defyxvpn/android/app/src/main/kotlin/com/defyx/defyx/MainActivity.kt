@@ -1,0 +1,645 @@
+package de.unboundtech.defyxvpn
+
+import android.Android
+import android.Manifest
+import android.ProgressListener
+import android.app.Activity
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.Drawable
+import android.net.Uri
+import android.net.VpnService
+import android.os.Build
+import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
+import android.util.Log
+import androidx.core.app.ActivityCompat
+import androidx.lifecycle.lifecycleScope
+import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.EventChannel
+import io.flutter.plugin.common.MethodCall
+import io.flutter.plugin.common.MethodChannel
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.net.*
+import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+
+private const val VPN_REQUEST_CODE = 1000
+private const val TAG = "MainActivity"
+private const val APP_ICON_SIZE_PX = 96
+
+class MainActivity : FlutterActivity() {
+    private val CHANNEL = "com.defyx.vpn"
+    private val STATUS_CHANNEL = "com.defyx.vpn_events"
+    private val VIBRATION_CHANNEL = "com.defyx.vibration"
+    private var eventSink: EventChannel.EventSink? = null
+    private var pendingVpnResult: MethodChannel.Result? = null
+    private val NOTIFICATION_PERMISSION_REQUEST_CODE = 1010
+    private lateinit var vibrationPlugin: VibrationPlugin
+    private val iconPermits = Semaphore(2)
+
+    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+        super.configureFlutterEngine(flutterEngine)
+        
+        vibrationPlugin = VibrationPlugin(applicationContext)
+
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler {
+                call,
+                result ->
+            lifecycleScope.launch { handleMethodCall(call, result) }
+        }
+
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, STATUS_CHANNEL)
+                .setStreamHandler(
+                        object : EventChannel.StreamHandler {
+                            override fun onListen(
+                                    arguments: Any?,
+                                    events: EventChannel.EventSink?
+                            ) {
+                                eventSink = events
+                                // sendVpnStatusToFlutter("disconnected")
+                            }
+                            override fun onCancel(arguments: Any?) {
+                                eventSink = null
+                            }
+                        }
+                )
+
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, "com.defyx.progress_events")
+                .setStreamHandler(ProgressStreamHandler())
+
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, "com.defyx.crash_events")
+                .setStreamHandler(CrashStreamHandler())
+        
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, VIBRATION_CHANNEL).setMethodCallHandler {
+                call, result ->
+            vibrationPlugin.handleMethodCall(call, result)
+        }
+    }
+    private fun grantNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ActivityCompat.requestPermissions(
+                    this,
+                    arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                    NOTIFICATION_PERMISSION_REQUEST_CODE
+            )
+        }
+    }
+
+    // Aggressive OEM battery managers (MIUI, Huawei, ColorOS, etc.) can kill the app in the
+    // background without this exemption; only prompt once so we don't nag on every launch.
+    private fun requestIgnoreBatteryOptimizations() {
+        val prefs = getSharedPreferences("defyx_prefs", Context.MODE_PRIVATE)
+        if (prefs.getBoolean("battery_optimization_requested", false)) return
+
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (powerManager.isIgnoringBatteryOptimizations(packageName)) return
+
+        try {
+            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+            intent.data = Uri.parse("package:$packageName")
+            startActivity(intent)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to request battery optimization exemption", e)
+        } finally {
+            prefs.edit().putBoolean("battery_optimization_requested", true).apply()
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        val intent = Intent(this, DefyxVpnService::class.java)
+        grantNotificationPermission()
+        requestIgnoreBatteryOptimizations()
+        startService(intent)
+    }
+
+    private suspend fun handleMethodCall(call: MethodCall, result: MethodChannel.Result) {
+        try {
+            when (call.method) {
+                "connect" -> connectVpn(call.arguments as? Map<String, Any>, result)
+                "disconnect" -> disconnectVpn(result)
+                "isVPNPrepared" -> result.success(true)
+                "prepareVPN" -> grantVpnPermission(result)
+                "getVpnStatus" -> getVpnStatus(result)
+                "isTunnelRunning" -> isTunnelRunning(result)
+                "calculatePing" -> calculatePing(result)
+                "getFlag" -> getFlag(result)
+                "startVPN" -> startVPN(call.arguments as? Map<String, Any>, result)
+                "stopVPN" -> stopVPN(result)
+                "getInstalledApps" -> getInstalledApps(result)
+                "getAppIcon" -> getAppIcon(call.argument<String>("packageName"), result)
+                "grantVpnPermission" -> grantVpnPermission(result)
+                "setAsnName" -> setAsnName(result)
+                "setTimezone" -> setTimezone(call.arguments as? Map<String, Any>, result)
+                "getFlowLine" -> getFlowLine(call.arguments as? Map<String, Any>, result)
+                "getCachedFlowLine" -> getCachedFlowLine(result)
+                "decodeAndVerifyFlowline" -> decodeAndVerifyFlowline(call.arguments as? Map<String, Any>, result)
+                "setCacheDir" -> setCacheDir(call.arguments as? Map<String, Any>, result)
+                "getSharedDirectory" -> result.success("${cacheDir.absolutePath}/defyx")
+                "setConnectionMethod" ->
+                        setConnectionMethod(call.arguments as? Map<String, Any>, result)
+                "login" -> login(call.arguments as? Map<String, Any>, result)
+                "loginByCode" -> loginByCode(call.arguments as? Map<String, Any>, result)
+                else -> result.notImplemented()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error handling method call: ${call.method}", e)
+            result.error("METHOD_ERROR", "Error executing ${call.method}", e.message)
+        }
+    }
+
+    private suspend fun prepareVpn(result: MethodChannel.Result) {
+        val vpnIntent = VpnService.prepare(this)
+        if (vpnIntent != null) {
+            result.success(true)
+        } else {
+            result.success(false)
+        }
+    }
+    private fun connectVpn(args: Map<String, Any>?, result: MethodChannel.Result) {
+        pendingVpnResult = result
+
+        // DefyxVpnService.setVpnStatusListener { status -> sendVpnStatusToFlutter(status) }
+
+        val vpnIntent = VpnService.prepare(this)
+        if (vpnIntent != null) {
+            try {
+                startActivityForResult(vpnIntent, VPN_REQUEST_CODE)
+            } catch (e: Exception) {
+                result.error("VPN_PERMISSION_ERROR", "Failed to request VPN permission", e.message)
+            }
+        } else {
+            DefyxVpnService.getInstance()
+                    .startVpn(
+                            this,
+                            args?.get("mode") as? String ?: "off",
+                            args?.get("rules") as? String ?: "[]",
+                            args?.get("apps") as? String ?: "[]"
+                    )
+            result.success(true)
+        }
+    }
+
+    private fun grantVpnPermission(result: MethodChannel.Result) {
+        try {
+            val vpnIntent = VpnService.prepare(this)
+            if (vpnIntent != null) {
+                pendingVpnResult = result
+                startActivityForResult(vpnIntent, VPN_REQUEST_CODE)
+            } else {
+                result.success(true)
+            }
+        } catch (e: SecurityException) {
+            Log.e(TAG, "SecurityException requesting VPN permission", e)
+            result.error("VPN_PERMISSION_DENIED", "VPN permission denied", e.message)
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception requesting VPN permission", e)
+            result.error("VPN_PERMISSION_ERROR", "Failed to request VPN permission", e.message)
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+
+        if (requestCode == VPN_REQUEST_CODE) {
+            val res = pendingVpnResult ?: return
+            pendingVpnResult = null
+
+            if (resultCode == Activity.RESULT_OK) {
+                res.success(true)
+            } else {
+                res.success(false)
+            }
+        }
+    }
+
+    private fun disconnectVpn(result: MethodChannel.Result) =
+            try {
+                DefyxVpnService.getInstance().stopVpn()
+                sendVpnStatusToFlutter("disconnected")
+                result.success(true)
+            } catch (e: Exception) {
+                result.error("VPN_STOP_ERROR", "Failed to stop VPN", e.message)
+            }
+
+    private fun getVpnStatus(result: MethodChannel.Result) =
+            try {
+                result.success(DefyxVpnService.getInstance().getVpnStatus())
+            } catch (e: Exception) {
+                result.error("GET_STATUS_ERROR", "Failed to get VPN status", e.message)
+            }
+    private fun isTunnelRunning(result: MethodChannel.Result) =
+            try {
+                result.success(DefyxVpnService.getInstance().isTunnelRunning())
+            } catch (e: Exception) {
+                result.error("GET_STATUS_ERROR", "Failed to get tunnel status", e.message)
+            }
+
+    private fun sendVpnStatusToFlutter(status: String) {
+        eventSink?.success(mapOf("status" to status))
+    }
+
+    private fun calculatePing(result: MethodChannel.Result) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val ping = DefyxVpnService.getInstance().measurePing()
+                result.success(ping)
+            } catch (e: Exception) {
+                Log.e("Ping", "Ping failed: ${e.message}", e)
+                withContext(Dispatchers.Main) {
+                    result.error("PING_ERROR", "Failed to calculate ping", e.localizedMessage)
+                }
+            }
+        }
+    }
+
+    private fun startVPN(args: Map<String, Any>?, result: MethodChannel.Result) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val flowLine = args?.get("flowLine") as? String
+                val pattern = args?.get("pattern") as? String
+                val deepScan = args?.get("deepScan") as? String
+                val healthCheck = args?.get("healthCheck") as? String
+                val boolDeepScan = deepScan.toBoolean()
+                val boolHealthCheck = healthCheck.toBoolean()
+                if (flowLine.isNullOrEmpty() || pattern.isNullOrEmpty()) {
+                    withContext(Dispatchers.Main) {
+                        result.error(
+                                "INVALID_ARGUMENT",
+                                "flowLine or pattern is missing or empty",
+                                null
+                        )
+                    }
+                    return@launch
+                }
+                val vpnCacheDir = "${cacheDir.absolutePath}/defyx"
+                val cacheDirectory = File(vpnCacheDir)
+                if (!cacheDirectory.exists()) {
+                    cacheDirectory.mkdirs()
+                }
+                DefyxVpnService.getInstance()
+                        .connectVPN(vpnCacheDir, flowLine, pattern, boolDeepScan, boolHealthCheck)
+                result.success(true)
+            } catch (e: Exception) {
+                Log.e("Start VPN", "Start VPN failed: ${e.message}", e)
+                withContext(Dispatchers.Main) {
+                    result.error("PING_ERROR", "Failed to Start VPN", e.localizedMessage)
+                }
+            }
+        }
+    }
+
+    private fun stopVPN(result: MethodChannel.Result) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                DefyxVpnService.getInstance().disconnectVPN()
+                result.success(true)
+            } catch (e: Exception) {
+                Log.e("Stop VPN", "Stop VPN failed: ${e.message}", e)
+                withContext(Dispatchers.Main) {
+                    result.error("PING_ERROR", "Failed to Stop VPN", e.localizedMessage)
+                }
+            }
+        }
+    }
+
+    private fun getInstalledApps(result: MethodChannel.Result) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val apps =
+                        listOf(Intent.CATEGORY_LAUNCHER, Intent.CATEGORY_LEANBACK_LAUNCHER)
+                                .flatMap { category ->
+                                    packageManager.queryIntentActivities(
+                                            Intent(Intent.ACTION_MAIN).addCategory(category),
+                                            PackageManager.MATCH_ALL
+                                    )
+                                }
+                                .map { it.activityInfo.applicationInfo }
+                                .filter { it.packageName != packageName }
+                                .distinctBy { it.packageName }
+                                .mapNotNull { appEntry(it) }
+                withContext(Dispatchers.Main) { result.success(apps) }
+            } catch (e: Exception) {
+                Log.e(TAG, "Get installed apps failed: ${e.message}", e)
+                withContext(Dispatchers.Main) {
+                    result.error("GET_APPS_ERROR", "Failed to list apps", e.localizedMessage)
+                }
+            }
+        }
+    }
+
+    private fun appEntry(info: ApplicationInfo): Map<String, Any?>? {
+        val name = runCatching { info.loadLabel(packageManager).toString() }.getOrNull() ?: return null
+        return mapOf("name" to name, "packageName" to info.packageName)
+    }
+
+    private fun getAppIcon(packageName: String?, result: MethodChannel.Result) {
+        CoroutineScope(Dispatchers.IO).launch {
+            val icon =
+                    iconPermits.withPermit {
+                        packageName?.let {
+                            runCatching {
+                                        drawableToPng(
+                                                packageManager.getApplicationIcon(it),
+                                                APP_ICON_SIZE_PX
+                                        )
+                                    }
+                                    .getOrNull()
+                        }
+                    }
+            withContext(Dispatchers.Main) { result.success(icon) }
+        }
+    }
+
+    private fun drawableToPng(drawable: Drawable, sizePx: Int): ByteArray {
+        val bitmap =
+                if (drawable is BitmapDrawable && drawable.bitmap.width == sizePx) {
+                    drawable.bitmap
+                } else {
+                    Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888).also {
+                        val canvas = Canvas(it)
+                        drawable.setBounds(0, 0, canvas.width, canvas.height)
+                        drawable.draw(canvas)
+                    }
+                }
+        return ByteArrayOutputStream().use { stream ->
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)
+            stream.toByteArray()
+        }
+    }
+
+    private fun getFlag(result: MethodChannel.Result) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val flag = DefyxVpnService.getInstance().getFlag()
+                result.success(flag)
+            } catch (e: Exception) {
+                e.printStackTrace()
+                withContext(Dispatchers.Main) { result.success("xx") }
+            }
+        }
+    }
+    private fun setAsnName(result: MethodChannel.Result) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                DefyxVpnService.getInstance().setAsnName()
+                result.success("success")
+            } catch (e: Exception) {
+                e.printStackTrace()
+                withContext(Dispatchers.Main) { result.success("failed") }
+            }
+        }
+    }
+    private fun setTimezone(args: Map<String, Any>?, result: MethodChannel.Result) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val timezone = args?.get("timezone") as? String
+                if (timezone.isNullOrEmpty()) {
+                    withContext(Dispatchers.Main) {
+                        result.error("INVALID_ARGUMENT", "timezone is missing or empty", null)
+                    }
+                    return@launch
+                }
+                val timezoneFloat = timezone.toFloat()
+                DefyxVpnService.getInstance().setTimezone(timezoneFloat)
+                result.success(true)
+            } catch (e: Exception) {
+                Log.e("Set Local Timezone", "Set Local Timezone failed: ${e.message}", e)
+                withContext(Dispatchers.Main) {
+                    result.error("PING_ERROR", "Failed to Set Local Timezone", e.localizedMessage)
+                }
+            }
+        }
+    }
+    private fun getFlowLine(args: Map<String, Any>?, result: MethodChannel.Result) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val isTest = args?.get("isTest") as? String
+                val token = args?.get("token") as String
+                if (isTest.isNullOrEmpty()) {
+                    withContext(Dispatchers.Main) {
+                        result.error("INVALID_ARGUMENT", "isTest is missing or empty", null)
+                    }
+                    return@launch
+                }
+                val isTestBoolean = isTest.toBoolean()
+                val flowLine = DefyxVpnService.getInstance().getFlowLine(isTestBoolean,token)
+                result.success(flowLine)
+            } catch (e: Exception) {
+                Log.e("Get Flow Line", "Get Flow Line failed: ${e.message}", e)
+                withContext(Dispatchers.Main) {
+                    result.error(
+                            "GET_FLOW_LINE_ERROR",
+                            "Failed to Get Flow Line",
+                            e.localizedMessage
+                    )
+                }
+            }
+        }
+    }
+
+    private fun getCachedFlowLine(result: MethodChannel.Result) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val flowLine = DefyxVpnService.getInstance().getCachedFlowLine()
+                result.success(flowLine)
+            } catch (e: Exception) {
+                Log.e("Get Cached Flow Line", "Get Cached Flow Line failed: ${e.message}", e)
+                withContext(Dispatchers.Main) {
+                    result.error(
+                            "GET_CACHED_FLOW_LINE_ERROR",
+                            "Failed to Get Cached Flow Line",
+                            e.localizedMessage
+                    )
+                }
+            }
+        }
+    }
+
+    private fun decodeAndVerifyFlowline(args: Map<String, Any>?, result: MethodChannel.Result) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val flowLine = args?.get("flowLine") as? String
+                if (flowLine.isNullOrEmpty()) {
+                    withContext(Dispatchers.Main) {
+                        result.error("INVALID_ARGUMENT", "flowLine is missing or empty", null)
+                    }
+                    return@launch
+                }
+                val decodedFlowLine = DefyxVpnService.getInstance().decodeAndVerifyFlowline(flowLine)
+                result.success(decodedFlowLine)
+            } catch (e: Exception) {
+                Log.e("Decode And Verify Flowline", "Decode And Verify Flowline failed: ${e.message}", e)
+                withContext(Dispatchers.Main) {
+                    result.error(
+                            "DECODE_VERIFY_FLOWLINE_ERROR",
+                            "Failed to decode and verify flowline",
+                            e.localizedMessage
+                    )
+                }
+            }
+        }
+    }
+
+    private fun setConnectionMethod(args: Map<String, Any>?, result: MethodChannel.Result) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val method = args?.get("method") as? String
+                if (method.isNullOrEmpty()) {
+                    withContext(Dispatchers.Main) {
+                        result.error("INVALID_ARGUMENT", "method is missing or empty", null)
+                    }
+                    return@launch
+                }
+                DefyxVpnService.getInstance().setConnectionMethod(method)
+                result.success(true)
+            } catch (e: Exception) {
+                Log.e("Set Connection Method", "Set Connection Method failed: ${e.message}", e)
+                withContext(Dispatchers.Main) {
+                    result.error(
+                            "PING_ERROR",
+                            "Failed to Set Connection Method",
+                            e.localizedMessage
+                    )
+                }
+            }
+        }
+    }
+
+    private fun setCacheDir(args: Map<String, Any>?, result: MethodChannel.Result) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val cacheDir = args?.get("cacheDir") as? String
+                if (cacheDir.isNullOrEmpty()) {
+                    withContext(Dispatchers.Main) {
+                        result.error("INVALID_ARGUMENT", "cacheDir is missing or empty", null)
+                    }
+                    return@launch
+                }
+                DefyxVpnService.getInstance().setCacheDir(cacheDir)
+                result.success(true)
+            } catch (e: Exception) {
+                Log.e("Set Cache Dir", "Set Cache Dir failed: ${e.message}", e)
+                withContext(Dispatchers.Main) {
+                    result.error(
+                            "SET_CACHE_DIR_ERROR",
+                            "Failed to Set Cache Dir",
+                            e.localizedMessage
+                    )
+                }
+            }
+        }
+    }
+
+    private fun login(args: Map<String, Any>?, result: MethodChannel.Result) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val email = args?.get("email") as? String
+                val password = args?.get("password") as? String
+                if (email.isNullOrEmpty() || password.isNullOrEmpty()) {
+                    withContext(Dispatchers.Main) {
+                        result.error(
+                                "INVALID_ARGUMENT",
+                                "email or password is missing or empty",
+                                null
+                        )
+                    }
+                    return@launch
+                }
+                val loginResult = DefyxVpnService.getInstance().login(email, password)
+                result.success(loginResult)
+            } catch (e: Exception) {
+                Log.e("Login", "Login failed: ${e.message}", e)
+                withContext(Dispatchers.Main) {
+                    result.error("LOGIN_ERROR", "Failed to login", e.localizedMessage)
+                }
+            }
+        }
+    }
+
+    private fun loginByCode(args: Map<String, Any>?, result: MethodChannel.Result) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val code = args?.get("code") as? String
+                if (code.isNullOrEmpty()) {
+                    withContext(Dispatchers.Main) {
+                        result.error(
+                                "INVALID_ARGUMENT",
+                                "code is missing or empty",
+                                null
+                        )
+                    }
+                    return@launch
+                }
+                val loginResult = DefyxVpnService.getInstance().loginByCode(code)
+                result.success(loginResult)
+            } catch (e: Exception) {
+                Log.e("Login by code", "Login failed: ${e.message}", e)
+                withContext(Dispatchers.Main) {
+                    result.error("LOGIN_ERROR", "Failed to login by code", e.localizedMessage)
+                }
+            }
+        }
+    }
+}
+
+class ProgressStreamHandler : EventChannel.StreamHandler, ProgressListener {
+
+    private var eventSink: EventChannel.EventSink? = null
+
+    override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+        this.eventSink = events
+        Android.setProgressListener(this)
+    }
+
+    override fun onCancel(arguments: Any?) {
+        this.eventSink = null
+    }
+
+    override fun onProgress(msg: String?) {
+        CoroutineScope(Dispatchers.Main).launch { eventSink?.success(msg) }
+    }
+}
+
+class CrashStreamHandler : EventChannel.StreamHandler {
+
+    private var eventSink: EventChannel.EventSink? = null
+
+    override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+        this.eventSink = events
+        
+        // Register crash callback with Go library
+        Android.setCrashCallback(object : android.CrashListener {
+            override fun onCrash(functionName: String, errorMessage: String, stackTrace: String) {
+                // Forward crash info to Flutter via event channel
+                CoroutineScope(Dispatchers.Main).launch {
+                    eventSink?.success(
+                        mapOf(
+                            "functionName" to functionName,
+                            "errorMessage" to errorMessage,
+                            "stackTrace" to stackTrace,
+                            "platform" to "android"
+                        )
+                    )
+                }
+            }
+        })
+    }
+
+    override fun onCancel(arguments: Any?) {
+        this.eventSink = null
+        // Optionally unregister callback
+        Android.setCrashCallback(null)
+    }
+}

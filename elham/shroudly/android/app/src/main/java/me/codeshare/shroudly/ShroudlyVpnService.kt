@@ -1,0 +1,1821 @@
+package me.codeshare.shroudly
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.VpnService
+import android.os.Build
+import android.os.ParcelFileDescriptor
+import android.os.SystemClock
+import android.service.quicksettings.TileService
+import android.util.Log
+import java.io.File
+import java.io.IOException
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
+
+/*
+ * Protection on Android: a VPN that carries every other app's connections to
+ * the engine.
+ *
+ *   apps -> VPN interface -> hev-socks5-tunnel -> engine (SOCKS5 on 127.0.0.1)
+ *        -> the network, with the engine's techniques
+ *
+ * hev and the engine both run inside this app's process, on threads of their
+ * own (Tun2Socks, Engine). This app is left out of its own VPN
+ * (addDisallowedApplication), so the engine's connections and the encrypted
+ * DNS go straight to the network: no loop, and nothing to protect() socket by
+ * socket.
+ *
+ * While the VPN is up every app depends on it, so it is watched (tick, and
+ * Health.kt): a part that stops is restarted, and when that does not help,
+ * protection ends with a notice and apps connect directly again. The phone is
+ * never left "protected" with no way out.
+ */
+class ShroudlyVpnService : VpnService() {
+    companion object {
+        const val TAG = "Shroudly"
+        const val ACTION_START = "me.codeshare.shroudly.START"
+        const val ACTION_STOP = "me.codeshare.shroudly.STOP"
+        /* Writes the current counters to the log (used by the smoke test). */
+        const val ACTION_STATS = "me.codeshare.shroudly.STATS"
+        /* Debug builds only (DebugControlActivity): what the emulator tests
+         * use to make a part fail and watch protection deal with it. The
+         * extra "what" says which: "engine-stop", "tunnel-stop", "path-check". */
+        const val ACTION_TEST = "me.codeshare.shroudly.TEST"
+        /* "Block ads and trackers" or its exceptions changed (MainActivity). */
+        const val ACTION_ADBLOCK = "me.codeshare.shroudly.ADBLOCK"
+        /* "Help people in censored countries" switched (Snowflake). */
+        const val ACTION_SNOWFLAKE = "me.codeshare.shroudly.SNOWFLAKE"
+        /* The Connections list (Conns): extra "what" is CONNS to ask for it,
+         * or BLOCK/UNBLOCK <name>. */
+        const val ACTION_CONNS = "me.codeshare.shroudly.CONNS"
+        /* A setting of the Settings window changed (extra "what": "strategy"
+         * restarts the engine with it, "apps" renews the VPN interface with
+         * the apps that skip Shroudly). Nothing while protection is off. */
+        const val ACTION_SETTINGS = "me.codeshare.shroudly.SETTINGS"
+
+        internal const val CHANNEL = "protection"
+        internal const val ALERT_CHANNEL = "alerts"
+        internal const val NOTIFICATION_ID = 1
+        private const val ALERT_ID = 2
+        // An app that cannot reach its servers (RawWatch): its own notice, so
+        // it never replaces the one that says protection stopped.
+        private const val RAW_ID = 3
+        internal const val LEARNED_RAW_MAX = 100
+        private const val RAW_NETWORK_WORKS_MS = 3L * 60 * 1000
+        internal const val MAX_RESTARTS = 5
+        // A STATS left unanswered this long (in uptime, so time asleep does not
+        // count) means the engine's command loop hangs. In the app's own
+        // process an answer takes a millisecond.
+        internal const val HANG_TIMEOUT_MS = 30000L
+        // How often the engine is asked for its counters when nobody is looking:
+        // to know it still answers, and how much came back (PathWatch).
+        internal const val IDLE_PROBE_MS = 10000L
+        // The tunnel is restarted once; stopping again within this time (real
+        // time, asleep included) ends protection.
+        private const val TUNNEL_RETRY_WINDOW_MS = 10L * 60 * 1000
+        // The engine is restarted once when the way through it is broken; broken
+        // again within this time (real time, asleep included) ends protection.
+        private const val PATH_RETRY_WINDOW_MS = 10L * 60 * 1000
+        // A network change is acted on once it has been quiet this long: IPv6
+        // often arrives a moment after the network itself.
+        internal const val NET_SETTLE_MS = 3000L
+        // The first look at the way through the engine, after a start, a restart
+        // or a network change: long enough for the encrypted DNS to warm up.
+        private const val FIRST_PATH_CHECK_MS = 3000L
+        private const val PREFS = "engine"
+        private const val AUTH_FILE = "socks-auth"
+        // Kept by 2.6.x, when the engine was a process of its own.
+        private const val OLD_PID_KEY = "enginePid"
+        // How many tunnels have been started: which stand-in range is next.
+        private const val MAP_GENERATION = "mapGeneration"
+        // When an always-on VPN last ended itself (wall clock).
+        private const val SELF_STOP_AT = "selfStopAt"
+        private const val SELF_STOP_QUIET_MS = 10L * 60 * 1000
+        // Under lockdown, the pause before everything is tried again: from
+        // the first, doubling up to the last.
+        private const val HOLD_FIRST_MS = 15_000L
+        private const val HOLD_MAX_MS = 300_000L
+        // How long Android is given to check the network underneath again.
+        // (its probes time out after 10 s each and there are several: 23 s seen).
+        private const val RECHECK_MS = 35_000L
+        // How long hev may take to stop.
+        private const val TUNNEL_STOP_MS = 5_000L
+        /* A stop not through by then ends the process (StopDeadline). */
+        const val STOP_DEADLINE_MS = 15_000L
+        private const val LOG_FILE = "log.txt"
+
+        /* Only once the user has allowed the VPN (VpnService.prepare() gives
+         * nothing to ask): that consent is what lets the service run in the
+         * foreground as systemExempted on Android 14 and later, and a service
+         * started with startForegroundService() that cannot go foreground
+         * crashes the app. False: not allowed, nothing started. */
+        fun start(ctx: Context): Boolean {
+            val allowed = try { prepare(ctx) == null } catch (e: Exception) { false }
+            if (!allowed) {
+                log("Not started: the VPN is not allowed yet")
+                return false
+            }
+            ctx.startForegroundService(Intent(ctx, ShroudlyVpnService::class.java).setAction(ACTION_START))
+            return true
+        }
+
+        fun stop(ctx: Context, by: String = "the app") {
+            if (Protection.state == Protection.State.OFF) return
+            ctx.startService(Intent(ctx, ShroudlyVpnService::class.java).setAction(ACTION_STOP).putExtra(EXTRA_BY, by))
+        }
+
+        /* Where a stop came from, for the log. */
+        const val EXTRA_BY = "me.codeshare.shroudly.BY"
+
+        /* The app's log (AppLog) keeps its lines in the app's files from here on. */
+        fun attachLog(ctx: Context) {
+            AppLog.attach(File(ctx.applicationContext.filesDir, LOG_FILE))
+        }
+
+        fun log(msg: String) {
+            Log.i(TAG, msg)
+            AppLog.add(msg)
+        }
+
+        /* Names of sites and what worked on them: in the system log of debug
+         * builds only, so a release build's log never lists the sites someone
+         * opened; in the app's own log in memory, for "Share logs". */
+        internal fun logSite(msg: String) {
+            if (BuildConfig.DEBUG) Log.i(TAG, msg)
+            AppLog.add(msg, site = true)
+        }
+
+        private fun logSite(msg: () -> String) = logSite(msg())
+
+        /* Creates the channels, or renames them in the current language. The
+         * user's own settings for them (importance, sound) are kept. */
+        fun channels(context: Context) {
+            val ctx = Lang.wrap(context)
+            val nm = ctx.getSystemService(NotificationManager::class.java) ?: return
+            nm.createNotificationChannel(
+                NotificationChannel(CHANNEL, ctx.getString(R.string.navProtection), NotificationManager.IMPORTANCE_LOW).apply {
+                    setShowBadge(false)
+                },
+            )
+            nm.createNotificationChannel(
+                NotificationChannel(ALERT_CHANNEL, ctx.getString(R.string.androidAlertsChannel), NotificationManager.IMPORTANCE_DEFAULT),
+            )
+        }
+
+        /* The "protection stopped" notice is out of date once the user is back. */
+        fun clearAlert(ctx: Context) {
+            try { ctx.getSystemService(NotificationManager::class.java)?.cancel(ALERT_ID) } catch (_: Exception) {}
+        }
+
+        fun openApp(ctx: Context): PendingIntent = PendingIntent.getActivity(
+            ctx, 0, Intent(ctx, HomeActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+    }
+
+    // Starts, stops and restarts run one at a time, in order.
+    private val work: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "shroudly-service").apply { isDaemon = true }
+    }
+    // The health checks that wait on sockets, one at a time, off `work`.
+    private val checks: ExecutorService = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "shroudly-check").apply { isDaemon = true }
+    }
+    /* For threads other than `work` (the engine's reader, network callbacks,
+     * checks): once the service is being destroyed there is nothing left to do. */
+    private fun later(block: () -> Unit) {
+        try { work.execute(block) } catch (_: RejectedExecutionException) {}
+    }
+
+    private fun check(block: () -> Unit) {
+        try { checks.execute(block) } catch (_: RejectedExecutionException) {}
+    }
+
+    private var poll: ScheduledFuture<*>? = null
+    private var restartCredit: ScheduledFuture<*>? = null
+    private var netCheck: ScheduledFuture<*>? = null
+    // The network underneath as last seen (Network.toString(), its id) and
+    // whether it had IPv6.
+    private var underlyingId: String? = null
+    private var underlyingNet: Network? = null
+    private var underlyingV6 = false
+    // Networks the phone moved on from while what apps opened over them
+    // still worked there (Handover): ended once one goes or stops working.
+    private val kept = HashSet<Network>()
+    // Every network that could be underneath, as the callback reports them.
+    // Changed on `work`, read by the path checks on `checks` too (underlying):
+    // a plain set read while a network came or went threw there, and the
+    // check took the network for one that does not work.
+    private val networks = java.util.concurrent.CopyOnWriteArraySet<Network>()
+
+    private var engine: Engine? = null
+    private var doh: DohForwarder? = null
+    private var tun: ParcelFileDescriptor? = null
+    private var tunnelRunning = false
+    private var port = 0
+    private var dohPort = 0
+    private var restarts = 0
+    private var auth: SocksAuth? = null
+    private var authFile: File? = null
+    // "Your own server" for this session (OwnServer).
+    private val ownServer by lazy { OwnServer.Session(filesDir, ::log) }
+    private var v6Routed = false
+    private var network: NetWatch? = null
+    // Uptime of the oldest STATS not answered yet (0: none), and of the last one sent.
+    private var probeSentAt = 0L
+    private var lastProbeAt = 0L
+    // elapsedRealtime of the last tunnel restart, and of the last restart
+    // for a broken way through (0: none).
+    private var tunnelRestartedAt = 0L
+    // Tunnels started in this session (the first one, and any restart).
+    private var tunnelStarts = 0
+    private var pathRestartedAt = 0L
+    // When a routine path check that found the way through was last said
+    // (PathWatch.sayRoutine): 0 after a start.
+    private var routineSaidAt = 0L
+    // Under lockdown, how long until everything is tried again (0: not held).
+    private val hold = LockdownHold(HOLD_FIRST_MS, HOLD_MAX_MS) { ms, run -> work.schedule(run, ms, TimeUnit.MILLISECONDS) }
+    private val hevWatch = HevWatch()
+    private var hevRestartedAt = 0L
+    // Started by Android (always-on VPN at boot, after a network change)
+    // rather than by the user.
+    private var startedBySystem = false
+    // The notice that protection ended was posted moments ago: not again.
+    private var quietNotice = false
+    @Volatile private var active = false
+    // The sites that made Tor start, said once each (EngineEvent.Fallback).
+    private val torNeedTold = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
+    // Health: which engine the checks under way are about (a result about an
+    // engine replaced meanwhile is dropped).
+    private var healthEpoch = 0
+    private val liveness = Liveness()
+    private val pathWatch = PathWatch()
+    // The engine would not stop: it holds the engine's state in this process,
+    // which only a new process clears (see wedged()).
+    private var restartProcess = false
+
+    private lateinit var learned: Learned
+    private val told = HashSet<String>()
+    // Apps whose own connections (not TLS or HTTP) cannot get through.
+    private val rawWatch by lazy {
+        RawWatch(RawApps.of(this)) {
+            // Never told without a network under the VPN, nor while nothing
+            // else comes back either.
+            underlyingId != null && SystemClock.elapsedRealtime() - lastDownAt <= RAW_NETWORK_WORKS_MS
+        }
+    }
+    // When the engine's counters last showed bytes coming back (uptime).
+    @Volatile private var lastDownAt = Long.MIN_VALUE / 2
+    @Volatile private var lastBytesDown = 0L
+    // This session has been counted as a day protection worked (Usage).
+    @Volatile private var workedToday = false
+    // When the services last looked at the store flag and notice (uptime).
+    private var storeLookAt = 0L
+    // Techniques for streams that are not TLS or HTTP (raw-*), per address:
+    // kept apart, so an app's many addresses never push out sites' techniques.
+    private lateinit var learnedRaw: Learned
+
+    // In the language chosen in Settings (Lang; before Android 13).
+    override fun attachBaseContext(base: Context) = super.attachBaseContext(Lang.wrap(base))
+
+    override fun onCreate() {
+        super.onCreate()
+        attachLog(this)
+    }
+
+    // The newest start's id: a stop finishing as another start comes in
+    // leaves the service to that start (finish, stopSelfResult).
+    @Volatile private var lastStartId = 0
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        lastStartId = startId
+        when (intent?.action) {
+            ACTION_STOP -> {
+                if (active) log("Stop asked from ${intent.getStringExtra(EXTRA_BY) ?: "the notification"}")
+                // Asked to stop before it ever started: still owe startForeground.
+                if (!active && Protection.state == Protection.State.OFF) {
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
+                requestStop(0, null)
+                return START_NOT_STICKY
+            }
+            ACTION_STATS -> {
+                later { logStats() }
+                if (!active && Protection.state == Protection.State.OFF) stopSelf()
+                return stickyWhileOn()
+            }
+            ACTION_SETTINGS -> {
+                if (active) when (intent.getStringExtra("what")) {
+                    "strategy" -> later {
+                        engine?.let { engineGone(it, "restarted with the technique chosen in Settings", countsAsCrash = false) }
+                        // "Off" or not: what the notice says protection covers.
+                        if (active) goForeground(starting = false)
+                    }
+                    // "Your own server" set, changed or turned off: the engine again with it.
+                    "ownServer" -> later {
+                        engine?.let { engineGone(it, "restarted with the server chosen in Settings", countsAsCrash = false) }
+                    }
+                    // The last way out turned on or off: the engine again with or without it.
+                    "torLastResort" -> later {
+                        engine?.let { engineGone(it, "restarted with the last way out ${if (TorRoute.enabled(this)) "on" else "off"}", countsAsCrash = false) }
+                    }
+                    // The user said yes to Tor (TorAsk's card): it starts now.
+                    "torYes" -> later {
+                        log("The last way out: allowed by the user; Tor starts and stays allowed")
+                        if (active) torRoute.need()
+                    }
+                    // Another DNS server: from the next lookup on, nothing restarted.
+                    "dns" -> later {
+                        if (active) {
+                            doh?.let { AppSettings.applyDns(this, it) }
+                            engine?.send(if (AppSettings.customDnsStrict(this)) "DNS-STRICT 1" else "DNS-STRICT 0")
+                            engine?.send("DNS-CLEAR")
+                        }
+                    }
+                    "apps" -> later {
+                        if (active) {
+                            log("The apps that go through Shroudly changed; the VPN interface is renewed")
+                            renewInterface(routesV6(underlyingV6))
+                            if (active) goForeground(starting = false)
+                        }
+                    }
+                    // QUIC or IPv6 turned off or on (#59): the engine again with
+                    // its options, and the interface with IPv6 or without.
+                    "network" -> later {
+                        if (active) {
+                            log("Network settings: QUIC ${if (AppSettings.quicOff(this)) "off" else "on"}, IPv6 ${if (AppSettings.ipv6Off(this)) "off" else "on"}")
+                            engine?.let { engineGone(it, "restarted with the network settings chosen in Settings", countsAsCrash = false) }
+                            if (routesV6(underlyingV6) != v6Routed) renewInterface(routesV6(underlyingV6))
+                        }
+                    }
+                }
+                if (!active && Protection.state == Protection.State.OFF) stopSelf()
+                return stickyWhileOn()
+            }
+            ACTION_CONNS -> {
+                val what = intent.getStringExtra("what") ?: "CONNS"
+                if (active && Conns.COMMAND.matches(what)) later { engine?.send(what) }
+                // Tor just became ready (TorRoute): the sites and apps sent
+                // through it are given again, which ends their connections
+                // made the usual way meanwhile, so they connect through Tor.
+                else if (active && what == Conns.TOR_AGAIN) later { Conns.torEntries(this).takeIf { it.isNotEmpty() }?.let { t -> engine?.send(t.joinToString("\n") { "TOR $it" }) } }
+                if (!active && Protection.state == Protection.State.OFF) stopSelf()
+                return stickyWhileOn()
+            }
+            ACTION_ADBLOCK, ACTION_SNOWFLAKE -> {
+                if (active) {
+                    if (intent.action == ACTION_SNOWFLAKE) snowflake.changed() else { applyAdblock(); refreshAdblockSoon(0) }
+                }
+                if (!active && Protection.state == Protection.State.OFF) stopSelf()
+                return stickyWhileOn()
+            }
+            ACTION_TEST -> {
+                if (BuildConfig.DEBUG) later { test(intent.getStringExtra("what")) }
+                if (!active && Protection.state == Protection.State.OFF) stopSelf()
+                return stickyWhileOn()
+            }
+            // ACTION_START, the system's always-on VPN, or a restart after the
+            // process was killed (START_STICKY): all mean "be on".
+            else -> {
+                // Started again after Android ended the process while on. Said
+                // in the log: without it a report showed the engine starting
+                // over and over and nothing of why (SR-JMD1: Roblox and a
+                // WhatsApp call on a phone that ends apps to save memory).
+                if (intent == null) {
+                    Usage.endedByAndroid(this)
+                    log("Android ended the app while protection was on and started it again (memory or battery saving)")
+                }
+                requestStart(bySystem = intent?.action != ACTION_START)
+            }
+        }
+        return START_STICKY
+    }
+
+    /* Should Android end the app, it starts this service again only if the
+     * last start's answer asked for it: one for a setting while protection
+     * is on (START_NOT_STICKY up to 2.6.43) took back the START_STICKY of
+     * the start itself, and protection stayed off. */
+    private fun stickyWhileOn() = if (active) START_STICKY else START_NOT_STICKY
+
+    override fun onRevoke() {
+        // Another VPN app took over, or the user switched this one off in Settings.
+        log("VPN permission revoked")
+        Usage.setLockdown(this, false)
+        requestStop(R.string.androidVpnRevoked, null)
+    }
+
+    override fun onDestroy() {
+        if (active || tun != null || engine != null) {
+            try { work.execute { teardown() } } catch (_: RejectedExecutionException) {}
+        }
+        work.shutdown()
+        try { work.awaitTermination(8, TimeUnit.SECONDS) } catch (_: InterruptedException) {}
+        checks.shutdownNow()
+        // Ended by Android while on (not through a stop): back once a network is there.
+        if (Protection.state == Protection.State.ON || Protection.state == Protection.State.STARTING) {
+            KeepOn.networkGone(this)
+            Usage.endedByAndroid(this)
+        }
+        if (Protection.state != Protection.State.OFF) Protection.set(Protection.State.OFF)
+        refreshTile()
+        super.onDestroy()
+    }
+
+    private fun requestStart(bySystem: Boolean) {
+        // Owed to startForegroundService() whatever happens next.
+        val refused = goForeground(starting = Protection.state != Protection.State.ON)
+        if (refused != null) {
+            // Android 14+ runs a VPN in the foreground only once the user has
+            // allowed it (the system's always-on VPN has been). Without that
+            // there is nothing to run: no other foreground type is used.
+            if (Protection.state == Protection.State.OFF) {
+                Protection.fail(R.string.androidVpnDenied, refused)
+                refreshTile()
+                stopSelf()
+            }
+            return
+        }
+        // Starting or on already; or still stopping, and the window and tile
+        // offer Start again once that is done.
+        if (Protection.state != Protection.State.OFF) return
+        Protection.set(Protection.State.STARTING)
+        refreshTile()
+        startedBySystem = bySystem
+        work.execute { startAll() }
+    }
+
+    /* errorRes 0: the user asked. Anything else: protection ended on its own,
+     * and a notification says so, since the window may not be open. */
+    private fun requestStop(errorRes: Int, detail: String?) {
+        if (Protection.state == Protection.State.OFF || Protection.state == Protection.State.STOPPING) return
+        Protection.set(Protection.State.STOPPING)
+        // Whatever holds the work thread up, a stop always ends (StopDeadline).
+        StopDeadline.arm { log(it) }
+        // Off by the user's choice (or another VPN's): it stays off. Ended by
+        // itself: it comes back once a network is there (KeepOn).
+        if (errorRes == 0 || errorRes == R.string.androidVpnRevoked) KeepOn.stoppedByUser(this)
+        else if (KeepOn.endedByItself(this)) log("Protection comes back by itself once a network is there, in ${KeepOn.RETRY_MS / 60000} minutes at the earliest")
+        later {
+            // The VPN interface goes first: the phone's traffic leaves
+            // straight, or through the next VPN app, the moment protection
+            // stops (#78), not after the goodbye below.
+            dropInterface()
+            // Out of the live count, through the engine while it still runs
+            // (this app is outside its own VPN); at the user's stop only
+            // (OnlineCount.stop).
+            OnlineCount.stop(leave = errorRes == 0, port = port, auth = auth)
+            teardown()
+            Protection.set(Protection.State.OFF)
+            if (errorRes != 0) {
+                Protection.fail(errorRes, detail)
+                notifyStopped(errorRes)
+            }
+            finish()
+        }
+    }
+
+    private fun finish() {
+        // The newest start when this stop is decided: one after it keeps the
+        // service (stopSelfResult below).
+        val id = lastStartId
+        // Started again while this stop finished (an automation app's Stop
+        // then Start, or Toggle twice): that start has the service now, its
+        // notice included. Up to 2.6.58 the stop ended the service under it,
+        // and the start failed ("rejected from" the executor).
+        if (Protection.state != Protection.State.OFF) { refreshTile(); return }
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        // Only if no start came in since: one that did keeps the service,
+        // and its notice, which the line above may have just taken away.
+        if (!stopSelfResult(id)) {
+            if (Protection.state != Protection.State.OFF) goForeground(starting = Protection.state != Protection.State.ON)
+            refreshTile()
+            return
+        }
+        refreshTile()
+        if (restartProcess || Engine.busy) endProcess()
+    }
+
+    /* An engine run that would not stop keeps the engine's state, and its
+     * port, in this process: no engine can start here again. The VPN is down
+     * by now and the notice posted, so the process ends; the next start (the
+     * user's, or the system's always-on VPN) gets a clean one. */
+    private fun endProcess() {
+        log("An engine run did not stop; ending the app's process so the next start is clean")
+        AppLog.flush()
+        work.schedule({ android.os.Process.killProcess(android.os.Process.myPid()) }, 500, TimeUnit.MILLISECONDS)
+    }
+
+    /* ── start ─────────────────────────────────────────────────────────── */
+
+    private fun startAll() {
+        Conns.newSession()
+        try {
+            val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+            if (prefs.contains(OLD_PID_KEY)) prefs.edit().remove(OLD_PID_KEY).apply()
+            learned = Learned(prefs.getString("learned", null))
+            learnedRaw = Learned(prefs.getString("learnedRaw", null), LEARNED_RAW_MAX)
+            told.clear()
+            workedToday = false
+            restarts = 0
+            tunnelRestartedAt = 0
+            pathRestartedAt = 0
+            pathWatch.oneStrike = false
+            hold.cancel()
+            hevRestartedAt = 0
+            Protection.trouble(0)
+            tunnelStarts = 0
+            restartProcess = false
+
+            EngineNative.loadError?.let { throw StartError("the engine library could not be loaded: $it") }
+            // An engine from an earlier start that never stopped (see endProcess).
+            if (Engine.busy) {
+                restartProcess = true
+                throw StartError("an earlier engine run has not stopped", R.string.androidProtectionLost)
+            }
+
+            // Encrypted DNS first, so the engine's first lookups have it. If it
+            // cannot start, the engine falls back to plain DNS.
+            val d = DohForwarder(::log, prefs.getString("dohRoute", null), awake = { screenOn() }) { id ->
+                prefs.edit().putString("dohRoute", id).apply()
+            }
+            AppSettings.applyDns(this, d)
+            dohPort = try { d.start() } catch (e: Exception) { log("Encrypted DNS unavailable: ${e.message}"); 0 }
+            doh = if (dohPort > 0) d else null
+
+            port = spawnEngine()
+
+            // Makes this app the prepared VPN when the user has already said
+            // yes (the window asked); anything else means they have not.
+            if (prepare(this) != null) throw StartError("VPN permission is missing", R.string.androidVpnDenied)
+            val cm = getSystemService(ConnectivityManager::class.java)
+            val under = underlying(cm)
+            underlyingV6 = Net.hasIpv6(under?.second)
+            v6Routed = routesV6(underlyingV6)
+            underlyingId = under?.first?.toString()
+            underlyingNet = under?.first
+            // No network yet: said in the window until one is there.
+            if (under == null) Protection.trouble(R.string.androidNoNetwork)
+            val pfd = establish(v6Routed) ?: throw StartError("VPN permission is missing", R.string.androidVpnDenied)
+            tun = pfd
+            startTunnel()
+            watchNetwork(cm)
+
+            active = true
+            Protection.startedAt = SystemClock.elapsedRealtime()
+            Protection.alwaysOn = alwaysOn()
+            Protection.lockdown = lockdown()
+            Usage.setLockdown(this, Protection.lockdown)
+            Protection.ipv6 = v6Routed
+            Protection.set(Protection.State.ON)
+            snowflake.start()
+            Protection.socksPort = port
+            Protection.socksAuth = auth
+            // On until the user turns it off (KeepOn).
+            KeepOn.on(this)
+            // The live count, as the desktop's: while protection is on (OnlineCount).
+            OnlineCount.sync(this)
+            // The ad and tracker list, when that is on and there is none or it is old.
+            refreshAdblockSoon(5)
+            clearAlert(this)
+            goForeground(starting = false)
+            refreshTile()
+            probeSentAt = 0
+            lastProbeAt = 0
+            healthReset(FIRST_PATH_CHECK_MS)
+            val selfStop = System.currentTimeMillis() - prefs.getLong(SELF_STOP_AT, 0)
+            if (startedBySystem && alwaysOn() && !lockdown() && selfStop in 0 until SELF_STOP_QUIET_MS) {
+                // Android started the always-on VPN again soon after it ended
+                // itself: one failed check is enough this time.
+                log("Started again by Android ${selfStop / 1000}s after protection ended itself; one failed check ends it again")
+                pathWatch.oneStrike = true
+                pathRestartedAt = SystemClock.elapsedRealtime()
+            }
+            poll = work.scheduleWithFixedDelay({ tick() }, 1, 1, TimeUnit.SECONDS)
+            routineSaidAt = 0L
+            log("Protection on: engine on 127.0.0.1:$port${if (auth != null) " (password)" else ""}, " +
+                "encrypted DNS on ${if (dohPort > 0) "127.0.0.1:$dohPort" else "none"}, IPv6 ${if (v6Routed) "routed" else "off"}; " +
+                "network: ${if (under == null) "none" else Net.describe(cm, under.first, under.second)}")
+        } catch (e: Exception) {
+            val detail = (e as? StartError)?.message ?: e.toString()
+            // Never on: "could not start", not "stopped" (the window's
+            // Details and the log say why).
+            val res = (e as? StartError)?.res?.takeIf { it != R.string.androidProtectionLost } ?: R.string.startFailed
+            log("Could not start protection: $detail")
+            teardown()
+            Protection.set(Protection.State.OFF)
+            Protection.fail(res, detail)
+            // Never on: not "Protection stopped" (the reason under the title
+            // that it could not start, or the app's name over that line).
+            notifyStopped(res, title = if (res == R.string.startFailed) R.string.app_name else R.string.startFailed)
+            finish()
+        }
+    }
+
+    private class StartError(msg: String, val res: Int = R.string.startFailed) : Exception(msg)
+
+    /* Starts an engine and returns its port. A first start (and a restart
+     * that cannot have its port back) gets a new password on a new free
+     * port: whoever takes an old port meanwhile learns nothing that still
+     * works. A restart of the engine (keep: true) asks for the port it had,
+     * with the password it had, so the tunnel goes on as it was (see
+     * restartEngine). Another free port is taken if the chosen one is gone
+     * by the time the engine binds. */
+    private fun spawnEngine(keep: Boolean = false): Int {
+        val blockIps = blockIps()
+        val wanted = if (keep && port > 0 && auth != null) port else 0
+        if (wanted == 0) auth = SocksAuth.random()
+        for (attempt in 0..3) {
+            val p = if (attempt == 0 && wanted > 0) wanted else Engine.freePort()
+            authFile = File(filesDir, AUTH_FILE).also { auth!!.writeTo(it) }
+            val upstream = ownServer.fileFor(AppSettings.ownServer(this))
+            // The last way out, unless turned off or the user's own server
+            // carries everything; Tor itself starts when first needed.
+            val fallback = if (upstream == null && TorRoute.enabled(this)) torRoute.portFile() else { torRoute.stop(); null }
+            val e = Engine(::log, ::logSite, ::onEngineEvent, ::onEngineExit)
+            engine = e
+            val ok = e.start(Engine.args(p, dohPort, blockIps, authFile, Engine.FAKE_NET, AdBlock.listFile(this), AdBlock.allow(this), AppSettings.strategy(this), AppSettings.customDnsStrict(this),
+                AppSettings.quicOff(this), AppSettings.ipv6Off(this), upstream, AppSettings.decoyNames(this), fallback, RemoteConfig.engineArgs(this)))
+            // Read once, at its start: the secrets are not left lying in a file.
+            authFile?.delete()
+            upstream?.delete()
+            if (ok) {
+                doh?.socksAuth = auth
+                doh?.socksPort = p
+                probeSentAt = 0
+                // Working through the user's own server: the address sites
+                // see, and DNS through it too, never straight out (#67).
+                doh?.throughEngine = upstream != null
+                if (upstream != null) ownServer.watchExit(p, auth) else ownServer.stopExit()
+                return p
+            }
+            engine = null
+            val err = e.lastError ?: "engine failed to start"
+            // A run that would not stop holds the engine's state: no other
+            // can start in this process.
+            if (e.running || Engine.busy) {
+                restartProcess = true
+                throw StartError("the engine did not stop after a failed start: $err", R.string.androidProtectionLost)
+            }
+            if (!err.contains("listen failed") || attempt == 3) throw StartError(err)
+            if (p == wanted) {
+                // Someone else has the old port now, and the tunnel may have
+                // given them the password: the tunnel stops sending there, and
+                // the engine gets a new port and a new password.
+                log("Port $wanted is taken now; the engine gets another one")
+                stopTunnel()
+                auth = SocksAuth.random()
+            }
+        }
+        throw StartError("engine failed to start")
+    }
+
+    private fun blockIps(): List<String> = try {
+        assets.open("block-ips.txt").bufferedReader().readLines().map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("#") }
+    } catch (_: Exception) {
+        emptyList()
+    }
+
+    private fun establish(v6: Boolean): ParcelFileDescriptor? {
+        val b = Builder()
+            .setSession(getString(R.string.app_name))
+            .setMtu(TunnelConfig.MTU)
+            .addAddress(TunnelConfig.ADDRESS_V4, 32)
+            .addDnsServer(TunnelConfig.DNS_V4)
+            .setConfigureIntent(openApp(this))
+        // Everything but the local network and multicast (TunnelConfig.LOCAL_V4):
+        // casting, a TV's discovery and the local network's own answers stay
+        // off the VPN.
+        for ((a, len) in TunnelConfig.routesV4()) b.addRoute(a, len)
+        // Only the apps chosen (Settings, #60): every other one, this app
+        // among them, straight out. Android takes one way or the other, never
+        // both; with none of them installed any more, the usual way.
+        var only = 0
+        if (AppSettings.appsOnly(this)) {
+            for (pkg in AppSettings.included(this)) {
+                try { b.addAllowedApplication(pkg); only++ } catch (_: android.content.pm.PackageManager.NameNotFoundException) {}
+            }
+        }
+        var skip = 0
+        if (only == 0) {
+            b.addDisallowedApplication(packageName)
+            // Apps the user set to skip Shroudly (Settings): straight out, past
+            // the VPN. One no longer installed is left out.
+            for (pkg in AppSettings.excluded(this)) {
+                try { b.addDisallowedApplication(pkg); skip++ } catch (_: android.content.pm.PackageManager.NameNotFoundException) {}
+            }
+        }
+        // Under "Block connections without VPN", Android lets nothing out of
+        // an app the VPN leaves out (it reads only its own allowlist): those
+        // apps have no internet at all (Settings says so, NA-2).
+        if ((only > 0 || skip > 0) && lockdown()) log("Lockdown: the ${if (only > 0) "apps not chosen" else "$skip apps left out"} have no internet while Android blocks connections without a VPN")
+        // Without an IPv6 address and route, Android answers apps' IPv6 with
+        // "unreachable" at once, and they use IPv4.
+        if (v6) {
+            b.addAddress(TunnelConfig.ADDRESS_V6, 128).addRoute("::", 0)
+            // The local network's IPv6 and multicast off the VPN (Android 13+).
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) for ((a, len) in TunnelConfig.LOCAL_V6) {
+                try { b.excludeRoute(android.net.IpPrefix(java.net.InetAddress.getByName(a), len)) } catch (_: Exception) {}
+            }
+        }
+        // Metered exactly when the network underneath is. From Android 10 a
+        // VPN counts as metered unless it says otherwise; saying it is not
+        // makes Android take the metering of the network underneath
+        // (setUnderlyingNetworks is not called: Android follows the default
+        // network itself). Without it the VPN was metered on Wi-Fi too, and
+        // apps held back updates, backups and video quality.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) b.setMetered(false)
+        return b.establish()
+    }
+
+    private fun startTunnel() {
+        val pfd = tun ?: throw StartError("no VPN interface")
+        val conf = File(filesDir, "tunnel.yml")
+        val a = auth
+        // The next range of stand-in addresses (TunnelConfig): what apps kept
+        // from an earlier tunnel is refused, never another site's.
+        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+        val generation = prefs.getInt(MAP_GENERATION, 0) + 1
+        prefs.edit().putInt(MAP_GENERATION, generation).apply()
+        val mapped = TunnelConfig.mappedNetwork(generation)
+        conf.writeText(TunnelConfig.yaml(port, user = a?.user, pass = a?.pass, mapped = mapped, maxSessions = sessionCap()))
+        if (!Tun2Socks.TProxyStartService(conf.absolutePath, pfd.fd)) throw StartError("tunnel failed to start")
+        tunnelRunning = true
+        // A bad setting ends its thread at once; better to know now than to
+        // show "Protected" over a dead tunnel.
+        Thread.sleep(200)
+        if (!Tun2Socks.TProxyIsRunning()) {
+            stopTunnel()
+            throw StartError("tunnel stopped right after starting")
+        }
+        if (++tunnelStarts > 1) {
+            log("Tunnel started again; stand-in addresses now from $mapped")
+            // The Private DNS server's stand-in address was the old tunnel's.
+            work.schedule({ if (active) revalidateIfStrict() }, 500, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    private fun sessionCap() = if (android.os.Process.is64Bit()) TunnelConfig.MAX_SESSIONS else TunnelConfig.MAX_SESSIONS_32
+
+    /* Stops hev and waits for its thread. A hev that does not stop within
+     * TUNNEL_STOP_MS (stuck) holds the VPN interface in this process: the
+     * process has to end (endProcess). */
+    private fun stopTunnel() {
+        if (!tunnelRunning) return
+        tunnelRunning = false
+        hevWatch.reset()
+        val done = java.util.concurrent.CountDownLatch(1)
+        Thread({
+            try { Tun2Socks.TProxyStopService() } catch (e: Throwable) { log("tunnel stop: $e") }
+            done.countDown()
+        }, "tunnel-stop").apply { isDaemon = true }.start()
+        if (!done.await(TUNNEL_STOP_MS, TimeUnit.MILLISECONDS)) {
+            log("The tunnel did not stop")
+            restartProcess = true
+        }
+    }
+
+    /* ── running ───────────────────────────────────────────────────────── */
+
+    /* The screen is on (DohForwarder keeps its routes warm only then). */
+    private fun screenOn(): Boolean =
+        try { getSystemService(android.os.PowerManager::class.java)?.isInteractive != false } catch (_: Exception) { true }
+
+    private fun tick() {
+        if (!active) return
+        // Now and then: Google Play's flag and the suggestion's notice
+        // (StoreCards), and the APK's update looked for (ApkUpdates).
+        val up = SystemClock.uptimeMillis()
+        if (storeLookAt == 0L || up - storeLookAt >= StoreCards.LOOK_EVERY_MS) { storeLookAt = up; StoreCards.look(this, port, auth); ApkUpdates.look(this, port, auth) }
+        if (tunnelRunning && !Tun2Socks.TProxyIsRunning()) {
+            onTunnelStopped()
+            return
+        }
+        val e = engine ?: return
+        // Its run returned without its end being reported, for instance
+        // between its start and protection being on.
+        if (!e.running) {
+            engineGone(e, "is no longer running")
+            return
+        }
+        val now = SystemClock.uptimeMillis()
+        if (probeSentAt > 0 && e.lastOutputAt < probeSentAt && now - probeSentAt > HANG_TIMEOUT_MS) {
+            probeSentAt = 0
+            engineGone(e, "stopped answering its commands")
+            return
+        }
+        doh?.let { d ->
+            if (!d.serving && dohPort > 0) {
+                log("Encrypted DNS stopped; starting it again on 127.0.0.1:$dohPort")
+                if (!d.restart(dohPort)) log("Encrypted DNS could not start again; the engine uses plain DNS")
+            }
+        }
+        health(e, now)
+        // Every second while the window or the tile is looking; otherwise only
+        // now and then, to know the engine still answers.
+        if (!Protection.hasListeners() && now - lastProbeAt < IDLE_PROBE_MS) return
+        if (probeSentAt == 0L || e.lastOutputAt >= probeSentAt) probeSentAt = now
+        lastProbeAt = now
+        e.send("STATS")
+    }
+
+    /* The checks that wait on sockets run on `checks`; what they find comes
+     * back here, on `work`. */
+    private fun health(e: Engine, now: Long) {
+        val epoch = healthEpoch
+        val p = port
+        val a = auth
+        if (liveness.due(now)) {
+            liveness.started(now)
+            check {
+                val real0 = SystemClock.elapsedRealtime()
+                val up0 = SystemClock.uptimeMillis()
+                val ok = EngineProbe.answers(p, a)
+                val slept = Sleep.slept(real0, up0, SystemClock.elapsedRealtime(), SystemClock.uptimeMillis())
+                later {
+                    if (epoch != healthEpoch || !active) return@later
+                    // The phone slept while it waited: no answer means nothing.
+                    if (slept && !ok) { liveness.abandoned(); return@later }
+                    if (liveness.result(ok)) engineGone(e, "does not accept connections on its port", freshPort = true)
+                    else if (!ok) log("Engine did not answer on its port; looking again")
+                }
+            }
+        }
+        val hev = try { Tun2Socks.TProxyGetStats() } catch (_: Throwable) { null }
+        val tx = hev?.getOrNull(0) ?: -1L
+        val rx = hev?.getOrNull(2) ?: -1L
+        if (hevWatch.stuck(now, tx, rx, EngineNative.udpInOrNone(), EngineNative.connsInOrNone())) {
+            tunnelTrouble("takes apps' packets and gives nothing back")
+            return
+        }
+        if (hevWatch.full(now, Protection.stats?.connsActive ?: -1L, sessionCap())) {
+            tunnelTrouble("has been full (${Protection.stats?.connsActive} connections) for a minute")
+            return
+        }
+        pathWatch.traffic(now, tx, Protection.stats?.bytesDown ?: -1L)
+        // No network at all: nothing to check until one comes (the network
+        // callback asks for a check then). A locked phone with its network
+        // off was checked every 10 seconds, for nothing.
+        if (underlyingId != null && pathWatch.due(now)) {
+            // Only the two-minute one is "routine" (said rarely, see onPath):
+            // one asked for after a new engine, tunnel or network has a reason.
+            val why = if (pathWatch.stalled(now)) "apps get nothing back" else if (pathWatch.askedNow(now)) "asked" else "routine"
+            pathWatch.started(now)
+            check {
+                val t0 = SystemClock.uptimeMillis()
+                val real0 = SystemClock.elapsedRealtime()
+                // Through the engine; only when nothing got through, is the
+                // network itself down? Once it works, the engine once more
+                // (PathCheck).
+                val o = PathCheck.run({ EngineProbe.reachesAny(p, a) }, { EngineProbe.direct() }, { underlyingWorks() }, { recheckUnderlying() })
+                val slept = Sleep.slept(real0, t0, SystemClock.elapsedRealtime(), SystemClock.uptimeMillis())
+                later {
+                    if (epoch != healthEpoch || !active) return@later
+                    // The phone slept in the middle of it: its sockets were
+                    // frozen, and what it found says nothing either way.
+                    if (slept && o.reached == null) {
+                        log("Path check ($why): the phone slept during it; looking again")
+                        pathWatch.abandoned(SystemClock.uptimeMillis())
+                        return@later
+                    }
+                    onPath(o.reached, o.direct, o.networkWorks, why, SystemClock.uptimeMillis() - t0)
+                }
+            }
+        }
+    }
+
+    private fun onPath(reached: String?, direct: String?, networkWorks: Boolean, why: String, ms: Long) {
+        val now = SystemClock.uptimeMillis()
+        when (pathWatch.result(now, reached != null, networkWorks)) {
+            PathWatch.Verdict.HEALTHY -> {
+                // Every two minutes, "all fine" was most of the log: a
+                // routine one is said once after a start, when slow, and then
+                // once in half an hour (PathWatch.sayRoutine).
+                if (why != "routine" || PathWatch.sayRoutine(routineSaidAt, now, ms)) {
+                    log("Path check ($why): through the engine to $reached in ${ms}ms")
+                    if (why == "routine") routineSaidAt = now
+                }
+                if (Protection.national != null) { Protection.national(null); log("The rest of the world answers again") }
+                // Under lockdown, a retry of everything planned because the
+                // way through was broken: not wanted now that it works, with
+                // the tunnel running (it would reset every connection apps
+                // hold). One planned for anything else stays: this check
+                // never goes through the tunnel.
+                val tunnelUp = tunnelRunning && (try { Tun2Socks.TProxyIsRunning() } catch (_: Throwable) { false })
+                if (hold.pathHealthy(tunnelUp)) log("The retry planned under lockdown is not needed any more")
+                if (Protection.troubleRes != 0 && tunnelUp && !hold.planned) {
+                    log("The way through works again")
+                    Protection.trouble(0)
+                    clearAlert(this)
+                }
+            }
+            PathWatch.Verdict.NO_NETWORK -> {
+                log("Path check ($why): nothing reached, " +
+                    (if (direct == null) "and nothing directly either: the network is down" else "and Android says the network has no internet"))
+                checkNational()
+            }
+            PathWatch.Verdict.RETRY -> log("Path check ($why): nothing reached through the engine (${ms}ms); directly: $direct; looking again")
+            PathWatch.Verdict.BROKEN -> {
+                // Always once: a fresh engine and tunnel may do. Again soon
+                // after, in real time, give up (a phone asleep most of the
+                // night is not "soon after" in the morning).
+                val real = SystemClock.elapsedRealtime()
+                if (!Sleep.again(pathRestartedAt, real, PATH_RETRY_WINDOW_MS)) {
+                    pathRestartedAt = real
+                    log("Nothing reached through the engine; directly: $direct; starting everything anew")
+                    val e = engine ?: return
+                    engineGone(e, "reaches nothing on a network that works", countsAsCrash = false, freshPort = true)
+                    // healthReset (in the restart) keeps it: one more failure ends protection.
+                    pathWatch.oneStrike = true
+                } else {
+                    giveUp(R.string.androidNoInternet,
+                        "no connection through the engine reached the internet " +
+                            "(${EngineProbe.TARGETS.joinToString { "${it.first}:${it.second}" }}) " +
+                            "while Android's own check of the network passed (directly: $direct)",
+                        LockdownHold.Cause.PATH)
+                }
+            }
+        }
+    }
+
+    /* Nothing reached anywhere: whether the country's own network still
+     * answers (a shutdown of the rest of the world, NationalNet), at most
+     * once a minute, off the checks' thread. */
+    @Volatile private var nationalAt = 0L
+    @Volatile private var nationalBusy = false
+    private fun checkNational() {
+        val now = SystemClock.elapsedRealtime()
+        if (nationalBusy || (nationalAt != 0L && now - nationalAt < 60_000)) return
+        nationalAt = now
+        nationalBusy = true
+        val cm = getSystemService(ConnectivityManager::class.java)
+        val net = try { underlying(cm)?.first } catch (_: Exception) { null }
+        Thread({
+            try {
+                val zone = java.util.TimeZone.getDefault().id
+                val found = NationalNet.answers(net)?.takeIf { NationalNet.plausible(it.first, zone) }
+                val cc = found?.first
+                if (cc != null) AppSettings.setHomeCountry(this, cc)
+                if (cc != Protection.national) {
+                    Protection.national(cc)
+                    if (found != null) log("Only this country's own network answers: the connection to the rest of the world is cut (${found.second} opens, the world's addresses do not). No app can get past that; Shroudly carries on when it is back")
+                }
+            } finally { nationalBusy = false }
+        }, "national-check").apply { isDaemon = true }.start()
+    }
+
+    /* Asks Android to check the network underneath again now, and waits
+     * for the result: false as soon as Android finds it has no internet,
+     * true if it still says it has after RECHECK_MS. Called from `checks`. */
+    private fun recheckUnderlying(): Boolean {
+        val cm = getSystemService(ConnectivityManager::class.java)
+        val net = try { underlying(cm)?.first } catch (_: Exception) { null } ?: return false
+        try { cm.reportNetworkConnectivity(net, false) } catch (_: Exception) {}
+        val end = SystemClock.uptimeMillis() + RECHECK_MS
+        while (SystemClock.uptimeMillis() < end) {
+            if (!underlyingWorks()) return false
+            try { Thread.sleep(1000) } catch (_: InterruptedException) { return underlyingWorks() }
+        }
+        return underlyingWorks()
+    }
+
+    /* Android's own check of the network underneath (this app is outside its
+     * VPN, so its default network is that one) has passed. */
+    private fun underlyingWorks(): Boolean = try {
+        val cm = getSystemService(ConnectivityManager::class.java)
+        val caps = underlying(cm)?.let { cm.getNetworkCapabilities(it.first) }
+        caps != null && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+    } catch (_: Exception) {
+        false
+    }
+
+    /* This app's VPN network, as Android lists it: the one with the VPN
+     * interface's address. */
+    @Suppress("DEPRECATION")
+    private fun vpnNetwork(cm: ConnectivityManager): Network? = try {
+        cm.allNetworks.firstOrNull { n ->
+            val caps = cm.getNetworkCapabilities(n)
+            caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
+                cm.getLinkProperties(n)?.linkAddresses?.any { it.address.hostAddress == TunnelConfig.ADDRESS_V4 } == true
+        }
+    } catch (_: Exception) {
+        null
+    }
+
+    /* After the tunnel was started again under a VPN interface that stayed:
+     * a Private DNS server set by name ("strict") was looked up through the
+     * old tunnel, and Android keeps using the stand-in address it got, which
+     * the new tunnel does not know. Every name then fails to resolve until
+     * Android looks the server up again, which it does not do by itself. A
+     * report that the network does not work makes it check the network
+     * again, Private DNS included. */
+    private fun revalidateIfStrict() {
+        val cm = getSystemService(ConnectivityManager::class.java)
+        val lp = vpnNetwork(cm)?.let { cm.getLinkProperties(it) } ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && lp.privateDnsServerName != null) revalidate()
+    }
+
+    private fun revalidate() {
+        val cm = getSystemService(ConnectivityManager::class.java)
+        val vpn = vpnNetwork(cm)
+        val lp = vpn?.let { cm.getLinkProperties(it) }
+        val strict = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && lp?.privateDnsServerName != null
+        log("Asking Android to check the VPN network again (Private DNS ${if (strict) "strict" else "not strict"})")
+        try {
+            if (vpn != null) cm.reportNetworkConnectivity(vpn, false)
+        } catch (e: Exception) {
+            log("Could not ask Android to check the VPN network: $e")
+        }
+    }
+
+    /* A new engine, tunnel or network: the checks start over, the next path
+     * check in firstCheckMs. */
+    private fun healthReset(firstCheckMs: Long) {
+        val now = SystemClock.uptimeMillis()
+        healthEpoch++
+        liveness.reset(now)
+        pathWatch.reset(now)
+        pathWatch.ask(now, firstCheckMs)
+    }
+
+    /* hev's thread ended on its own: every app's traffic would go nowhere. */
+    private fun onTunnelStopped() = tunnelTrouble("stopped unexpectedly")
+
+    /* hev stopped, is stuck, or is full: it is started again once; again
+     * within TUNNEL_RETRY_WINDOW_MS, protection is given up (giveUp). */
+    private fun tunnelTrouble(why: String) {
+        // In real time: a hiccup in the evening and one in the morning are
+        // not one after the other, however little the phone was awake.
+        val now = SystemClock.elapsedRealtime()
+        if (Sleep.again(tunnelRestartedAt, now, TUNNEL_RETRY_WINDOW_MS)) {
+            log("Tunnel $why, again; giving up")
+            stopTunnel()
+            giveUp(R.string.androidProtectionLost, "the tunnel keeps failing: it $why")
+            return
+        }
+        log("Tunnel $why; restarting it")
+        tunnelRestartedAt = now
+        stopTunnel()
+        if (restartProcess) {
+            wedged("the tunnel $why and did not stop")
+            return
+        }
+        try {
+            startTunnel()
+            healthReset(FIRST_PATH_CHECK_MS)
+        } catch (e: Exception) {
+            log("Tunnel restart failed: ${e.message}")
+            giveUp(R.string.androidProtectionLost, "the tunnel could not be restarted: ${e.message}")
+        }
+    }
+
+    /* The network underneath: the default network of this app, which is
+     * left out of its own VPN, so never the VPN itself. Android follows the
+     * system's default network for the VPN on its own (setUnderlyingNetworks
+     * is never called): the VPN is metered when that network is, and moves
+     * with it from Wi-Fi to mobile data. Up to 2.6.1 the network a default
+     * callback reported was passed to setUnderlyingNetworks, and that was
+     * the VPN itself: the VPN became its own underlying network and kept the
+     * first network's transport and metering, and its IPv6 was judged by the
+     * VPN's own addresses. */
+    private fun underlying(cm: ConnectivityManager): Pair<Network, LinkProperties>? {
+        val candidates = listOfNotNull(cm.activeNetwork) + networks
+        var best: Pair<Network, LinkProperties>? = null
+        var bestRank = -1
+        for ((i, n) in candidates.withIndex()) {
+            val caps = cm.getNetworkCapabilities(n) ?: continue
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue
+            if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue
+            val lp = cm.getLinkProperties(n) ?: continue
+            // The app's default network first; else the best other one.
+            if (i == 0 && n == cm.activeNetwork) return n to lp
+            val rank = (if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) 4 else 0) +
+                (if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)) 2 else 0)
+            if (rank > bestRank) { best = n to lp; bestRank = rank }
+        }
+        return best
+    }
+
+    /* Every network that could be underneath (not a VPN, with internet),
+     * and the phone's default one (NetWatch): any change in them is looked
+     * at once things have settled. */
+    private fun watchNetwork(cm: ConnectivityManager) {
+        val w = NetWatch(::later, { networks += it }, { networks -= it }, ::onNetwork)
+        network = w
+        w.start(cm)?.let { log("Cannot follow network changes: $it") }
+    }
+
+    private fun onNetwork() {
+        if (!active) return
+        // Acted on once it has been quiet a moment: IPv6 often arrives a
+        // moment after the network itself.
+        netCheck?.cancel(false)
+        netCheck = work.schedule({ onNetworkSettled() }, NET_SETTLE_MS, TimeUnit.MILLISECONDS)
+    }
+
+    private fun onNetworkSettled() {
+        netCheck = null
+        if (!active) return
+        val cm = getSystemService(ConnectivityManager::class.java)
+        val now = underlying(cm)
+        val id = now?.first?.toString()
+        val v6 = Net.hasIpv6(now?.second)
+        // A network the phone moved on from, where apps' connections were
+        // kept (below), that has gone or no longer reaches the internet.
+        val keptGone = kept.filter { Handover.keptEnds(Handover.look(cm, it)) }
+        if (id == underlyingId && v6 == underlyingV6) {
+            if (keptGone.isNotEmpty()) endOldConnections("The network apps' connections were kept on has gone or no longer reaches the internet: they are ended, so they connect again")
+            return
+        }
+        // Another network, or one back after none (not just its IPv6).
+        val changed = id != underlyingId
+        val old = underlyingNet
+        underlyingId = id
+        underlyingNet = now?.first
+        underlyingV6 = v6
+        if (now == null) {
+            kept.clear()
+            log("Network: none")
+            // A phone that turns the network off at lock may end apps then
+            // too: should it end this one, it comes back with the network.
+            KeepOn.networkGone(this)
+            // Said in the window, so no one takes it for Shroudly's doing.
+            if (Protection.troubleRes == 0) Protection.trouble(R.string.androidNoNetwork)
+            return
+        }
+        log("Network: ${Net.describe(cm, now.first, now.second)}")
+        if (Protection.troubleRes == R.string.androidNoNetwork) Protection.trouble(0)
+        rawWatch.networkChanged()
+        if (changed) doh?.networkChanged()
+        // The technique that opened sites on the old network is not tried first on this one (engine.c, net_best).
+        if (changed) engine?.send("NET-CHANGED")
+        pathWatch.oneStrike = false
+        healthReset(FIRST_PATH_CHECK_MS)
+        // What was opened over the old network is ended, unless it still
+        // works there (Handover): then it is kept until that network goes.
+        val keepOld = changed && keptGone.isEmpty() && old != null && !Handover.endsOld(Handover.look(cm, old), Handover.look(cm, now.first))
+        val ending = (changed || keptGone.isNotEmpty()) && !keepOld
+        // The interface carries IPv6 only where the network does. A new one
+        // starts a new tunnel, which ends every connection apps have: at
+        // once for IPv6 gone, only along with an end anyway for IPv6 come
+        // (Handover.renewsForV6).
+        if (Handover.renewsForV6(routesV6(v6), v6Routed, ending)) {
+            log("IPv6 ${if (v6) "available" else "gone"} on this network; renewing the VPN interface")
+            renewInterface(routesV6(v6))
+            return
+        }
+        if (routesV6(v6) != v6Routed) log("IPv6 available on this network; the VPN interface takes it once apps' connections end anyway, not now")
+        if (keepOld) {
+            kept += old!!
+            log("The network before (${Net.describe(cm, old)}) still works: apps' connections over it are kept until it goes")
+            return
+        }
+        if (ending) endOldConnections()
+    }
+
+    /* Another network: apps' connections through the tunnel were carried
+     * over the old one, and where it did not go away at once (Wi-Fi out of
+     * range but still joined, mobile data lingering) they are dead without
+     * knowing it. Android ends an app's own connections when their network
+     * goes, but these are on the VPN, which stays: the apps kept waiting on
+     * them, and nothing came until protection was turned off and on (a
+     * user's report). A new tunnel ends every one of them, and the apps
+     * connect again over the new network. */
+    private fun endOldConnections(line: String = "Network changed: apps' connections over the old one are ended, so they connect again") {
+        kept.clear()
+        if (!tunnelRunning || engine == null) return
+        log(line)
+        // IPv6 the network gained meanwhile comes with it (onNetworkSettled).
+        if (routesV6(underlyingV6) != v6Routed) {
+            renewInterface(routesV6(underlyingV6))
+            return
+        }
+        stopTunnel()
+        if (restartProcess) {
+            wedged("the tunnel did not stop after the network changed")
+            return
+        }
+        try {
+            startTunnel()
+        } catch (e: Exception) {
+            log("Tunnel restart failed: ${e.message}")
+            giveUp(R.string.androidProtectionLost, "the tunnel could not be restarted: ${e.message}")
+        }
+    }
+
+    /* IPv6 on the interface: where the network has it, unless turned off. */
+    private fun routesV6(networkHasV6: Boolean) = networkHasV6 && !AppSettings.ipv6Off(this)
+
+    /* A new VPN interface (with IPv6 or without), and the tunnel on it. */
+    private fun renewInterface(v6: Boolean) {
+        val fresh = try { establish(v6) } catch (e: Exception) { log("establish: $e"); null }
+        if (fresh == null) {
+            requestStop(R.string.androidVpnRevoked, "the VPN interface could not be renewed")
+            return
+        }
+        val old = tun
+        stopTunnel()
+        // hev did not stop: it holds the old interface, and a new tunnel would
+        // wait on it for ever, this service's work thread with it (a Stop
+        // pressed then never came: protection stuck at "stopping", a
+        // Turkcell report while Wi-Fi and mobile data kept trading places).
+        if (restartProcess) {
+            try { fresh.close() } catch (_: Exception) {}
+            wedged("the tunnel did not stop when the VPN interface was renewed")
+            return
+        }
+        // A new tunnel ends every connection apps had: none is kept anywhere.
+        kept.clear()
+        tun = fresh
+        v6Routed = v6
+        // While the engine is being restarted, the restart starts the tunnel.
+        if (engine != null) {
+            try {
+                startTunnel()
+            } catch (e: Exception) {
+                log("Tunnel restart failed: ${e.message}")
+                giveUp(R.string.androidProtectionLost, "the tunnel could not be restarted: ${e.message}")
+            }
+        }
+        try { old?.close() } catch (_: Exception) {}
+    }
+
+    /* ── "Block ads and trackers" (AdBlock) ──
+     * The list is fetched on a thread of its own (a download must not hold up
+     * the health checks), checked by the engine, then put to use without a
+     * restart. */
+    private val adblockCheck = java.util.concurrent.atomic.AtomicReference<java.util.concurrent.CompletableFuture<EngineEvent.AdblockCheck>?>(null)
+    private val adblockFetching = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private fun refreshAdblockSoon(delayS: Long) {
+        if (!AdBlock.enabled(this) || !AdBlock.due(this)) return
+        if (!adblockFetching.compareAndSet(false, true)) return
+        Thread({
+            try {
+                if (delayS > 0) Thread.sleep(delayS * 1000)
+                refreshAdblock()
+            } catch (_: InterruptedException) {
+            } finally {
+                adblockFetching.set(false)
+            }
+        }, "adblock").apply { isDaemon = true }.start()
+    }
+
+    private fun refreshAdblock() {
+        val e = engine ?: return
+        if (!active || !AdBlock.enabled(this) || !AdBlock.due(this)) return
+        log("Ad blocking: fetching the list")
+        val tmp = try { AdBlock.fetch(this, port, auth) } catch (x: Exception) {
+            log("Ad blocking: the list could not be fetched (${x.message ?: x.javaClass.simpleName}); Shroudly tries again later")
+            return
+        }
+        val f = java.util.concurrent.CompletableFuture<EngineEvent.AdblockCheck>()
+        adblockCheck.set(f)
+        e.send("ADBLOCK-CHECK ${tmp.path}")
+        val v = try { f.get(30, TimeUnit.SECONDS) } catch (_: Exception) { null } finally { adblockCheck.compareAndSet(f, null) }
+        if (v == null || !v.ok) {
+            AdBlock.discard(tmp)
+            log("Ad blocking: the list fetched is not one to use (${v?.error ?: "no answer"})")
+            return
+        }
+        try { AdBlock.adopt(this, tmp) } catch (x: IOException) {
+            log("Ad blocking: the list could not be used (${x.message})")
+            return
+        }
+        applyAdblock()
+    }
+
+    /* The setting as it is now, into the running engine. */
+    private fun applyAdblock() {
+        if (!active) return
+        engine?.send(AdBlock.commands(this).joinToString("\n"))
+    }
+
+    private fun onEngineEvent(ev: EngineEvent) {
+        when (ev) {
+            is EngineEvent.Ready -> {
+                log("Engine listening on 127.0.0.1:${ev.port} (${ev.techniques} techniques)")
+                // The names the user blocked in the Connections list.
+                Conns.commands(this).takeIf { it.isNotEmpty() }?.let { engine?.send(it.joinToString("\n")); log(Conns.summary(this)) }
+                // What a server cannot take first: a technique of that kind is then not restored for it.
+                val cmds = Avoids.commands(getSharedPreferences(PREFS, MODE_PRIVATE).getString(Avoids.KEY, null), System.currentTimeMillis()) +
+                    learnedRaw.commands(System.currentTimeMillis()) + learned.commands(System.currentTimeMillis())
+                if (cmds.isNotEmpty()) {
+                    engine?.send(cmds.joinToString("\n"))
+                    log("Techniques remembered for ${cmds.count { it.startsWith("LEARN") }} sites restored")
+                }
+                // A session that has been up a while has earned a fresh restart budget.
+                later {
+                    restartCredit?.cancel(false)
+                    restartCredit = work.schedule({ restarts = 0 }, 120, TimeUnit.SECONDS)
+                }
+            }
+            is EngineEvent.Stats -> {
+                if (ev.bytesDown > lastBytesDown) lastDownAt = SystemClock.elapsedRealtime()
+                // Carried traffic: a day protection worked (Usage), once a session.
+                if (ev.bytesDown > 0 && !workedToday && active && Protection.troubleRes == 0) { workedToday = true; Usage.worked(this) }
+                lastBytesDown = ev.bytesDown
+                torRoute.noteUse(ev.fallback)
+                Protection.stats = ev
+                Protection.changed()
+            }
+            is EngineEvent.Conn, is EngineEvent.Ad, is EngineEvent.ConnsEnd -> connsCollector.take(ev)
+            is EngineEvent.Host -> onHost(ev)
+            is EngineEvent.NetDns -> if (NetDnsText.once(ev, SystemClock.elapsedRealtime())) logSite(NetDnsText.line(ev))
+            is EngineEvent.Refused -> onRefused(ev)
+            // Its age starts over (Learned.remember checks the names); nothing for the log.
+            is EngineEvent.Kept -> if (ev.host.isNotEmpty() && !ev.strategy.startsWith("raw-")) synchronized(learned) {
+                learned.remember(ev.host, ev.strategy, System.currentTimeMillis())
+                getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString("learned", learned.encode()).apply()
+            }
+            is EngineEvent.UdpFull -> log(ev.line)
+            is EngineEvent.Error -> log("engine: ${ev.message}")
+            is EngineEvent.Upstream -> if (!ev.ok) ownServer.down(OwnServer.localIf(OwnServer.whyCode(ev.why), AppSettings.ownServer(this)?.host))
+            // Nothing was listening: Tor is started for the next connection.
+            // Tor only once the user said yes (issue #77); until then asked.
+            is EngineEvent.Fallback -> if (!ev.ok) { if (ev.why != "file unusable" && active) { if (TorRoute.approved(this)) { if (ev.host.isNotEmpty() && TorRoute.state != "ready" && torNeedTold.add(ev.host)) ShroudlyVpnService.logSite("${ev.host}: no technique got through; the last way out (Tor) is needed for it"); torRoute.need() } else TorAsk.ask(this, ev.host) } } else {
+                logSite("${ev.host}: no technique got through; opened through the last way out (Tor)")
+                if (ev.host.isNotEmpty()) TorNotice.used(this, ev.host)
+            }
+            is EngineEvent.Direct -> if (ev.host.isNotEmpty()) logSite(ev.line)
+            is EngineEvent.DnsAround -> DnsNotice.around(this)
+            is EngineEvent.Adblock -> when {
+                ev.error != null -> log("Ad blocking: the list could not be used (${ev.error})")
+                ev.on -> log("Ad blocking: a list of ${ev.entries} names in use")
+            }
+            is EngineEvent.AdblockCheck -> adblockCheck.getAndSet(null)?.complete(ev)
+            else -> {}
+        }
+    }
+
+    private fun onHost(ev: EngineEvent.Host) {
+        if (ev.raw && (ev.kind == "blocked" || ev.kind == "unreachable")) { onRaw(ev); return }
+        // The lite APK, a site the full one would take to Tor (LiteOffer).
+        if (!ev.raw && LiteOffer.lite && LiteOffer.wants(ev.kind, ev.alert, ev.stage)) LiteOffer.offer(this, ev.host)
+        // The full APK with the last way out turned off: asked again, now and then (TorAsk.askAgain),
+        // for every site Tor would have carried: still blocked after every technique, cut each
+        // time, or with no address that answers (YouTube and Instagram in Iran are the last kind).
+        if (!ev.raw && !LiteOffer.lite && LiteOffer.wants(ev.kind, ev.alert, ev.stage)) TorAsk.askAgain(this, ev.host)
+        val key = "${ev.kind} ${ev.host}"
+        val first = synchronized(told) {
+            if (told.size > 400) told.clear()
+            told.add(key)
+        }
+        when (ev.kind) {
+            "bypass" -> {
+                val raw = ev.strategy.startsWith("raw-")
+                val store = if (raw) learnedRaw else learned
+                synchronized(store) {
+                    store.remember(ev.host, ev.strategy, System.currentTimeMillis())
+                    getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(if (raw) "learnedRaw" else "learned", store.encode()).apply()
+                }
+                if (first) logSite { "${ev.host}: blocked here, opened with ${ev.strategy} (${ev.attempts} tries, ${ev.family}${ev.took})" }
+            }
+            "blocked" -> if (first) logSite {
+                when {
+                    ev.alert -> "${ev.host}: the server refused the connection itself; not a block"
+                    ev.note == "silent" -> "${ev.host}: no answer after ${ev.attempts} techniques (${ev.family})"
+                    else -> "${ev.host}: still blocked after ${ev.attempts} techniques (${ev.family})"
+                }
+            }
+            "unreachable" -> if (first) logSite { "${ev.host}: could not be reached (${if (ev.stage == "dns") "DNS" else "connection"})" }
+            "cut" -> if (first) logSite { "${ev.host}: connects, then the network cuts it (${ev.strategy})" }
+            else -> {}
+        }
+    }
+
+    /* An app turned down what a technique produced: its next connection uses
+     * another kind; that, and the kinds to leave out, kept across restarts. */
+    private fun onRefused(ev: EngineEvent.Refused) {
+        if (ev.host.isEmpty()) return
+        val now = System.currentTimeMillis()
+        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+        if (ev.next.isNotEmpty()) synchronized(learned) {
+            learned.remember(ev.host, ev.next, now)
+            prefs.edit().putString("learned", learned.encode()).apply()
+        }
+        if (ev.avoid > 0) prefs.edit().putString(Avoids.KEY, Avoids.remember(prefs.getString(Avoids.KEY, null), ev.host, ev.avoid, now)).apply()
+        logSite { "${ev.host}: the app refused the certificate the server sent after ${ev.strategy}; the next connection uses ${ev.next.ifEmpty { "no technique" }} instead" }
+    }
+
+    /* A connection that is not TLS or HTTP that no technique got through, or
+     * whose address does not answer at all (see RawApps.kt): a line in the
+     * log, and, for an app that can be named, one notice per network. */
+    private fun onRaw(ev: EngineEvent.Host) {
+        val kind = if (ev.kind == "blocked") RawWatch.Kind.BLOCKED else RawWatch.Kind.UNREACHABLE
+        when (val o = rawWatch.onEvent(kind, ev.host, ev.port, ev.attempts, System.currentTimeMillis(), ev.stage, ev.note)) {
+            is RawWatch.Outcome.Log -> { o.before?.let { b -> logSite { b } }; logSite { o.line } }
+            is RawWatch.Outcome.Tell -> {
+                val n0 = o.notice
+                // An app no list knows: named by its servers in the question.
+                val n = if (n0.app.isNotEmpty()) n0 else n0.copy(app = text(R.string.torAskUnknownApp, "addr" to n0.addrs.first().substringBeforeLast(':').trim('[', ']')))
+                val addrs = n.addrs.joinToString(", ")
+                val what = if (n.kind == RawWatch.Kind.UNREACHABLE) "${if (n0.app.isEmpty()) "An app" else n.app} cannot reach its servers ($addrs): the network blocks those addresses themselves"
+                    else "${n.app}: the network stops its connections ($addrs) and no technique got through"
+                // The last way out takes these connections too (the engine's
+                // via_fallback, by address): "use the app's own proxy" was
+                // wrong advice there. An Iran Telegram report: that notice,
+                // and a Tor question naming a bare IPv6 address, so Tor was
+                // never allowed and Telegram stayed shut.
+                when (TorAsk.forRaw(LiteOffer.lite, TorRoute.bundled(this), TorRoute.enabled(this), TorRoute.approved(this),
+                    AppSettings.ownServerTyped(this).isNotBlank() || Protection.ownServerDown != null)) {
+                    TorAsk.Raw.CARRIES -> logSite { "$what; they go through the last way out (Tor)" }
+                    TorAsk.Raw.ASKS -> {
+                        log("$what; the last way out (Tor) gets around that once allowed, asked on the main screen")
+                        TorAsk.askApp(this, n.app)
+                    }
+                    TorAsk.Raw.OFF -> {
+                        if (TorAsk.askAgain(this, n.app, app = true)) log("$what; the last way out (Tor), turned off, would get around that: asked again on the main screen")
+                        else { log("$what; only the app's own proxy setting, a VPN, or the last way out (Tor, Settings) gets around that"); notifyRaw(if (n.kind == RawWatch.Kind.UNREACHABLE) R.string.autoRawUnreachable else R.string.autoRawBlocked, n.app) }
+                    }
+                    TorAsk.Raw.NONE -> {
+                        log("$what; only the app's own proxy setting or a VPN gets around that")
+                        // The lite APK: the full one's Tor would carry the app's
+                        // connections too (LiteOffer); its card says so instead.
+                        if (!(LiteOffer.lite && LiteOffer.offer(this, n.app))) notifyRaw(if (n.kind == RawWatch.Kind.UNREACHABLE) R.string.autoRawUnreachable else R.string.autoRawBlocked, n.app)
+                    }
+                }
+            }
+            RawWatch.Outcome.Nothing -> {}
+        }
+    }
+
+    private fun notifyRaw(res: Int, app: String) {
+        try {
+            channels(this)
+            val text = text(res, "app" to app)
+            val n = Notification.Builder(this, ALERT_CHANNEL)
+                .setSmallIcon(R.drawable.ic_stat_logo)
+                .setContentTitle(getString(R.string.app_name))
+                .setContentText(text)
+                .setStyle(Notification.BigTextStyle().bigText(text))
+                .setContentIntent(openApp(this))
+                .setAutoCancel(true)
+                .build()
+            getSystemService(NotificationManager::class.java).notify(RAW_ID, n)
+        } catch (e: Exception) {
+            log("Could not post the notice: ${e.message}")
+        }
+    }
+
+    /* Called on the engine's reader thread. */
+    private fun onEngineExit(e: Engine, code: Int) {
+        later { engineGone(e, "stopped on its own (code $code)") }
+    }
+
+    /* The engine `e` stopped, hangs, or does not do its job. Runs on `work`,
+     * so one at a time; `engine` is cleared at once, so a second report about
+     * the same engine is ignored, and a restart is the only one in progress
+     * until it has set a new engine. countsAsCrash: false for a restart that
+     * is not the engine's own failing (PathWatch), which has its own limit.
+     *
+     * The tunnel stays up meanwhile: apps' connections to the engine fail at
+     * once (nothing listens on its port) and are made again once the new
+     * engine has the port back. freshPort: when the trouble may be the port
+     * or the tunnel itself (the engine did not take connections, or nothing
+     * got through it), everything starts anew instead: a new port, a new
+     * password and a new tunnel. */
+    private fun engineGone(e: Engine, why: String, countsAsCrash: Boolean = true, freshPort: Boolean = false) {
+        if (!active || e !== engine) return
+        engine = null
+        healthEpoch++
+        log("Engine $why")
+        // The engine ending or reaching nothing on a network that works is
+        // Shroudly's own trouble, even when a restart then puts it right:
+        // "Something not working?" is offered for a day (Report.offered). A
+        // restart for a setting the user changed is not.
+        if (countsAsCrash || freshPort) Report.fault(this)
+        doh?.socksPort = 0
+        Protection.socksPort = 0
+        Protection.socksAuth = null
+        if (!e.stop()) {
+            wedged("the engine $why and did not stop when told to")
+            return
+        }
+        if (freshPort) {
+            stopTunnel()
+            port = 0
+        }
+        if (countsAsCrash) scheduleRestart() else work.schedule({ restartEngine() }, 300, TimeUnit.MILLISECONDS)
+    }
+
+    /* A run that does not return holds the engine's state in this process:
+     * no new engine can start beside it. Protection ends (apps connect
+     * directly) and the process with it (finish). */
+    private fun wedged(detail: String) {
+        Report.fault(this)
+        log("Stuck: $detail")
+        restartProcess = true
+        if (alwaysOn()) {
+            // Android starts an always-on VPN again once its process is gone;
+            // with lockdown, apps have no internet without it meanwhile anyway.
+            log("Always-on VPN: ending the process, Android starts protection again")
+            endProcess()
+            return
+        }
+        requestStop(R.string.androidProtectionLost, detail)
+    }
+
+    /* ── giving up ─────────────────────────────────────────────────────── */
+
+    /* Android 10+: the user made this the always-on VPN, and with
+     * "Block connections without VPN" (lockdown). Earlier versions do not
+     * say: false. */
+    private fun alwaysOn(): Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && (try { isAlwaysOn } catch (_: Exception) { false })
+    private fun lockdown(): Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && (try { isLockdownEnabled } catch (_: Exception) { false })
+
+    /* Protection cannot carry traffic and was not brought back. Normally it
+     * ends, and apps connect directly. Under lockdown that would leave them
+     * with nothing at all, since Android lets nothing out without the VPN:
+     * protection holds on instead, tries everything again with a growing
+     * pause, and says honestly that apps are offline until it works. */
+    private fun giveUp(res: Int, detail: String, cause: LockdownHold.Cause = LockdownHold.Cause.OTHER) {
+        Report.fault(this)
+        if (lockdown()) {
+            holdOn(detail, cause)
+            return
+        }
+        // An always-on VPN that ended itself may be started again by Android
+        // soon (a network change): that start then gives up at the first
+        // failed check, and the notice is not posted again (see startAll).
+        if (alwaysOn()) {
+            val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+            val since = System.currentTimeMillis() - prefs.getLong(SELF_STOP_AT, 0)
+            quietNotice = since in 0 until SELF_STOP_QUIET_MS
+            prefs.edit().putLong(SELF_STOP_AT, System.currentTimeMillis()).apply()
+        }
+        log("Ending protection so apps connect directly: $detail")
+        requestStop(res, detail)
+    }
+
+    private fun holdOn(detail: String, cause: LockdownHold.Cause) {
+        val ms = hold.plan(cause) { recoverAll() }
+        log("Lockdown (Android blocks connections without the VPN): staying on, trying everything again in ${ms / 1000}s: $detail")
+        if (Protection.troubleRes == 0) {
+            Protection.trouble(R.string.androidLockdownOffline)
+            notifyStopped(R.string.androidLockdownOffline, title = R.string.app_name)
+        }
+    }
+
+    /* Under lockdown: a new engine on a new port, and a new tunnel. */
+    private fun recoverAll() {
+        if (!active) return
+        log("Trying everything again")
+        restarts = 0
+        pathRestartedAt = 0
+        tunnelRestartedAt = 0
+        val e = engine
+        if (e != null) {
+            engine = null
+            healthEpoch++
+            doh?.socksPort = 0
+            if (!e.stop()) {
+                wedged("the engine did not stop to be started again")
+                return
+            }
+        }
+        stopTunnel()
+        if (restartProcess) {
+            wedged("the tunnel did not stop to be started again")
+            return
+        }
+        port = 0
+        restartEngine()
+        // Judged at once: what was tried is checked again soon.
+        pathWatch.oneStrike = true
+    }
+
+    private fun scheduleRestart() {
+        if (restarts >= MAX_RESTARTS) {
+            log("Engine keeps stopping; giving up")
+            giveUp(R.string.androidProtectionLost, "the engine keeps stopping")
+            return
+        }
+        restarts++
+        val delay = minOf(500L * restarts, 4000L)
+        log("Restarting engine in ${delay}ms (attempt $restarts/$MAX_RESTARTS)")
+        work.schedule({ restartEngine() }, delay, TimeUnit.MILLISECONDS)
+    }
+
+    /* A new engine on the port the last one had, with the same password,
+     * so hev goes on as it was: its table of names and stand-in addresses
+     * stays, and the addresses apps were given stay valid. Only when the
+     * port cannot be had back does the new engine get another port and a new
+     * password, and the tunnel is started again with those (its stand-in
+     * addresses then start over in the next range, see TunnelConfig). */
+    private fun restartEngine() {
+        if (!active || engine != null) return
+        val before = port
+        try {
+            port = spawnEngine(keep = true)
+        } catch (e: StartError) {
+            log("Restart failed: ${e.message}")
+            if (restartProcess) wedged(e.message ?: "the engine did not stop")
+            else if (e.res == R.string.androidProtectionLost) giveUp(e.res, e.message ?: "")
+            else scheduleRestart()
+            return
+        } catch (e: Exception) {
+            log("Restart failed: $e")
+            scheduleRestart()
+            return
+        }
+        if (port != before || !tunnelRunning) {
+            stopTunnel()
+            try {
+                startTunnel()
+            } catch (e: Exception) {
+                log("Tunnel restart failed: ${e.message}")
+                giveUp(R.string.androidProtectionLost, "the tunnel could not be restarted: ${e.message}")
+                return
+            }
+        }
+        Protection.socksPort = port
+        Protection.socksAuth = auth
+        healthReset(FIRST_PATH_CHECK_MS)
+        log(if (port == before) "Engine back on 127.0.0.1:$port; the tunnel went on" else "Engine back on 127.0.0.1:$port with a new password; tunnel renewed")
+    }
+
+    private fun logStats() {
+        val s = Protection.stats
+        if (s == null) {
+            log("stats: ${Protection.state.name.lowercase()}, no counters yet")
+        } else {
+            log("stats: ${Protection.state.name.lowercase()}, connections ${s.connsTotal} total ${s.connsActive} active, " +
+                "up ${s.bytesUp} B, down ${s.bytesDown} B, tls ${s.tls}, http ${s.http}, desync ${s.desync}")
+        }
+        doh?.let { d -> d.summary().takeIf { it.isNotEmpty() }?.let { log(if (d.usingCustom()) "Your DNS server is answering: $it" else "Encrypted DNS answering via $it") } }
+    }
+
+    /* Debug builds: make one part fail as it might on a phone, for the
+     * emulator tests (scripts/emulator-smoke.sh). */
+    private fun test(what: String?) {
+        if (!active) return
+        val e = engine
+        when (what) {
+            // The engine's run returns, as if it had crashed or been ended.
+            "engine-stop" -> { log("test: stopping the engine under the service"); e?.send("STOP") }
+            // hev's thread ends.
+            "tunnel-stop" -> { log("test: stopping the tunnel under the service"); try { Tun2Socks.TProxyStopService() } catch (_: Throwable) {} }
+            // A path check now.
+            "path-check" -> { log("test: path check"); pathWatch.ask(SystemClock.uptimeMillis(), 0) }
+            // Ask Android to check the VPN network again (Private DNS).
+            "revalidate" -> { log("test: revalidate"); revalidate() }
+            // A new VPN interface, as when IPv6 comes or goes.
+            "renew" -> { log("test: renewing the VPN interface"); renewInterface(v6Routed) }
+            else -> log("test: unknown '$what'")
+        }
+    }
+
+    /* ── stop ──────────────────────────────────────────────────────────── */
+
+    /* Undoes whatever startAll did, in reverse: the tunnel first so apps stop
+     * sending into it, then the interface, so traffic goes direct again. */
+    // "Help people in censored countries" while on, charging, on Wi-Fi.
+    private val snowflake by lazy { Snowflake(this) { log(it) } }
+    // The last way out (TorRoute): Tor, for sites nothing else opened.
+    private val torRoute by lazy { TorRoute.shared(this) }
+    private val connsCollector = Conns.Collector()
+
+    /* hev stopped and its thread waited for, then the VPN interface closed:
+     * Android takes its address, routes and DNS away with it. Safe twice. */
+    private fun dropInterface() {
+        stopTunnel()
+        try { tun?.close() } catch (_: Exception) {}
+        tun = null
+    }
+
+    private fun teardown() {
+        // What went through, for a report sent after this stop (Conns.lastSession).
+        engine?.let { e -> Conns.keepLastSession({ e.send("CONNS") }) }
+        val wasActive = active
+        active = false
+        snowflake.stop()
+        // Kept a few minutes: a quick Stop and Start goes on with it.
+        torRoute.linger()
+        TorNotice.reset()
+        TorAsk.reset()
+        OnlineCount.stop(leave = false)
+        healthEpoch++
+        poll?.cancel(false); poll = null
+        restartCredit?.cancel(false); restartCredit = null
+        hold.cancel()
+        Protection.trouble(0)
+        netCheck?.cancel(false); netCheck = null
+        underlyingId = null
+        underlyingNet = null
+        kept.clear()
+        networks.clear()
+        network?.stop(getSystemService(ConnectivityManager::class.java))
+        network = null
+        dropInterface()
+        val total = Protection.stats?.connsTotal
+        engine?.let { e ->
+            if (!e.stop()) {
+                log("The engine did not stop")
+                restartProcess = true
+            }
+        }
+        engine = null
+        doh?.stop(); doh = null
+        dohPort = 0
+        authFile?.delete()
+        authFile = null
+        auth = null
+        ownServer.close()
+        if (wasActive) log("Protection off${if (total != null) "; $total connections relayed" else ""}")
+    }
+
+    /* ── notification and tile ─────────────────────────────────────────── */
+
+    /* Null once the service is in the foreground; else why Android refused. */
+    private fun goForeground(starting: Boolean): String? {
+        channels(this)
+        val stopIntent = PendingIntent.getService(
+            this, 1, Intent(this, ShroudlyVpnService::class.java).setAction(ACTION_STOP).putExtra(EXTRA_BY, "the notification"),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        // Under lockdown, Stop asks first in the window (with Shroudly off
+        // there apps have no internet at all, MainActivity.confirmStop).
+        val stop = if (Protection.lockdown) PendingIntent.getActivity(
+            this, 4, Intent(this, HomeActivity::class.java).putExtra(MainActivity.EXTRA_CONFIRM_STOP, true)
+                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        ) else stopIntent
+        // What it covers (Coverage): every app, only some, all but some.
+        val text = if (starting) getString(R.string.starting) else Coverage.text(this)
+        val n = Notification.Builder(this, CHANNEL)
+            .setSmallIcon(R.drawable.ic_stat_logo)
+            .setContentTitle(getString(if (starting) R.string.starting else R.string.protected_))
+            .setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText(text))
+            .setContentIntent(openApp(this))
+            .setOngoing(true)
+            .setShowWhen(false)
+            .setCategory(Notification.CATEGORY_SERVICE)
+            .setColor(Accent.swatch(this))
+            .addAction(Notification.Action.Builder(null, getString(R.string.stop), stop).build())
+            .apply { if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE) }
+            .build()
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                // The type for VPN apps the user has allowed (ACTIVATE_VPN).
+                startForeground(NOTIFICATION_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED)
+            } else {
+                startForeground(NOTIFICATION_ID, n)
+            }
+        } catch (e: Exception) {
+            log("Could not run in the foreground: $e")
+            return "Android refused the foreground service: $e"
+        }
+        return null
+    }
+
+    /* Protection ended without the user asking: the ongoing notification goes
+     * away with the service, so this one tells them their apps now connect
+     * directly. Tapping it opens the window. */
+    private fun notifyStopped(errorRes: Int, title: Int = R.string.protectionStopped) {
+        // The open window shows the reason itself, unless the process is about
+        // to end and the window with it.
+        if (Protection.windowVisible && !restartProcess) return
+        // Said once already, a moment ago (an always-on VPN that Android
+        // started again and that ended itself again).
+        if (quietNotice) return
+        try {
+            channels(this)
+            val text = getString(errorRes)
+            val n = Notification.Builder(this, ALERT_CHANNEL)
+                .setSmallIcon(R.drawable.ic_stat_logo)
+                .setContentTitle(getString(title))
+                .setContentText(text)
+                .setStyle(Notification.BigTextStyle().bigText(text))
+                .setContentIntent(openApp(this))
+                .setAutoCancel(true)
+                .setCategory(Notification.CATEGORY_ERROR)
+                .setColor(getColor(R.color.danger))
+                .build()
+            getSystemService(NotificationManager::class.java).notify(ALERT_ID, n)
+        } catch (e: Exception) {
+            log("Could not post the notice: ${e.message}")
+        }
+    }
+
+    private fun refreshTile() {
+        try { TileService.requestListeningState(this, ComponentName(this, ShroudlyTileService::class.java)) } catch (_: Exception) {}
+        ShroudlyWidget.updateAll(this)
+    }
+}

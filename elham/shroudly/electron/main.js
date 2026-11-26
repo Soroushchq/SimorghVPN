@@ -1,0 +1,4228 @@
+'use strict';
+
+/* Windows' own folders first on PATH, before anything here starts one of its
+ * tools by name (win-path.js, issue #61). */
+const windowsPathFixed = require('./win-path').ensureWindowsPath();
+
+/* "Shroudly --open-link=<class> -- <link>": what Windows runs for a link
+ * Games and apps mode took over (roblox-studio: from the website's Edit
+ * button, for one): its own program is started with the setting the mode
+ * keeps in the session, and this process ends (link-open.js). First, before
+ * anything else of Shroudly loads: a link should open at once. */
+if (process.argv.some((a) => typeof a === 'string' && a.startsWith('--open-link='))) {
+  require('./link-open').main(process.argv).then((code) => process.exit(code), () => process.exit(1));
+  return;
+}
+
+const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, nativeTheme, shell, Notification, powerMonitor, dialog, session, clipboard } = require('electron');
+const path = require('path');
+const url = require('url');
+const fs = require('fs');
+const os = require('os');
+const netModule = require('net');
+const Store = require('electron-store');
+const SettingsFile = require('./settings-file');
+const EngineManager = require('./engine-manager');
+const CustomDnsLib = require('./custom-dns');
+const OwnServer = require('./own-server');
+const { Share } = require('./share');
+const Snowflake = require('./snowflake');
+const WhatsNew = require('./whats-new');
+const HelperServer = require('./helper-server');
+const DataDir = require('./data-dir');
+const { WriteGuard, ensureTmp } = require('./write-guard');
+const SystemHosts = require('./system-hosts');
+const NationalNet = require('./national-net');
+const AdvancedMode = require('./advanced-mode');
+const AdvancedProtection = require('./advanced-protection');
+const DiscordApp = require('./discord-app');
+const DiscordRelay = require('./discord-relay');
+const AppProxy = require('./app-proxy');
+const AppEnv = require('./app-env');
+const Rivals = require('./rivals');
+const FlatpakEnv = require('./flatpak-env');
+const LinkHandlers = require('./link-handlers');
+const RobloxApp = require('./roblox-app');
+const RiotApp = require('./riot-app');
+const { RobloxWatch } = require('./roblox-watch');
+const Autopilot = require('./autopilot');
+const ReportSettings = require('./report-settings');
+const AroundWatch = require('./around-watch');
+const Repair = require('./repair');
+const StoreApps = require('./store-apps');
+const BlockCheck = require('./blockcheck');
+const Diagnostics = require('./diagnostics');
+const ProcNet = require('./procnet');
+const { RawWatch, programName, serviceOf, askLabel } = require('./raw-apps');
+const TorApps = require('./tor-apps');
+const Logos = require('./logos');
+const BrowserCheck = require('./browser-check');
+const SiteList = require('./site-list');
+const Updater = require('./updater');
+const UserBusy = require('./user-busy');
+const Presence = require('./presence');
+const Report = require('./report');
+const i18n = require('./main-i18n');
+const Families = require('./families');
+const ServiceCheck = require('./service-check');
+const { restoreProxy } = require('./restore-proxy');
+const SystemProxy = require('./system-proxy');
+const WinReg = require('./win-reg');
+const Watchdog = require('./watchdog');
+const DiscordLine = require('./discord-line');
+const Launch = require('./launch');
+const wake = require('./wake');
+const { buildReport, buildCompact, saveReport, toClipboard } = require('./log-report');
+const LogGate = require('./log-gate');
+const { AdblockList } = require('./adblock');
+const { reveal } = require('./reveal');
+const WinHttp = require('./winhttp');
+const SecurityBlock = require('./security-block');
+const { ProtectionKeeper } = require('./protection-keeper');
+const { StoreSuggest } = require('./store-suggest');
+const TorRoute = require('./tor-route');
+const TorDownload = require('./tor-download');
+const TorFiles = require('./tor-files');
+
+/* "Shroudly --restore-proxy" runs once at login after a run that never got to
+ * restore the system proxy (power loss, forced reboot), and from the watchdog
+ * after a crash: restore and exit (restore-proxy.js says how, and when it
+ * may ask for a macOS administrator's password). */
+const RESTORE_PROXY_ARG = '--restore-proxy';
+// Added by the watchdog's restore: Shroudly vanished just now (killed,
+// crashed), it is not a login.
+const FROM_WATCHDOG_ARG = '--from-watchdog';
+/* Where this run keeps its data (data-dir.js, issue #72): the default
+ * folder, a portable "Shroudly Data" next to the program, or a folder chosen
+ * in Settings; decided before anything is read or written. The server
+ * helper (--help-others) has a folder of its own. What belongs to this
+ * computer (the system proxy as it was, and the like) stays in the default
+ * folder, where a login restore finds it whatever happened to the other. */
+const defaultUserData = app.getPath('userData');
+const dataPlace = process.argv.includes(HelperServer.ARG)
+  ? { dir: defaultUserData, how: 'default', problem: null }
+  : DataDir.resolve({ defaultDir: defaultUserData });
+if (dataPlace.dir !== defaultUserData) {
+  try { app.setPath('userData', dataPlace.dir); app.setPath('sessionData', dataPlace.dir); } catch {}
+}
+const proxyStateFile = () => path.join(defaultUserData, 'proxy-state.json');
+const appEnvStateFile = () => path.join(defaultUserData, 'app-env.json');
+const discordLineFile = () => path.join(defaultUserData, 'discord-line.json');
+if (process.argv.includes(RESTORE_PROXY_ARG)) {
+  restoreProxy({
+    stateFile: proxyStateFile(),
+    settings: () => {
+      // Read only: a damaged file is the start's to set aside (settings-file.js).
+      const s = new Store({ clearInvalidConfig: true });
+      return { autoStart: s.get('autoStart', false), protectionOn: SettingsFile.protectionWanted(s), language: s.get('language') };
+    },
+    languages: () => systemLanguages(),
+    ready: () => app.whenReady().then(() => { try { if (app.dock) app.dock.hide(); } catch {} }),
+    // Shroudly may already be running again (it starts at login too): its own
+    // value is then left alone.
+    recoverOther: () => AppEnv.recoverSync({ stateFile: appEnvStateFile() }, { onlyIfDead: true }),
+    // Discord's line: left for a Shroudly that starts by itself at this login
+    // with Discord app mode on (it was kept at the logoff for it); taken out
+    // after a kill or a crash, and at a login Shroudly does not start at.
+    recoverDiscord: () => {
+      let keep = false;
+      if (!process.argv.includes(FROM_WATCHDOG_ARG)) {
+        try { const s = new Store({ clearInvalidConfig: true }); keep = s.get('autoStart', false) === true && s.get('discordMode') === true; } catch {}
+      }
+      DiscordLine.recoverSync({ stateFile: discordLineFile(), ownerAlive: (o) => SystemProxy._ownerAlive(o), keep });
+    },
+  }).catch(() => {}).finally(() => app.exit(0));
+  return;
+}
+
+/* "Shroudly --help-others": on a server, only "Help people in censored
+ * countries", with no window, no protection and nothing of the system
+ * touched (helper-server.js; scripts/server/ installs it as a service). */
+if (process.argv.includes(HelperServer.ARG)) {
+  HelperServer.run({ app, Store, Snowflake, version: appVersion() });
+  return;
+}
+
+/* The window is a few static panels: drawing them on the CPU costs nothing
+ * measurable, while GPU drawing kept the GPU process 20+ MB larger for as
+ * long as Shroudly runs, even after the window was closed, and spiked it to
+ * about 200 MB on a first paint. */
+app.disableHardwareAcceleration();
+// A damaged settings file is set aside rather than ending Shroudly here,
+// before it could show anything (settings-file.js); what it found is
+// settled once the log can take it.
+const settingsOpened = SettingsFile.open(Store, { dir: app.getPath('userData') });
+const store = settingsOpened.store;
+// The last way out (Tor) is off until the user allows it, on every system
+// and in every store edition (owner, 2026-11-23). Up to 2.6.89 the switch
+// showed on from the first start and Tor waited for a yes before carrying
+// anything; now the switch shows what the user chose. Written once, so
+// every read below sees it: someone who said yes keeps it on, everyone
+// else has it off and is asked when a site needs it (askTorAgain).
+try { if (store.get('torLastResort') === undefined) store.set('torLastResort', store.get('torApproved', false) === true); } catch {}
+let mainWindow = null;
+let tray = null;
+let engine = null;
+let advanced = null;
+// Lines about a host that cannot be reached: the first at once, then at most
+// one every half hour per host and kind (log-gate.js).
+const logGate = new LogGate();
+let updater = null;
+let keeper = null;
+let watchdogOpts = null;   // the watchdog's options (watchdog.js), once ready
+let presence = null;
+/* The log's last lines (the window's Logs, and what a report sends): 3000,
+ * as on Android and the Apple app. */
+const LOG_LINES = 3000;
+let systemLogs = [];
+let exitInProgress = false;
+let discordRelay = null;
+// Logout, shutdown or an update restart: leave Discord's line in place, so a
+// Discord that starts at the next login finds the relay as soon as we are up.
+let keepDiscordLine = false;
+// What it was before an update began, for an update that does not happen.
+let lineBeforeUpdate = false;
+let appProxy = null;
+let autopilot = null;
+let aroundWatch = null;
+// Apps whose own connections cannot get through, named and told (raw-apps.js).
+const rawWatch = new RawWatch({
+  log: (level, msg) => addLog(level, msg),
+  tell: (id, params) => autoTell(id, params),
+  owner: async (cport) => {
+    const o = engine && engine.port ? await ProcNet.owner(cport, engine.port) : null;
+    return o && o.name;
+  },
+  // Other traffic comes back through the engine: the network works.
+  networkWorks: () => !!(engine && engine.isActive() && engine.receivedWithin(2 * 60 * 1000)),
+  // The service's own name, checked as the autopilot checks a service.
+  confirm: async (service) => {
+    if (!service || !service.probe || !engine || !engine.isActive()) return 'unknown';
+    const r = await BlockCheck.check(service.probe, { socksPort: engine.port, connect: DiscordRelay.socksConnect });
+    return r && r.blocked ? 'blocked' : r && !r.unknown ? 'open' : 'unknown';
+  },
+  // The last way out carries the app's connections too: said so, or asked
+  // for naming the app, instead of "use the app's own proxy".
+  tor: () => (engine && engine.isActive() && engine.torFor ? engine.torFor() : null),
+  askTor: (app) => askTor(app),
+  askTorAgain: (app) => askTorAgain(app),
+});
+let storeApps = null;
+// A full-screen game, video or presentation in front: what Shroudly does by
+// itself (a permission prompt, a program's restart, an update) waits.
+const userBusy = new UserBusy();
+let appEnv = null;
+// Flatpak programs are sandboxed and never see the session's environment, so
+// on Linux the program proxy reaches them only through a per-program override
+// (flatpak-env.js). Where there is no flatpak, this stays null.
+const flatpakEnv = FlatpakEnv.availableSync() ? new FlatpakEnv({ log: (l, m) => addLog(l, m) }) : null;
+/* Games and apps mode can be offered where either way of reaching programs
+ * works: the session's environment (macOS, Windows) or Flatpak (Linux). */
+const appModeSupported = () => AppEnv.supported() || !!flatpakEnv;
+let siteList = null;
+// "Share my connection" (share.js).
+let share = null;
+let snowflake = null;
+
+const isDev = !app.isPackaged;
+const DEV_PORT = process.env.PORT || 3000;
+const AUTOSTART_ARG = '--autostart';
+
+function appVersion() {
+  try { return app.isPackaged ? app.getVersion() : require('../package.json').version; }
+  catch { return app.getVersion(); }
+}
+
+/* Windows groups the taskbar button and shows notifications under this ID; it
+ * must match build.appId so the installer's shortcuts carry the same identity. */
+if (process.platform === 'win32') app.setAppUserModelId('me.codeshare.shroudly');
+
+/* ── single instance ─────────────────────────────────────────────────────── */
+/* Shroudly opened again while it runs (its icon clicked, its shortcut, the
+ * Start menu): the copy that is already running shows its window, and this
+ * one ends here, before it does anything at all. It used to go on through
+ * its start while it quit: it put back "the system proxy from the previous
+ * session" (the running copy's live setting: AutoConfigURL removed, its
+ * record and its restore-at-login deleted), started a Discord relay of its
+ * own on another port and wrote that port into Discord's settings, then
+ * vanished, leaving Discord pointed at nothing. The running copy saw "another
+ * program changed the system proxy ... to no proxy (removed)" and "Discord
+ * wrote its settings without the line", seconds after each click (shown on a
+ * real Windows by tests/e2e/app.test.js, 5e). */
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+  return;
+}
+app.on('second-instance', () => showWindow());
+
+/* ── crash / hard-exit safety: restore the system proxy synchronously ─────── */
+process.on('exit', () => {
+  // The environment first: it is what fails outright when left behind.
+  try { if (appEnv && appEnv.applied) appEnv.clearSync(); } catch {}
+  try { if (flatpakEnv && flatpakEnv.applied) flatpakEnv.clearSync(); } catch {}
+  try { engine && engine.cleanupSync(); } catch {}
+  try { advanced && advanced.cleanupSync(); } catch {}
+});
+/* An error nothing caught, in one feature's event or timer: logged, and
+ * Shroudly goes on. Quitting on it left the computer without protection and
+ * without Shroudly until someone noticed. Before the start is through there
+ * is nothing to go on with, and it quits as before. The same error is
+ * logged at most once a minute. */
+let startedUp = false;
+const uncaughtSeen = new Map();
+function uncaught(err) {
+  const what = String((err && (err.stack || err.message)) || err).split('\n').slice(0, 2).join(' ').slice(0, 300);
+  const now = Date.now();
+  if (now - (uncaughtSeen.get(what) || 0) < 60000) return;
+  uncaughtSeen.set(what, now);
+  try { addLog('error', `Unexpected error, Shroudly keeps running: ${what}`); } catch {}
+}
+process.on('uncaughtException', (err) => {
+  console.error('[Shroudly] uncaught:', err);
+  if (exitInProgress) return;
+  if (!startedUp) { shutdownAndQuit(); return; }
+  uncaught(err);
+});
+process.on('unhandledRejection', (r) => {
+  console.error('[Shroudly] rejection:', r);
+  if (startedUp && !exitInProgress) uncaught(r);
+});
+
+/* ── helpers ─────────────────────────────────────────────────────────────── */
+/* Icons live in public/ during development; packaged builds copy them to the
+ * root of resources/ (see build.extraResources in package.json). */
+function iconAssetPath(file) {
+  return app.isPackaged
+    ? path.join(process.resourcesPath, file)
+    : path.join(__dirname, '..', 'public', file);
+}
+
+function addLog(level, message) {
+  const entry = { timestamp: new Date().toISOString(), level, message };
+  systemLogs.push(entry);
+  if (systemLogs.length > LOG_LINES) systemLogs = systemLogs.slice(-LOG_LINES);
+  toWindow('log:new', entry);
+  if (require('./report-check').faultLine(level, message)) reportFault();
+}
+
+/* Shroudly's own going wrong, now: "Something not working?" shows for a day
+ * (report-check.js offered). */
+function reportFault() {
+  try { store.set('reportFaultAt', Date.now()); } catch {}
+  try { toWindow('report:offered', reportOffered()); } catch {}
+}
+function reportOffered() {
+  // The remote settings may show it always, or never (remote-config.js).
+  const rule = require('./remote-config').reportOffer(remoteSettings());
+  if (rule === 'always') return true;
+  if (rule === 'never') return false;
+  let last = 0;
+  try { last = Math.max(0, ...(store.get('reports') || []).map((r) => Number(r && r.at) || 0)); } catch {}
+  return require('./report-check').offered(Number(store.get('reportFaultAt', 0)) || 0, last, Date.now());
+}
+// reg.exe that Windows will not start: said once, in the log (win-reg.js).
+WinReg.setLog(addLog);
+// PowerShell that never answers here (an antivirus blocking its command
+// line) is no longer started for every question (ps-host.js): said once.
+require('./ps-host').setOnRest(() => addLog('warning', 'PowerShell does not answer on this computer (a security program may be blocking it), so Shroudly stops starting it for a while; what it is asked for (which Roblox program runs since when, whether a game is full-screen) goes without until it answers again'));
+
+function isAutoStartLaunch() {
+  if (process.argv.includes(AUTOSTART_ARG)) return true;
+  // macOS login items get no arguments
+  if (process.platform === 'darwin') { try { return app.getLoginItemSettings().wasOpenedAtLogin; } catch {} }
+  return false;
+}
+
+let lastBlockedNotice = 0;
+
+/* Count only while protected, and only if the user left it on. */
+function syncPresence() {
+  if (!presence) return;
+  const wanted = store.get('shareOnlineCount', true) !== false &&
+                 !!(engine && engine.active);
+  // The first ping waits for our own SOCKS rule: sent a moment earlier it
+  // would be routed by the system's PAC file, and Chromium would start (and
+  // keep) a proxy-resolver process just for that.
+  if (wanted && presence.stopped) ownProxyReady.then(() => { if (presence.stopped && engine && engine.active) presence.restart(); });
+  else if (!wanted && !presence.stopped) presence.leave();
+}
+
+/* A notification; clicking it opens the window. Shroudly never brings its
+ * window up by itself: a full-screen game or video must not lose the screen
+ * to it (user-busy.js). Kept referenced until it goes, or its click is lost. */
+const shownNotes = new Set();
+function notify(title, body) {
+  if (store.get('showNotifications', true) && Notification.isSupported()) {
+    try {
+      // Right-to-left languages laid out as such (main-i18n.js, bidi).
+      const lang = i18n.resolveLanguage(store.get('language'), systemLanguages());
+      const n = new Notification({ title: i18n.bidi(title, lang), body: i18n.bidi(body, lang), icon: trayIconPath() });
+      const gone = () => shownNotes.delete(n);
+      n.on('click', () => { gone(); showWindow(); });
+      n.on('close', gone);
+      shownNotes.add(n);
+      if (shownNotes.size > 20) shownNotes.delete(shownNotes.values().next().value);
+      n.show();
+    } catch {}
+  }
+}
+
+/* What Shroudly does or finds by itself (the autopilot turning a mode on,
+ * restarting an app, Advanced mode, a blocked site, Tor) is told by
+ * notifyAuto, never in a stream: up to 2.6.59 one app's start (Roblox:
+ * Games and apps mode, the app restarted, Advanced mode, the site) brought
+ * three or four notifications at once, and the same ones at every start.
+ *   - what comes within AUTO_GATHER_MS goes in one notification;
+ *   - after one, AUTO_QUIET_MS without another (each still has its line in
+ *     the window, and the log says it was held back);
+ *   - the same words at most once in AUTO_SAME_MS.
+ * What the user asked for (logs saved, Start, Stop, an update) and what
+ * stops Shroudly working (an antivirus, protection failing) still go at
+ * once, through notify. */
+const AUTO_GATHER_MS = 3000;
+const AUTO_QUIET_MS = 5 * 60 * 1000;
+const AUTO_SAME_MS = 6 * 60 * 60 * 1000;
+const autoSaid = new Map();     // text -> when it was last told
+let autoPending = [];
+let autoGather = null;
+let autoShownAt = 0;
+function notifyAuto(body, title = 'Shroudly') {
+  const text = String(body || '').trim();
+  if (!text) return;
+  const now = Date.now();
+  const said = autoSaid.get(text);
+  if (said && now - said < AUTO_SAME_MS) return;
+  autoSaid.set(text, now);
+  if (autoSaid.size > 200) autoSaid.delete(autoSaid.keys().next().value);
+  if (!autoGather && now - autoShownAt < AUTO_QUIET_MS) {
+    addLog('info', `Notification held back (another came ${Math.round((now - autoShownAt) / 1000)} s ago; the window has it): ${text}`);
+    return;
+  }
+  if (!autoPending.some((p) => p.text === text)) autoPending.push({ title, text });
+  if (autoGather) return;
+  autoGather = setTimeout(() => {
+    autoGather = null;
+    const items = autoPending.splice(0);
+    if (!items.length) return;
+    autoShownAt = Date.now();
+    // One: as it is. Several: one notification, a line each, under one title.
+    if (items.length === 1) notify(items[0].title, items[0].text);
+    else notify('Shroudly', items.slice(0, 4).map((i) => i.text).join('\n'));
+  }, AUTO_GATHER_MS);
+  if (autoGather.unref) autoGather.unref();
+}
+
+/* An antivirus that quarantined, refused or ended a part of Shroudly
+ * (security-block.js: the engine, its watchdog, Advanced mode), told from
+ * this one place:
+ *   - one line in the log, always (English, with the file and the folder);
+ *   - one notification per part per session, if notifications are on: it
+ *     never brings the window up (a click on it does);
+ *   - the window's banner, kept with the engine's advice so a window opened
+ *     later still shows it, and the tray's status line;
+ * and gone with the next start that works. Shroudly never opens the
+ * antivirus, the folder or its own window for it, and never tries to make
+ * itself an exception: what to allow is the user's to decide.
+ * quiet: no notification and, while protection runs, nothing in the window
+ * (the watchdog's: the engine's own end, if it comes, tells the user). */
+const securityTold = new Set();
+// Advanced mode was blocked this session: it is not brought back by itself
+// (after a game, at the next Start) against the blocker.
+let advancedBlocked = false;
+// A computer that refuses Shroudly's new files (write-guard.js): told once,
+// and Advanced mode is not tried again by itself this session.
+let writeGuard = null;
+// The same failure of Advanced mode said once a minute, not at every try.
+let advancedFailSaid = { msg: '', at: 0 };
+function securityBlocked(info, { quiet = false } = {}) {
+  if (!info || !info.part) return;
+  addLog('error', SecurityBlock.logLine(info));
+  if (info.part === 'advanced') advancedBlocked = true;
+  if (quiet && engine && engine.isActive()) return;
+  if (!quiet && !securityTold.has(info.part)) {
+    securityTold.add(info.part);
+    const s = tr();
+    const sure = info.certain !== false;
+    notify('Shroudly', info.part === 'advanced' ? (sure ? s.notifySecurityAdvanced : s.notifySecurityAdvancedMaybe)
+      : (sure ? s.notifySecurityEngine : s.notifySecurityEngineMaybe));
+  }
+  if (engine) {
+    // The engine's block outweighs Advanced mode's: protection itself is off.
+    const now = engine.advice.security;
+    if (!(now && now.part === 'engine' && info.part === 'advanced')) engine._setAdvice({ security: SecurityBlock.forWindow(info) });
+  }
+  rebuildTrayMenu();
+}
+
+/* The engine is blocked for certain (the window's and the tray's status). */
+function engineBlocked() {
+  const sec = engine && !engine.isActive() ? engine.advice.security : null;
+  return !!(sec && sec.part === 'engine' && sec.certain);
+}
+
+/* What the log's header says about this computer and Shroudly now. */
+function reportState() {
+  return {
+    version: appVersion(),
+    os: `${{ win32: 'Windows', darwin: 'macOS', linux: 'Linux' }[process.platform] || process.platform} ${(() => { try { return process.getSystemVersion(); } catch { return os.release(); } })()}`,
+    arch: process.arch,
+    protection: engine && engine.isActive() ? 'on' : engine && engine.coming ? 'starting' : 'off',
+    routeMode: store.get('routeMode') === 'listed' ? 'listed' : 'all',
+    advanced: { on: !!(advanced && advanced.active), available: !!(advanced && advanced.available()) },
+    discordMode: store.get('discordMode') === true,
+    appsMode: store.get('appMode') === true,
+    storeApps: process.platform === 'win32' ? store.get('storeAppsMode') === true : null,
+    // An antivirus block the window shows now, in a few words.
+    security: engine ? SecurityBlock.summary(engine.advice.security) : null,
+  };
+}
+
+/* "Copy logs": a short version of the log, with its header, that a chat app
+ * takes as one message (log-report.js), to the clipboard. Nothing is sent
+ * anywhere. */
+function copyLogs() {
+  const report = buildCompact(reportState(), systemLogs);
+  if (!toClipboard(report, clipboard)) return { ok: false };
+  return { ok: true, lines: systemLogs.length, chars: report.length };
+}
+
+/* "Save logs": the whole log in a .txt file in the user's Downloads folder
+ * (else Desktop, Documents, home), shown in the file manager, so it can be
+ * attached to a message or an issue. Nothing is sent anywhere. */
+function saveLogs() {
+  const text = buildReport({ ...reportState(), verb: 'saved' }, systemLogs);
+  const dirs = ['downloads', 'desktop', 'documents', 'home'].map((n) => () => app.getPath(n));
+  const r = saveReport(text, dirs);
+  if (!r.ok) { addLog('error', `Logs could not be saved: ${r.error}`); return { ok: false }; }
+  // Shown in the file manager (on Linux never as a program of ours: reveal.js).
+  reveal(r.file).catch(() => {});
+  return { ok: true, file: r.file, name: path.basename(r.file), folder: path.dirname(r.file) };
+}
+
+/* From the tray: on the clipboard, said; where the desktop would not take it
+ * from a program without a window (Wayland), the window opens on the Logs
+ * panel, whose button can, and the notification says so. */
+function trayCopyLogs(s) {
+  if (copyLogs().ok) { notify('Shroudly', s.notifyLogsCopied); return; }
+  showWindow();
+  toWindow('ui:navigate', 'logs');
+  notify('Shroudly', s.notifyLogsCopyFailed);
+}
+
+/* From the tray: saved, the file shown in the file manager and named in a
+ * notification. */
+function traySaveLogs(s) {
+  const r = saveLogs();
+  if (r.ok) notify('Shroudly', String(s.notifyLogsSaved || '').replace('{file}', r.name).replace('{folder}', r.folder));
+  else notify('Shroudly', s.notifyLogsSaveFailed);
+}
+
+/* ── tray + status ───────────────────────────────────────────────────────── */
+/* The window's, the taskbar's and the notifications' icon: Shroudly's logo,
+ * as at the window's top left (never a blurred small copy). */
+function logoAssetPath(file) {
+  return app.isPackaged ? path.join(process.resourcesPath, 'logos', file) : path.join(__dirname, '..', 'logos', file);
+}
+function trayIconPath() {
+  const own = Logos.file(store.get('logo', 'classic'), 'window');
+  if (own && fs.existsSync(logoAssetPath(own))) return logoAssetPath(own);
+  return process.platform === 'win32' ? iconAssetPath('icon.ico')
+                                      : iconAssetPath('icon.png');
+}
+
+/* The logo chosen in Settings, put where a running program can put it: the
+ * window's icon (the taskbar follows it on Windows and Linux) and, on macOS,
+ * the Dock icon. The classic one on macOS is the app's own icon again. */
+let dockImage = null;   // { id, img }: the Dock picture of the logo in use
+function applyLogo() {
+  const id = Logos.chosen(store.get('logo', 'classic'));
+  try {
+    if (process.platform !== 'darwin' && mainWindow && !mainWindow.isDestroyed()) mainWindow.setIcon(trayIconPath());
+  } catch {}
+  try {
+    if (process.platform === 'darwin' && app.dock) {
+      const own = Logos.file(id, 'dock');
+      if (!own) {
+        // The classic one: the app's own icon again, at once. Until 2.6.78
+        // icon.icns was loaded for it, which nativeImage cannot read, so the
+        // chosen logo stayed until Shroudly started again. null hands the
+        // Dock back the bundle's icon.
+        app.dock.setIcon(null);
+      } else {
+        if (!dockImage || dockImage.id !== id) dockImage = { id, img: nativeImage.createFromPath(logoAssetPath(own)) };
+        if (!dockImage.img.isEmpty()) app.dock.setIcon(dockImage.img);
+      }
+    }
+  } catch {}
+  // The notification area and the menu bar show the chosen logo too.
+  try { if (tray && !tray.isDestroyed()) tray.setImage(makeTrayIcon(!!trayLook)); } catch {}
+}
+
+/* macOS gives the Dock the bundle's icon back whenever the app's tile is
+ * made anew: the Dock icon shown again with the window, the app coming to
+ * the front from the menu bar or Spotlight. The chosen logo is put back on
+ * each of those, once at once and once the tile has settled. */
+function reapplyLogoSoon() {
+  if (process.platform !== 'darwin' || Logos.chosen(store.get('logo', 'classic')) === 'classic') return;
+  applyLogo();
+  setTimeout(applyLogo, 400).unref();
+  setTimeout(applyLogo, 1500).unref();
+}
+
+/* The notification area and the menu bar: Shroudly's logo, exactly as at the
+ * window's top left, its eye open while protection is on and shut while off
+ * (scripts/logo/make-icons.py). @2x/@3x are picked up by themselves; the
+ * Windows .ico carries every size a display scale asks for. */
+const trayLogoCache = new Map();
+/* The chosen logo for the tray: its sizes for the screen's scales, and, while
+ * protection is off, at half strength (the classic one shuts its eye). */
+function trayLogo(id, active) {
+  const key = `${id}:${active ? 1 : 0}`;
+  if (trayLogoCache.has(key)) return trayLogoCache.get(key);
+  const own = Logos.file(id, 'window', 'linux');   // the PNG, on every system
+  const big = own ? nativeImage.createFromPath(logoAssetPath(own)) : nativeImage.createEmpty();
+  if (big.isEmpty()) return null;
+  const base = process.platform === 'darwin' ? 18 : process.platform === 'win32' ? 16 : 22;
+  const out = nativeImage.createEmpty();
+  for (const scale of [1, 2]) {
+    const px = base * scale;
+    let img = big.resize({ width: px, height: px, quality: 'best' });
+    if (!active) {
+      const bmp = Buffer.from(img.toBitmap());
+      // Every channel halved: right for premultiplied pixels, and only a
+      // little darker for straight ones.
+      for (let i = 0; i < bmp.length; i++) bmp[i] = bmp[i] >> 1;
+      img = nativeImage.createFromBitmap(bmp, { width: px, height: px });
+    }
+    out.addRepresentation({ scaleFactor: scale, width: px, height: px, buffer: img.toPNG() });
+  }
+  trayLogoCache.set(key, out);
+  return out;
+}
+
+function makeTrayIcon(active = false) {
+  try {
+    const id = Logos.chosen(store.get('logo', 'classic'));
+    if (id !== 'classic') { const own = trayLogo(id, active); if (own) return own; }
+    const name = `tray-${active ? 'on' : 'off'}.${process.platform === 'win32' ? 'ico' : 'png'}`;
+    let img = nativeImage.createFromPath(iconAssetPath(name));
+    if (img.isEmpty()) img = nativeImage.createFromPath(trayIconPath());
+    return img;
+  } catch { return nativeImage.createEmpty(); }
+}
+
+function systemLanguages() {
+  try { return app.getPreferredSystemLanguages(); } catch { return [app.getLocale()]; }
+}
+
+/* Main-process strings in the user's chosen language, else the OS language. */
+function tr() {
+  return i18n.strings(i18n.resolveLanguage(store.get('language'), systemLanguages()));
+}
+
+/* Protection is on, but browsers and most programs are not going through it:
+ * the system proxy could not be set, waits for an administrator's password,
+ * or another program took it over (SystemProxy.routes). The window, the tray
+ * and the start's notification say "Not working yet" then, not "Protected":
+ * a small banner under a big green "Protected" was read as "it works". */
+function notRouting() { return !!(engine && engine.isActive() && !engine.routing()); }
+
+/* A site that only the last way out (Tor) opened: said to the user, since
+ * it is slower and some sites ask Tor's visitors for a captcha. Once per
+ * site a session, and at most once every TOR_TELL_MS, so a page of blocked
+ * resources cannot turn into a stream of notifications. */
+const TOR_TELL_MS = 15 * 60 * 1000;
+const torTold = new Set();
+let torToldAt = 0;
+/* Tor asked for, not yet allowed (issue #77): a site no technique opened.
+ * The user decides in the window (ControlPanel's card): a notification says
+ * so, at most every TOR_ASK_MS; no window of its own, never the screen
+ * taken. The answer is kept (torApproved, or the last way out turned off);
+ * Settings → the Tor toggle changes it. */
+const TOR_ASK_MS = 30 * 60 * 1000;
+let torAsk = null;
+let torAskedAt = 0;
+function askTor(host) {
+  const h = String(host || '').toLowerCase();
+  const had = torAsk;
+  // Named as people know it: Telegram rather than one of its addresses
+  // (askLabel; a program the engine's connection was traced to counts too).
+  torAsk = askLabel(had, h, (x) => { const s = serviceOf(x); return s ? s.name : TorApps.appOfName(x) || rawWatch.hostApp.get(x) || null; });
+  const better = !!had && torAsk !== had;
+  if (!had) addLog('info', `The last way out: ${torAsk.host && torAsk.host !== h && h ? `${torAsk.host} (${h})` : torAsk.host || 'a site'} needs Tor; asking before it starts`);
+  else if (better) addLog('info', `The last way out: the question now names ${torAsk.host}${h && h !== torAsk.host.toLowerCase() ? ` (${h})` : ''}`);
+  const now = Date.now();
+  // A better name is said again at once: the notice named an address.
+  if (now - torAskedAt >= TOR_ASK_MS || better) {
+    torAskedAt = now;
+    const text = String(tr().torAskNotice || '').replace(/\{host\}/g, torAsk.host || '');
+    if (text) notifyAuto(text);
+  }
+  toWindow('dpi:status-changed', !!(engine && engine.isActive()));
+}
+/* "No" (or the last way out turned off in Settings) is kept, but not for
+ * ever: a user in Iran who had said no once saw X and YouTube stay shut, and
+ * nothing said that Tor was the one way left. A site no technique opens asks
+ * again after TOR_REST_MS (the same card; "No" rests again); one said
+ * before this version (no time kept) asks at the next such site. */
+// A day, not a week: another Iran user turned Tor off, YouTube and Instagram
+// stayed dead for days, and nothing was said (since 2.6.75 Tor carries only
+// what nothing else opens, so a yes costs little).
+const TOR_REST_MS = 24 * 60 * 60 * 1000;
+function askTorAgain(host) {
+  if (!host || torAsk || !engine || !engine.isActive() || !engine.torOffByUser || !engine.torOffByUser()) return false;
+  const rest = Number(store.get('torAskRest', 0)) || 0;
+  const now = Date.now();
+  if (rest && now - rest >= 0 && now - rest < TOR_REST_MS) return false;
+  store.set('torAskRest', now);
+  addLog('info', `The last way out is off and ${host} stays shut; asking again whether to use Tor`);
+  askTor(host);
+  return true;
+}
+function answerTor(yes) {
+  const host = torAsk ? torAsk.host : '';
+  torAsk = null;
+  if (yes) {
+    store.set('torApproved', true);
+    addLog('info', `The last way out: allowed by the user${host ? ` (for ${host})` : ''}; Tor starts and stays allowed`);
+    // Asked again with it off (askTorAgain): on, and the engine started
+    // again with it; Tor itself starts when a site needs it.
+    if (store.get('torLastResort', false) === false) { store.set('torLastResort', true); scheduleEngineRestart(); }
+    else if (engine && engine.isActive() && engine.tor) engine.tor.need();
+  } else {
+    store.set('torApproved', false);
+    store.set('torLastResort', false);
+    store.set('torAskRest', Date.now());
+    addLog('info', 'The last way out: the user said no; Tor stays off (Settings → Connection turns it on)');
+    scheduleEngineRestart();
+  }
+  toWindow('dpi:status-changed', !!(engine && engine.isActive()));
+  return { success: true };
+}
+ipcMain.handle('tor:answer', (e, yes) => answerTor(yes === true));
+
+function torUsed(host) {
+  const h = String(host || '').toLowerCase();
+  if (!h || torTold.has(h)) return;
+  torTold.add(h);
+  const now = Date.now();
+  if (now - torToldAt < TOR_TELL_MS) return;
+  torToldAt = now;
+  autoTell('torUsedDesktop', { host: h });
+}
+
+/* A small JSON document over HTTPS. Node's https rather than fetch(): the
+ * Windows 7 and 8 build runs Electron 22, whose Node (16) has no fetch. */
+function getJson(url, timeout) {
+  return new Promise((resolve, reject) => {
+    const req = require('https').get(url, { headers: { 'cache-control': 'no-store' } }, (res) => {
+      if (res.statusCode !== 200) { res.resume(); reject(new Error(`HTTP ${res.statusCode}`)); return; }
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (d) => { body += d; if (body.length > 1 << 20) req.destroy(new Error('too large')); });
+      res.on('end', () => { try { resolve(JSON.parse(body)); } catch (e) { reject(e); } });
+    });
+    req.setTimeout(timeout, () => req.destroy(new Error('timed out')));
+    req.on('error', reject);
+  });
+}
+
+/* Tor for a report that did not get through the usual way: running
+ * already, or started for it, whether or not the user has said yes to Tor
+ * for sites (the report alone goes through it; Tor is stopped again after
+ * it where they have not), and waited for up to REPORT_TOR_WAIT_MS. Russia's
+ * networks freeze Cloudflare's addresses, where the report server is, after
+ * about 16 KB, and a report with its log is more than that: with Tor off it
+ * could not be sent at all (a Russian user, 2.6.68). Resolves to a function
+ * to call once the report is through (null: no Tor). Not where Tor is
+ * turned off in Settings: the engine then has no way to it. */
+const REPORT_TOR_WAIT_MS = 150000;
+async function torForReport(waitMs = REPORT_TOR_WAIT_MS) {
+  const tor = engine && engine.isActive() ? engine.tor : null;
+  if (!tor || store.get('torLastResort', false) === false) return null;
+  if (tor.state === 'ready') return () => {};
+  const allowed = store.get('torApproved', false) === true;
+  addLog('info', `Report: not through the usual way; starting Tor to send it${allowed ? '' : ' (for the report alone)'}`);
+  try { tor.need(); } catch { return null; }
+  const done = () => { if (!allowed) { try { tor.stop(); } catch {} } };
+  const until = Date.now() + waitMs;
+  while (Date.now() < until && tor.state !== 'ready' && tor.state !== 'failed') await new Promise((res) => setTimeout(res, 1000));
+  if (tor.state === 'ready') return done;
+  done();
+  return null;
+}
+
+/* The same through Chromium's network (net.request: Electron 22 has it,
+ * net.fetch came in 25), so it follows the session's proxy: through the
+ * engine while protection is on (syncOwnProxy). */
+/* The remote settings (remote-config.js): read at once from what was kept,
+ * asked for again every six hours through Shroudly (Electron's net goes by
+ * the system proxy, the engine while protection is on). A new one takes
+ * effect at once: the engine starts again with it while protection is on. */
+let remoteConfig = null;
+function remoteSettings() { try { return remoteConfig ? remoteConfig.settings() : {}; } catch { return {}; } }
+function remoteCtx() {
+  let country = null;
+  try { country = require('./national-net').homeCountry({ remembered: store.get('homeCountry') }); } catch {}
+  if (!country) { try { country = (app.getLocaleCountryCode() || '').toUpperCase() || null; } catch {} }
+  return { platform: process.platform === 'win32' ? 'windows' : process.platform === 'darwin' ? 'macos' : 'linux', country, app: app.getVersion() };
+}
+function netText(url, timeout) {
+  return new Promise((resolve, reject) => {
+    const req = require('electron').net.request({ url, redirect: 'follow' });
+    let done = false;
+    const end = (e, v) => { if (done) return; done = true; clearTimeout(timer); if (e) { try { req.abort(); } catch {} reject(e); } else resolve(v); };
+    const timer = setTimeout(() => end(new Error('timed out')), timeout);
+    req.on('response', (res) => {
+      if (res.statusCode !== 200) { end(new Error(`HTTP ${res.statusCode}`)); return; }
+      let body = '';
+      res.on('data', (d) => { body += d; if (body.length > 256 * 1024) end(new Error('too large')); });
+      res.on('end', () => end(null, body));
+      res.on('error', end);
+    });
+    req.on('error', end);
+    req.end();
+  });
+}
+function startRemoteConfig() {
+  const { RemoteConfig } = require('./remote-config');
+  remoteConfig = new RemoteConfig({ store, fetchText: (u) => netText(u, 15000), ctx: remoteCtx, log: addLog });
+  const { engineKey } = require('./remote-config');
+  const look = (force) => {
+    const before = engineKey(remoteSettings());
+    return remoteConfig.refresh({ force }).then((changed) => {
+    // Only when what the engine starts with changed: a restart cuts every
+    // open connection (issue #90: a first, empty file restarted it).
+    if (changed && engineKey(remoteSettings()) !== before && engine && engine.isActive()) {
+      addLog('info', 'Remote settings: the engine starts again with them');
+      engine.restart().catch((e) => { if (e.code !== 'security_blocked') addLog('error', `Start failed: ${e.message}`); broadcastStatus(false); });
+    }
+  }).catch(() => {});
+  };
+  setTimeout(() => look(false), 20000).unref?.();
+  setInterval(() => look(false), 60 * 60 * 1000).unref?.();
+}
+
+function netJson(url, timeout) {
+  return new Promise((resolve, reject) => {
+    const req = require('electron').net.request({ url, redirect: 'follow' });
+    let done = false;
+    const end = (e, v) => { if (done) return; done = true; clearTimeout(timer); if (e) { try { req.abort(); } catch {} reject(e); } else resolve(v); };
+    const timer = setTimeout(() => end(new Error('timed out')), timeout);
+    req.on('response', (res) => {
+      if (res.statusCode !== 200) { end(new Error(`HTTP ${res.statusCode}`)); return; }
+      let body = '';
+      res.on('data', (d) => { body += d; if (body.length > 1 << 20) end(new Error('too large')); });
+      res.on('end', () => { try { end(null, JSON.parse(body)); } catch (e) { end(e); } });
+      res.on('error', end);
+    });
+    req.on('error', end);
+    req.end();
+  });
+}
+
+/* Advanced mode on or off, told to the window. Where the system proxy is
+ * set by the computer's administrator (system-proxy.js, machine_policy) it
+ * is what carries browsers, so the tray and the status follow it too. */
+function advancedState(active) {
+  toWindow('advanced:state', { active });
+  if (engine) { try { engine.setAdvanced(active); } catch {} }
+  // Tor is the last of all ways: the sites it carried until now try Advanced
+  // mode first.
+  if (active && engine) { try { engine.forgetFallback(); } catch {} }
+  if (engine && engine.proxyStatus && engine.proxyStatus.code === 'machine_policy') {
+    rebuildTrayMenu();
+    toWindow('dpi:status-changed', engine.isActive());
+  }
+}
+
+let trayActive = false;
+let trayLook = null;
+// Windows' taskbar turned light or dark: the tray's line follows.
+app.whenReady().then(() => { nativeTheme.on('updated', () => { if (tray) { trayLook = null; rebuildTrayMenu(); } }); });
+function rebuildTrayMenu(active = trayActive) {
+  trayActive = active;
+  if (!tray) return;
+  const s = tr();
+  const state = active ? (notRouting() ? s.notWorkingYet : s.trayActive) : engineBlocked() ? s.traySecurityBlocked : s.trayInactive;
+  const menu = Menu.buildFromTemplate([
+    { label: s.trayOpen, click: () => showWindow() },
+    { type: 'separator' },
+    { label: `${s.trayStatus}: ${state}`, enabled: false },
+    {
+      label: active ? s.trayStop : s.trayStart,
+      click: async () => { active ? await safeStop({ user: true }) : await safeStart({ user: true }); },
+    },
+    { type: 'separator' },
+    { label: s.traySupport, click: () => { showWindow(); toWindow('ui:navigate', 'support'); } },
+    { type: 'separator' },
+    { label: s.trayCopyLogs, click: () => trayCopyLogs(s) },
+    { label: s.traySaveLogs, click: () => traySaveLogs(s) },
+    { label: s.trayQuit, click: () => { app.isQuitting = true; shutdownAndQuit(); } },
+  ]);
+  tray.setContextMenu(menu);
+  tray.setToolTip(`Shroudly — ${state}`);
+  // Only when it changes: a new image makes some Linux panels redraw the
+  // whole icon.
+  const look = !!active;
+  if (look !== trayLook) { trayLook = look; tray.setImage(makeTrayIcon(look)); }
+}
+
+/* The icon in the notification area (the menu bar on macOS), unless the user
+ * hid it in Settings (issue #12). Shroudly keeps running in the background
+ * all the same, and starting it again (Start menu, Applications, the
+ * desktop's launcher) brings the window back: see 'second-instance'. */
+const trayWanted = () => store.get('showTrayIcon', true) !== false;
+function setTrayIcon(on) {
+  if (on && !tray) {
+    tray = new Tray(makeTrayIcon(trayActive));
+    trayLook = !!trayActive;
+    rebuildTrayMenu();
+    tray.on('click', () => showWindow());
+  } else if (!on && tray) {
+    tray.destroy();
+    tray = null;
+  }
+}
+
+/* Resolves once it is known whether the tray icon can be seen at all
+ * (launch.js): how Shroudly comes up at launch depends on it. */
+function createTray() {
+  setTrayIcon(trayWanted());
+  return checkTrayHost();
+}
+
+/* Without a visible tray icon (a stock GNOME), the window is minimised
+ * instead of sent to the tray, and never closed for being idle. */
+let trayVisible = true;
+async function checkTrayHost() {
+  trayVisible = await Launch.trayVisible();
+  if (!trayVisible) addLog('info', 'No tray on this desktop: the window is minimised instead of closed');
+}
+
+/* May the window go away entirely (closed to the background, or released
+ * when idle)? Yes when there is a tray icon to come back through, and when
+ * the user hid the icon on purpose: they come back by starting Shroudly
+ * again. Only a desktop with no tray at all, where the user did not choose
+ * that, keeps the window minimised instead, so it never vanishes. */
+const canLeave = () => trayVisible || !trayWanted();
+
+/* Does a host go through Shroudly? Always, unless the user routes only listed
+ * sites. Asked for every connection Games and apps mode carries, so the
+ * answer comes from memory; it is rebuilt when the routing settings or the
+ * list change. */
+let routing = null;
+function isRouted(host) {
+  if (!routing) {
+    const custom = store.get('siteList');
+    routing = {
+      listed: store.get('routeMode') === 'listed',
+      // The same list the PAC routes (engine-manager.js): a family named in a
+      // custom list counts whole (families.js); the user's own sites are
+      // added to the automatic list, never put in its place.
+      set: new Set(Families.expand([...(siteList ? siteList.domains : []), ...(Array.isArray(custom) ? custom : [])]).map((d) => String(d).toLowerCase())),
+    };
+  }
+  if (!routing.listed) return true;
+  for (let h = host; h; h = h.includes('.') ? h.slice(h.indexOf('.') + 1) : '') if (routing.set.has(h)) return true;
+  return false;
+}
+
+/* A list of one's own kept by 2.6.77 or older replaced the automatic one,
+ * and one edit of the box saved the whole built-in list with it. Since
+ * 2.6.78 one's own sites are added to the automatic list, so only what is
+ * on neither is kept as one's own; nothing left, the key goes. */
+function ownSitesOnly() {
+  const custom = store.get('siteList');
+  if (!Array.isArray(custom)) return;
+  const known = new Set([...EngineManager.FALLBACK_SITE_LIST, ...EngineManager.DEFAULT_SITE_LIST, ...(siteList ? siteList.domains : [])].map((d) => String(d).toLowerCase()));
+  const own = custom.filter((d) => !known.has(String(d).toLowerCase()));
+  if (own.length === custom.length) return;
+  if (own.length) store.set('siteList', own); else store.delete('siteList');
+}
+
+/* The automatic site list: checked once protection has settled, then at most
+ * once a day while it stays on (site-list.js says why only then). A newer
+ * list takes effect at once for "only listed sites", unless the user keeps a
+ * list of their own. */
+const SITE_LIST_EVERY_MS = 24 * 60 * 60 * 1000;
+let siteListTimer = null;
+function scheduleSiteListCheck(delayMs) {
+  clearTimeout(siteListTimer);
+  siteListTimer = setTimeout(async () => {
+    if (!siteList || !engine || !engine.isActive()) return;
+    // Only someone routing by the list needs it (their own sites included:
+    // those are added to it, see engine-manager.js _settings).
+    if (store.get('routeMode') !== 'listed') return;
+    if (Date.now() - siteList.checkedAt < SITE_LIST_EVERY_MS - 60000) return;
+    if (!(await siteList.refresh())) return;
+    if (engine.updateSiteList()) addLog('info', 'Proxy routing updated');
+    routing = null;
+    toWindow('sitelist:changed', siteList.info());
+  }, delayMs);
+}
+setInterval(() => { if (engine && engine.isActive()) scheduleSiteListCheck(0); }, 60 * 60 * 1000).unref();
+
+/* Shroudly's own requests (the live count, update checks) go through the
+ * engine while protection is on, as they always have, but by a fixed SOCKS
+ * rule rather than the system's PAC file: following the PAC keeps a Chromium
+ * proxy-resolver process (about 10 MB) alive just to read our own file.
+ * Protection off: whatever the system says, as before. */
+let ownProxyKey = null;
+let ownProxyReady = Promise.resolve();   // settles once the rule is in force
+function syncOwnProxy() {
+  const port = engine && engine.isActive() ? engine.port : null;
+  const cfg = port ? { proxyRules: `socks5://127.0.0.1:${port}`, proxyBypassRules: '<local>' } : { mode: 'system' };
+  const key = JSON.stringify(cfg);
+  if (key === ownProxyKey) return ownProxyReady;
+  ownProxyKey = key;
+  ownProxyReady = Promise.all([
+    ...[session.defaultSession, session.fromPartition('electron-updater', { cache: false })].map((s) => s.setProxy(cfg)),
+    // Chromium's own requests that belong to no session (Windows makes some).
+    // app.setProxy came in Electron 28: the Windows 7 and 8 build (22) has
+    // none, and calling it there failed every Start and Stop.
+    typeof app.setProxy === 'function' ? app.setProxy(cfg) : null,
+  ].map((p) => Promise.resolve(p).catch(() => {})));
+  Updater.setSystemRoute(cfg);
+  return ownProxyReady;
+}
+
+function broadcastStatus(active) {
+  syncOwnProxy();
+  if (active) scheduleSiteListCheck(20000);
+  rebuildTrayMenu(active);
+  toWindow('dpi:status-changed', active);
+}
+
+/* ── window ──────────────────────────────────────────────────────────────── */
+/* The window is most of what Shroudly costs: a renderer with the whole
+ * interface in it and the GPU work to draw it. Protection, the tray and
+ * everything else live in this process and never need it. So the window is
+ * closed for real, not just hidden, whenever nobody is using it: when it goes
+ * to the tray, and when it has sat unused for a few minutes (not focused, or
+ * focused with nobody at the computer), which also covers the many people who
+ * never send it to the tray at all. Opening Shroudly again builds a new one
+ * in well under a second; it asks this process for the current state. */
+const IDLE_RELEASE_MS = Math.max(1000, Number(process.env.SHROUDLY_IDLE_RELEASE_MS) || 3 * 60 * 1000);
+let lastActive = Date.now();
+let uiReady = false;          // the current window listens for one-off notices
+let releaseToken = 0;         // a release in progress is called off by bumping it
+let modalOpen = 0;            // a dialog belongs to the window: keep it
+let idleNoticeShown = false;
+let idleTimer = null;
+const loading = new WeakSet();  // windows still loading on their way to the screen
+/* Windows the user sent to the background (closed to the tray, or hidden
+ * with the icon off) before they had appeared: ready-to-show leaves them be. */
+const sentAway = new WeakSet();
+// One-off notices that must not be lost while there is no window: the latest
+// of each is shown once the next window is up.
+const STICKY = new Set(['dpi:need-restart', 'dpi:dns-auto-enabled', 'dpi:site-blocked', 'dpi:service-refused', 'ui:navigate']);
+const pending = new Map();
+
+function windowAlive() { return !!(mainWindow && !mainWindow.isDestroyed()); }
+
+/* macOS: a Dock icon only while the window is open. With the window closed
+ * Shroudly lives in the menu bar, like the taskbar button that goes with the
+ * window on Windows and Linux; opening it from the menu bar, Spotlight or
+ * Launchpad brings the icon back with the window. */
+function setDockIcon(visible) {
+  if (process.platform !== 'darwin' || !app.dock) return Promise.resolve();
+  try {
+    // The logo chosen in Settings goes on with it: the Dock forgets it when hidden.
+    if (visible) return Promise.resolve(app.dock.show()).then(() => reapplyLogoSoon()).catch(() => {});
+    app.dock.hide();
+  } catch {}
+  return Promise.resolve();
+}
+
+function toWindow(channel, payload) {
+  const sticky = STICKY.has(channel);
+  if (windowAlive() && (uiReady || !sticky)) { try { mainWindow.webContents.send(channel, payload); } catch {} return; }
+  if (sticky) pending.set(channel, payload);
+}
+
+function markActive() { lastActive = Date.now(); }
+
+function showWindow() {
+  releaseToken++;
+  markActive();
+  if (!windowAlive()) { createWindow({ show: true }); return; }
+  sentAway.delete(mainWindow);
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+  if (winhttpGone) setTimeout(() => { offerWinHttpReset().catch(() => {}); }, 1500);
+}
+
+/* Close the window and free everything it held. The interface is first told
+ * to save what is being typed (a field saves when it loses focus). */
+async function releaseWindow(reason) {
+  if (!windowAlive() || modalOpen > 0) return;
+  const win = mainWindow;
+  const token = ++releaseToken;
+  const wasOnScreen = win.isVisible() && !win.isMinimized();
+  try { win.webContents.send('ui:release'); } catch {}
+  await new Promise((r) => setTimeout(r, 400));
+  if (token !== releaseToken || win.isDestroyed() || modalOpen > 0) return;
+  if (reason === 'idle' && (Date.now() - lastActive < IDLE_RELEASE_MS)) return;
+  if (mainWindow === win) { mainWindow = null; uiReady = false; }
+  win.destroy();
+  if (reason === 'idle' && wasOnScreen && !idleNoticeShown) {
+    idleNoticeShown = true;
+    notify('Shroudly', trayWanted() ? (process.platform === 'darwin' ? tr().trayMinimizedMac : tr().trayMinimized) : tr().trayHiddenRunning);
+  }
+}
+
+function idleCheck() {
+  // Just woken up (or the clock jumped): the time asleep is no time unused.
+  if (wake.check()) return;
+  if (!windowAlive() || !canLeave()) return;
+  const w = mainWindow;
+  if (loading.has(w)) return;   // not shown yet because it is still loading
+  if (!w.isVisible()) { releaseWindow('hidden'); return; }
+  if (Date.now() - lastActive < IDLE_RELEASE_MS) return;
+  if (w.isFocused() && !w.isMinimized()) {
+    // In front of the user: only once the computer itself has been idle too.
+    let idleMs = 0;
+    try { idleMs = powerMonitor.getSystemIdleTime() * 1000; } catch {}
+    if (idleMs < IDLE_RELEASE_MS) return;
+  }
+  releaseWindow('idle');
+}
+
+function startIdleWatch() {
+  if (idleTimer) return;
+  idleTimer = setInterval(idleCheck, Math.min(15000, Math.max(250, Math.floor(IDLE_RELEASE_MS / 4))));
+  idleTimer.unref();
+}
+
+/* Windows announces logoff and shutdown to windows, not to the app. With the
+ * main window gone most of the time, a hidden window without any web content
+ * (no renderer, next to no memory) is kept just to hear it. */
+let sessionWatch = null;
+function watchSessionEnd() {
+  if (process.platform !== 'win32' || sessionWatch) return;
+  try {
+    // BaseWindow (no web content) came in Electron 30; the Windows 7 and 8
+    // build (Electron 22) keeps an empty, hidden BrowserWindow instead.
+    const { BaseWindow, BrowserWindow: Plain } = require('electron');
+    const Watch = BaseWindow || Plain;
+    sessionWatch = new Watch({ show: false, width: 1, height: 1, frame: false, skipTaskbar: true, focusable: false });
+    sessionWatch.on('query-session-end', () => { keepDiscordLine = discordLineOutlivesSession(); });
+    sessionWatch.on('session-end', restoreForSessionEnd);
+  } catch (e) { addLog('warning', `Logoff watch not available: ${e.message}`); }
+}
+
+async function checkDevServer() {
+  if (!isDev) return false;
+  return new Promise((resolve) => {
+    const http = require('http');
+    const req = http.get(`http://localhost:${DEV_PORT}`, (res) => resolve(res.statusCode === 200));
+    req.on('error', () => resolve(false));
+    req.setTimeout(800, () => { req.destroy(); resolve(false); });
+  });
+}
+
+async function createWindow({ show = true, minimised = false, quiet = false } = {}) {
+  uiReady = false;
+  if (show) await setDockIcon(true);
+  // Never taller than the screen it opens on (launch.js, windowHeights).
+  const { screen } = require('electron');
+  const workHeight = () => { try { return screen.getPrimaryDisplay().workAreaSize.height; } catch { return 0; } };
+  const fit = Launch.windowHeights(workHeight());
+  const win = new BrowserWindow({
+    width: 460, height: fit.height,
+    minWidth: 360, minHeight: fit.minHeight,
+    maxWidth: 720, maxHeight: 1100,
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      preload: path.join(__dirname, 'preload.js'),
+      webSecurity: true,
+      // On Windows and Linux Chromium's spellchecker downloads dictionaries
+      // from Google when the window opens: a request to Google from a
+      // circumvention tool, and memory, for two plain text fields (a site
+      // name and a list of domains) that need no spelling help.
+      spellcheck: false,
+    },
+    icon: trayIconPath(),
+    title: `Shroudly — ${tr().tagline}`,
+    // Native window buttons drawn over our own title bar (components/TitleBar):
+    // traffic lights on macOS, the system caption buttons on Windows/Linux.
+    ...(process.platform === 'darwin'
+      ? { titleBarStyle: 'hiddenInset', trafficLightPosition: { x: 13, y: 12 } }
+      : { titleBarStyle: 'hidden', titleBarOverlay: { color: '#0b0f17', symbolColor: '#a3afc4', height: 36 } }),
+    backgroundColor: '#0b0f17',
+    show: false,
+  });
+  mainWindow = win;
+  if (show) loading.add(win);
+  markActive();
+  startIdleWatch();
+
+  let startUrl;
+  if (isDev && await checkDevServer()) {
+    startUrl = `http://localhost:${DEV_PORT}`;
+  } else {
+    const indexPath = path.join(__dirname, '..', 'out', 'index.html');
+    if (!fs.existsSync(indexPath)) {
+      if (isDev) {
+        dialog.showErrorBox('Build Required', 'Build files not found.\n\nRun: npm run build');
+      } else {
+        // An installed copy with its window's files gone (an update cut
+        // short, an antivirus): said in the user's language, with the way
+        // out, as Settings → Repair says it. It told users to "Run: npm run
+        // build", in English.
+        const s = tr();
+        const r = await dialog.showMessageBox({
+          type: 'error', noLink: true, defaultId: 0, cancelId: 1,
+          message: fillIn(s.repairFilesMissing, { files: 'index.html' }),
+          buttons: [s.repairDownload, s.trayQuit],
+        }).catch(() => ({ response: 1 }));
+        if (r.response === 0) await shell.openExternal('https://github.com/umutxyp/Shroudly/releases/latest').catch(() => {});
+      }
+      app.quit();
+      return;
+    }
+    startUrl = url.format({ pathname: indexPath, protocol: 'file:', slashes: true });
+  }
+
+  win.loadURL(startUrl);
+
+  win.webContents.setWindowOpenHandler(({ url: target }) => {
+    if (/^https?:\/\//i.test(target)) shell.openExternal(target);
+    return { action: 'deny' };
+  });
+  win.webContents.on('will-navigate', (e, target) => {
+    if (target !== win.webContents.getURL()) e.preventDefault();
+  });
+  // A crashed or killed renderer leaves an empty window: start it afresh.
+  win.webContents.on('render-process-gone', (_e, d) => {
+    if (d.reason === 'clean-exit' || win.isDestroyed()) return;
+    addLog('warning', `Window process ended (${d.reason}); reopening`);
+    const visible = win.isVisible();
+    if (mainWindow === win) { mainWindow = null; uiReady = false; }
+    win.destroy();
+    // Back where it was, without taking the screen from whatever is in front.
+    if (visible) createWindow({ show: true, quiet: true });
+  });
+
+  // Moved to another screen, or its scaling changed: the least height again.
+  const refit = () => {
+    if (win.isDestroyed()) return;
+    try { win.setMinimumSize(360, Launch.windowHeights(screen.getDisplayMatching(win.getBounds()).workAreaSize.height).minHeight); } catch {}
+  };
+  win.on('moved', refit);
+  screen.on('display-metrics-changed', refit);
+  win.once('closed', () => screen.removeListener('display-metrics-changed', refit));
+
+  win.once('ready-to-show', () => {
+    loading.delete(win);
+    // Closed (sent to the background) before it had even appeared: it must
+    // not then pop up by itself.
+    if (!show || win.isDestroyed() || sentAway.has(win)) return;
+    markActive();
+    // In the taskbar without taking the screen (a quiet start with no tray).
+    if (minimised) { win.showInactive(); win.minimize(); return; }
+    if (quiet) { win.showInactive(); return; }
+    win.show(); win.focus();
+  });
+  // A page that never finishes loading must not keep the window forever.
+  if (show) setTimeout(() => loading.delete(win), 30000).unref();
+  win.on('focus', markActive);
+  win.on('show', markActive);
+  win.on('show', askProxyRecovery);
+  win.on('restore', markActive);
+  win.on('hide', () => { setTimeout(() => { if (!win.isDestroyed() && !win.isVisible()) releaseWindow('hidden'); }, 1000); });
+  win.on('closed', () => {
+    if (mainWindow === win) { mainWindow = null; uiReady = false; }
+    if (!windowAlive()) setDockIcon(false);
+  });
+
+  /* Closing the window (its X, Cmd+W) by the user. "Keep running in the
+   * tray" on: the window goes, Shroudly stays. Off: Shroudly quits, as the
+   * switch says; it used to stay all the same, the switch changing nothing
+   * but the window at login. The window Shroudly closes by itself when
+   * unused (releaseWindow) is destroyed, which never comes here. */
+  win.on('close', (e) => {
+    if (!app.isQuitting && !store.get('minimizeToTray', true)) { shutdownAndQuit(); return; }
+    if (!app.isQuitting && store.get('minimizeToTray', true)) {
+      e.preventDefault();
+      if (!canLeave()) { win.minimize(); return; }
+      sentAway.add(win);
+      win.hide();
+      // Said the first time only: one at every close piled up in the
+      // notification centre. macOS has a menu bar where the others have a tray.
+      if (!store.get('closeToldInTray', false)) {
+        try { store.set('closeToldInTray', true); } catch {}
+        notify('Shroudly', trayWanted() ? (process.platform === 'darwin' ? tr().trayMinimizedMac : tr().trayMinimized) : tr().trayHiddenRunning);
+      }
+    }
+  });
+}
+
+/* ── engine lifecycle wrappers ───────────────────────────────────────────── */
+/* Whether protection should be on is the user's call alone: it changes only
+ * when they press Start or Stop (window or tray), and Shroudly comes back
+ * that way after a restart, an update, a crash or a reboot. Sleep, waking,
+ * locking the screen or closing the lid never change it, and neither does
+ * any switch in Settings (Auto mode, the strategy): a settings file from
+ * before there was a setting for it gets one at the start
+ * (SettingsFile.settle). */
+const PROTECTION_KEY = SettingsFile.PROTECTION_KEY;
+
+/* Discord app mode and Games and apps mode carry other programs'
+ * connections. While protection is on its way up (the start at launch, a
+ * start under way, the engine restarting after a crash or a settings change)
+ * a new connection waits for it, at most ENGINE_WAIT_MS, instead of going out
+ * directly: on a filtering network that fails, and Discord's updater and
+ * Roblox then report errors ("retrying", "failed to load critical settings")
+ * that look as if Shroudly did not work. */
+const ENGINE_WAIT_MS = 15000;
+let launchStartPending = false;
+function engineComing() {
+  if (!engine || engine.isActive() || !protectionWanted()) return false;
+  return launchStartPending || engine.coming;
+}
+async function waitForEngine() {
+  const until = Date.now() + ENGINE_WAIT_MS;
+  while (engineComing() && Date.now() < until) await new Promise((r) => setTimeout(r, 200));
+}
+
+function protectionWanted() { return SettingsFile.protectionWanted(store); }
+
+/* macOS: settings a restart of the Mac left waiting for an administrator's
+ * password (EngineManager.recoverProxyAsAdmin). Asked by itself only with
+ * the window on screen and protection staying off, never from the tray
+ * alone; once the user dismissed it, only the window's button asks. */
+function askProxyRecovery() {
+  if (!engine || engine.isActive() || protectionWanted()) return;
+  const windowShown = windowAlive() && mainWindow.isVisible() && !mainWindow.isMinimized();
+  engine.recoverProxyAsAdmin({ windowShown }).catch(() => {});
+}
+
+/* Advanced mode as part of protection: it stops with it, comes back at the
+ * user's next Start when their Stop took it down, and a Stop wins over a
+ * start on protection's behalf still waiting for its permission prompt (the
+ * return, the autopilot's ask). The Settings panel's own start does not go
+ * through it (advanced-protection.js). */
+const advancedProtection = new AdvancedProtection({
+  active: () => !!(advanced && advanced.active),
+  start: () => startAdvanced(),
+  // After the Store apps' permission prompt, if one is on screen.
+  ready: async () => { if (storeApps) await storeApps.settled(); },
+  // Not over a full-screen game or video: asked once the user is out of it.
+  notBusy: (stop) => userBusy.until(stop),
+  // "Ask for permission by itself" off: not brought back after a game.
+  mayAsk: () => store.get('askByItself', true) !== false,
+  // An antivirus blocked it this session: not brought back by itself.
+  blocked: () => advancedBlocked,
+  stop: async () => {
+    try { await advanced.stop(); } catch {}
+    advancedState(false);
+  },
+  // Standby: the driver let go, the elevated engine kept, so it comes back
+  // with no new permission prompt (advanced-mode.js pause).
+  pause: async () => {
+    let ok = false;
+    try { ok = await advanced.pause(); } catch {}
+    advancedState(false);
+    return ok;
+  },
+  waiting: () => !!(advanced && advanced.standby),
+  // A crash restart or a settings restart under way is still protection on.
+  protectionOn: () => !!(engine && (engine.isActive() || engine.coming)),
+  antiCheat: () => Autopilot.antiCheatRunning(),
+  declined: () => { if (autopilot) autopilot.recordDecline(); },
+  tell: (id, params) => autoTell(id, params),
+  log: (level, msg) => addLog(level, msg),
+});
+// A game with an anti-cheat starting while Advanced mode runs: it steps
+// aside until the game has closed (advanced-protection.js guard). The
+// anti-cheats it is about are Windows ones; looked for only while Advanced
+// mode runs or waits.
+if (process.platform === 'win32') {
+  setInterval(() => {
+    if ((advanced && advanced.active) || advancedProtection.paused) advancedProtection.guard().catch(() => {});
+    else advancedProtection.lastGame = undefined;
+  }, 5000).unref();
+}
+
+/* Settings: "Start Advanced mode with Shroudly". Once protection is up at
+ * launch (at sign-in too), Advanced mode comes on as after the user's own
+ * Start: one permission prompt, never beside a game's anti-cheat, never over
+ * a full-screen program, not after an antivirus blocked it
+ * (advanced-protection.js comeBack). */
+function advancedAtLaunch(r) {
+  if (!r || r.success === false || store.get('advancedAtLaunch', false) !== true) return;
+  if (!advanced || advanced.active || !advanced.available()) return;
+  addLog('info', 'Advanced mode starts with Shroudly (Settings)');
+  advancedProtection.resume = true;
+  advancedProtection.started().catch(() => {});
+}
+
+/* The last start, by the user or by itself, failed (not an antivirus's
+ * doing: that has its own state): the window says so, with Repair, until a
+ * start works or the user stops protection (dpi:status failed). */
+let lastStartFailed = false;
+
+async function safeStart({ user = false } = {}) {
+  // Said in the log: a report of a stop and a start half a second apart
+  // could not tell the user's own Stop and Start from Shroudly's doing.
+  if (user) { store.set(PROTECTION_KEY, true); addLog('info', 'Start pressed by the user'); }
+  try {
+    const r = await engine.start();
+    lastStartFailed = false;
+    broadcastStatus(true);
+    // Started, but browsers are not going through it yet: said so, not "on".
+    // Said only when something is left to do: "Protection is on" at every
+    // start (at sign-in too) said what the tray icon and the window show.
+    const routed = !notRouting();
+    if (!routed) { notify('Shroudly', tr().notifyStartedNotRouted); reportFault(); }
+    syncPresence();
+    if (user) advancedProtection.started().catch(() => {});
+    // Whether this network blocks what the installed apps need, before they
+    // are opened (autopilot.js); soon: a Roblox installer a script started at
+    // login waits for this verdict. And whether Microsoft Store apps can
+    // reach Shroudly (store-apps.js).
+    setTimeout(() => { if (autopilot) autopilot.survey().catch(() => {}); }, 1000);
+    // The ad and tracker list, when that is on and there is none or it is old.
+    setTimeout(() => { ensureAdblock().catch(() => {}); }, 5000);
+    setTimeout(() => { if (storeApps) storeApps.survey().catch(() => {}); }, 3000);
+    robloxWatch.warm();
+    return { ...(r || { success: true }), routed };
+  } catch (e) {
+    // An antivirus block has its own line already (securityBlocked).
+    if (e.code !== 'security_blocked') addLog('error', `Start failed: ${e.message}`);
+    lastStartFailed = e.code !== 'security_blocked';
+    broadcastStatus(false);
+    return { success: false, error: e.message, code: e.code || null };
+  }
+}
+
+async function safeStop({ user = false } = {}) {
+  if (user) { store.set(PROTECTION_KEY, false); lastStartFailed = false; addLog('info', 'Stop pressed by the user'); }
+  // Nothing of Roblox's is stopped or started once protection is going off.
+  robloxWatch.halt();
+  // A question about Tor belongs to this session: a new one asks again.
+  torAsk = null;
+  // A settings change still waiting to be applied belongs to the session
+  // being stopped (EngineManager ignores one that slips through anyway).
+  clearTimeout(engineRestartTimer); engineRestartTimer = null;
+  clearTimeout(proxyReapplyTimer); proxyReapplyTimer = null;
+  try {
+    // The user's own stop: the only one that may ask for a macOS
+    // administrator's password, and that takes out what was written for the
+    // next login (system-proxy.js).
+    // Advanced mode is part of protection: stopping protection must also stop
+    // its packet interception, or WinDivert / NFQUEUE would keep injecting
+    // decoys into every outbound connection after the user turned protection
+    // off. (A crash or quit already stops both; this is the user's Stop.)
+    // A start on protection's behalf still waiting for its prompt is
+    // stopped when it comes up (advanced-protection.js).
+    await advancedProtection.stopped({ user });
+    await engine.stop({ user });
+    broadcastStatus(false);
+    syncPresence();
+    return { success: true };
+  } catch (e) {
+    addLog('error', `Stop failed: ${e.message}`);
+    return { success: false, error: e.message };
+  }
+}
+
+/* Quit through before-quit, which stops the engine and restores the proxy. */
+function shutdownAndQuit() {
+  app.isQuitting = true;
+  app.quit();
+}
+
+/* ── auto-start (per-OS, no elevation) ───────────────────────────────────── */
+/* Windows Run-key value name. 2.0.0 registered under Electron's default
+ * AppUserModelId; that entry is removed so it can't keep starting the app. */
+const WIN_LOGIN_ITEM = { path: process.execPath, args: [AUTOSTART_ARG], name: 'Shroudly' };
+const WIN_LEGACY_LOGIN_NAMES = ['electron.app.Shroudly', 'me.codeshare.shroudly'];
+
+/* The real executable on disk: inside an AppImage, process.execPath is a
+ * temporary mount that is gone after a reboot. */
+function launcherPath() { return process.env.APPIMAGE || process.execPath; }
+
+/* exe: what the Linux entry starts (an AppImage an update has just renamed). */
+/* macOS: a copy run from its disk image, or from Downloads (where App
+ * Translocation gives it a random read-only path): a login item, the
+ * restore agent and the updater would all point at a path that is gone
+ * once the disk image is ejected. The window offers the move to
+ * Applications (BlockedNotice), and nothing is registered for login until
+ * then. */
+function outsideApplications() {
+  if (process.platform !== 'darwin' || !app.isPackaged) return false;
+  try { return !app.isInApplicationsFolder(); } catch { return false; }
+}
+
+function setAutoStart(enable, exe = launcherPath()) {
+  try {
+    if (process.platform === 'win32') {
+      for (const name of WIN_LEGACY_LOGIN_NAMES) app.setLoginItemSettings({ openAtLogin: false, path: process.execPath, name });
+      app.setLoginItemSettings({ ...WIN_LOGIN_ITEM, openAtLogin: enable });
+      return true;
+    }
+    if (process.platform === 'darwin') {
+      // Kept as the user's choice (the setting) and registered after the move.
+      if (enable && outsideApplications()) return true;
+      app.setLoginItemSettings({ openAtLogin: enable });
+      return true;
+    }
+    const dir = path.join(app.getPath('home'), '.config', 'autostart');
+    const file = path.join(dir, 'shroudly.desktop');
+    if (enable) {
+      const q = (a) => `"${String(a).replace(/(["`$\\])/g, '\\$1')}"`;
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(file,
+        `[Desktop Entry]\nType=Application\nName=Shroudly\nExec=${q(exe)} ${AUTOSTART_ARG}\nX-GNOME-Autostart-enabled=true\n`);
+    } else if (fs.existsSync(file)) {
+      fs.unlinkSync(file);
+    }
+    return true;
+  } catch (e) {
+    addLog('error', `Auto-start: ${e.message}`);
+    return false;
+  }
+}
+
+function getAutoStartEnabled() {
+  if (process.platform === 'linux') {
+    return fs.existsSync(path.join(app.getPath('home'), '.config', 'autostart', 'shroudly.desktop'));
+  }
+  try { return app.getLoginItemSettings(process.platform === 'win32' ? WIN_LOGIN_ITEM : undefined).openAtLogin && !windowsStartupOff(); } catch { return false; }
+}
+
+/* Windows: start at login turned off in Task Manager or Settings (launch.js,
+ * startupTurnedOff). Re-registering the entry at every launch turned it
+ * back on behind the user's back, Shroudly's own switch still said "on",
+ * and at a logoff Discord's line was kept for a login at which Shroudly
+ * would not start. */
+function windowsStartupOff() {
+  if (process.platform !== 'win32') return false;
+  try { return Launch.startupTurnedOff(app.getLoginItemSettings(WIN_LOGIN_ITEM), WIN_LOGIN_ITEM.name); } catch { return false; }
+}
+
+/* ── app ready ───────────────────────────────────────────────────────────── */
+/* The application menu. Electron's own came with every build: View with
+ * Reload (a blank window for a moment, the panel state lost), Toggle
+ * Developer Tools, zoom and full screen, and their shortcuts (Cmd/Ctrl+R,
+ * Ctrl+Shift+I) working on Linux too. macOS keeps what every Mac app has:
+ * the app menu (About, Hide, Quit) and Edit, so copy and paste work in the
+ * window; Windows and Linux have none. */
+/* macOS: the menu bar in the user's language (Electron's own is English
+ * whatever the language, with View → Toggle Developer Tools in it); built
+ * again on a language change. None on Windows and Linux. */
+function setAppMenu() {
+  if (process.platform !== 'darwin') { Menu.setApplicationMenu(null); return; }
+  const s = tr();
+  Menu.setApplicationMenu(Menu.buildFromTemplate([{ label: 'Shroudly', submenu: [
+    { role: 'about', label: s.menuAbout }, { type: 'separator' },
+    { role: 'hide', label: s.menuHide }, { role: 'hideOthers', label: s.menuHideOthers }, { role: 'unhide', label: s.menuShowAll },
+    { type: 'separator' }, { role: 'quit', label: s.quitApp },
+  ] }, { label: s.menuEdit, submenu: [
+    { role: 'undo', label: s.menuUndo }, { role: 'redo', label: s.menuRedo }, { type: 'separator' },
+    { role: 'cut', label: s.menuCut }, { role: 'copy', label: s.supportCopy }, { role: 'paste', label: s.menuPaste },
+    { role: 'selectAll', label: s.menuSelectAll },
+  ] }, { role: 'windowMenu', label: s.menuWindow, submenu: [
+    { role: 'minimize', label: s.menuMinimize }, { role: 'close', label: s.close },
+  ] }]));
+}
+
+// The end-to-end test connects two windows of the app over WebRTC on a CI
+// machine that may have no mDNS responder: local addresses shown as they are
+// there (the app itself keeps Chromium's default, which hides them).
+if (process.env.SHROUDLY_E2E === '1') app.commandLine.appendSwitch('disable-features', 'WebRtcHideLocalIpsWithMdns');
+
+app.whenReady().then(async () => {
+  setAppMenu();
+  // Before anything reads the settings: a damaged file, a new install, and
+  // protection from a version that let Auto mode decide (settings-file.js).
+  SettingsFile.settle(store, { ...settingsOpened, packaged: app.isPackaged, autoStartNow: getAutoStartEnabled, log: addLog });
+  // Started with another version than last time: the main window says once
+  // what changed (whats-new.js). Tests see the card only when they ask.
+  if (process.env.SHROUDLY_E2E !== '1' || process.env.SHROUDLY_E2E_WHATS_NEW === '1') {
+    WhatsNew.note(store, { current: appVersion(), firstRun: !!settingsOpened.firstRun, text: i18n.strings('en').whatsNewDesktop });
+  }
+  // Settings that cannot be written (a full disk, a folder not writable):
+  // kept for this run instead of ending it (settings-file.js), said once.
+  // The system's temporary folder, made again if a cleaning program deleted
+  // it; and the folders Shroudly writes in, looked at when a write fails.
+  ensureTmp();
+  writeGuard = new WriteGuard({ dirs: [app.getPath('userData')], log: addLog });
+  const unsaved = (e) => { addLog('warning', `Settings cannot be saved (${(e && (e.code || e.message)) || 'unknown'}); changes last until Shroudly closes`); try { writeGuard.note(e); } catch {} };
+  if (settingsOpened.unsaved) unsaved(settingsOpened.unsaved);
+  else settingsOpened.onUnsaved = unsaved;
+  // A data folder chosen earlier that cannot be used this run (data-dir.js).
+  if (dataPlace.problem) addLog('warning', DataDir.problemLine(dataPlace.problem));
+  else if (dataPlace.how !== 'default') addLog('info', `Data folder: ${dataPlace.how === 'portable' ? 'portable, next to the program' : 'chosen in Settings'} (${dataPlace.dir})`);
+  // Turned off in Windows itself: off here too, and left off (the switch in
+  // Settings turns it on again, for Windows as well).
+  if (store.get('autoStart', false) === true && windowsStartupOff()) {
+    try { store.set('autoStart', false); } catch {}
+    addLog('info', 'Start at login is turned off in Windows; Shroudly leaves it off');
+  }
+  const restoreCommand = {
+    exe: launcherPath(),
+    args: app.isPackaged ? [RESTORE_PROXY_ARG] : [app.getAppPath(), RESTORE_PROXY_ARG],
+  };
+  // The engine binary in its watchdog mode, which runs restoreCommand should
+  // Shroudly vanish with something applied (watchdog.js).
+  const watchdog = {
+    core: EngineManager.coreBinaryPath(),
+    restore: { exe: restoreCommand.exe, args: [...restoreCommand.args, FROM_WATCHDOG_ARG] },
+    copyDir: app.getPath('userData'),
+    // Ended with its file gone: an antivirus took the engine (watchdog.js).
+    onCoreGone: (core) => securityBlocked({
+      part: 'engine', kind: 'missing', file: path.basename(core), detail: 'the watchdog was ended with it',
+      folder: app.isPackaged ? SecurityBlock.installFolder() : path.dirname(core),
+    }, { quiet: true }),
+  };
+  watchdogOpts = watchdog;
+  siteList = new SiteList({
+    cacheFile: path.join(app.getPath('userData'), 'site-list.json'),
+    log: addLog,
+    getSocksPort: () => (engine && engine.isActive() ? engine.port : null),
+  });
+  ownSitesOnly();
+  adblockList = new AdblockList({ dir: app.getPath('userData'), connect: DiscordRelay.socksConnect });
+  // The remote settings first: the engine and Tor read them (remote-config.js).
+  if (!remoteConfig) startRemoteConfig();
+  // The last way out (tor-route.js): Tor through Snowflake, for a site
+  // nothing else opened; started by the engine's need of it.
+  let torWasReady = false;
+  const torRoute = new TorRoute({
+    dataDir: app.getPath('userData'), log: addLog, remote: remoteSettings,
+    // The bridges the Tor Project gives out for this country, asked through
+    // Shroudly's own server (bridges.torproject.org is blocked where they
+    // are needed), through the engine while it runs (tor-route.js).
+    countryBridges: async () => {
+      const j = await netJson('https://shroudly.codeshare.me/v1/bridges', 20000);
+      return j && j.bridges && typeof j.bridges === 'object' ? j.bridges : null;
+    },
+    onChange: () => {
+      toWindow('dpi:status-changed', !!(engine && engine.isActive()));
+      // Ready: what the user sends through Tor (sites, apps) and opened
+      // before it was is ended once, so the app connects again through it
+      // (a browser keeps a connection made the usual way for minutes).
+      const ready = torRoute.state === 'ready';
+      if (ready && !torWasReady && engine && engine.isActive()) engine.torReady();
+      torWasReady = ready;
+    },
+    // Fetched the first time it is needed (issue #75), through the engine
+    // while it runs, so a network that blocks torproject.org does not stop it.
+    // Not on Windows 7 and 8: the Tor Project's Tor no longer runs there
+    // (torOldWindows), so there is nothing to fetch.
+    fetch: torUnsupported() ? null : (dir, onProgress) => TorDownload.ensure(dir, {
+      socksPort: engine && engine.isActive() ? engine.port : 0,
+      connect: (port, host, p) => (port ? DiscordRelay.socksConnect(port, host, p) : new Promise((resolve, reject) => {
+        const sock = require('net').connect(p, host, () => resolve(sock)); sock.once('error', reject);
+      })),
+      onProgress, log: addLog,
+    }),
+  });
+  engine = new EngineManager(store, {
+    addLog, onStatusChange: broadcastStatus, torRoute,
+    // The remote settings: technique arguments and decoys (remote-config.js).
+    remote: remoteSettings,
+    // Tor needed, not yet allowed: the user is asked (askTor).
+    onTorAsk: (host) => askTor(host),
+    // An antivirus took, refused or keeps ending the engine.
+    onSecurityBlock: (info) => securityBlocked(info),
+    // "Block ads and trackers": the list in use, once one has been fetched.
+    adblockFile: () => (adblockList && adblockList.has() ? adblockList.file : null),
+    // The file naming the user's own server goes here (own-server.js).
+    dataDir: app.getPath('userData'),
+    siteList: () => siteList.domains,
+    // A site still blocked while Advanced mode is on: nothing to suggest.
+    advancedOn: () => !!(advanced && advanced.active),
+    // One line per unreachable host every half hour, wherever it comes from
+    // (the engine, Games and apps, the Discord relay).
+    logGate,
+    // Connections under the domain of Discord's voice servers, told to the
+    // autopilot, which takes one to a voice server's own name for a call
+    // starting, in the app or a browser (autopilot.js).
+    watch: Autopilot.WATCH,
+    proxyOptions: {
+      stateFile: proxyStateFile(), watchdog,
+      // Not from a disk image or a translocated copy (outsideApplications):
+      // the login agent would point at a path gone after the eject.
+      restoreCommand: outsideApplications() ? null : restoreCommand,
+      // macOS's administrator password dialog says why Shroudly asks, in the
+      // user's language once main-i18n.js has these strings; system-proxy.js
+      // falls back to English.
+      adminPrompt: (kind) => tr()[kind === 'restore' ? 'proxyAdminPromptRestore' : 'proxyAdminPrompt'],
+    },
+    onProbe: (p) => { onProbeResult(p).catch(() => toWindow('dpi:probe-result', p)); },
+    // What the window should say about this network: another VPN running,
+    // the kind of filtering detected, sites that connect and are then cut,
+    // encrypted DNS blocked.
+    onAdvice: (advice) => {
+      toWindow('dpi:advice', advice);
+    },
+    // A cut the engine believes (enough of them, not one stalled connection,
+    // nor a link that went quiet), still standing a few seconds later (not
+    // a moment when other sites went quiet too, nor a move to another
+    // network): about a service the autopilot looks after, and what Advanced
+    // mode is for.
+    onCut: (host) => {
+      if (!autopilot) return;
+      autopilot.noteHost('cut', host, { believed: true });
+      if (aroundWatch) aroundWatch.note('cut', host, { believed: true });
+      autopilot.needAdvanced(host).catch(() => {});
+    },
+    // Which networks this computer is on: a cut told just after a move to
+    // another one is the move's doing (engine-manager.js, SILENT_CUTS).
+    networkPrint: () => networkFingerprint(),
+    // Encrypted DNS was switched back on because a site could not be reached
+    // without it. The settings screen has to show the new state.
+    onDnsAutoEnabled: (host) => {
+      toWindow('dpi:dns-auto-enabled', { host });
+    },
+
+    // Programs that were already open when protection started are still using
+    // the connection they were given at launch.
+    onNeedRestart: (apps) => {
+      // Shown inside the window only. As a system notification this reads like
+      // something has gone wrong with the program it names, which is alarming
+      // and untrue — nothing happened to it, it simply started before the
+      // protection did.
+      toWindow('dpi:need-restart', { apps });
+    },
+
+    // What really happened to the system proxy (system-proxy.js): set, needs
+    // an administrator (macOS standard account), not possible on this desktop,
+    // refused, or taken over by another program. Shown in the window.
+    // The status in the window and the tray follows it ("Not working yet").
+    onProxyStatus: (st) => {
+      toWindow('dpi:proxy-status', st);
+      rebuildTrayMenu();
+      toWindow('dpi:status-changed', !!(engine && engine.isActive()));
+    },
+    // macOS: settings from before a restart still waiting for an
+    // administrator's password, after the user dismissed its dialog.
+    onProxyRecovery: (r) => toWindow('dpi:proxy-recovery', r),
+    // An app's own connections (not TLS or HTTP) that cannot get through:
+    // named and told in one line (raw-apps.js).
+    onRaw: (kind, msg) => { if (rawWatch) rawWatch.onEvent(kind, msg).catch(() => {}); },
+    // A server that cut a connection after its handshake: Advanced mode, when
+    // on, sends its next connections the stronger way (advanced-mode.js).
+    onCutAddr: (addr, host) => { if (advanced && advanced.active) advanced.escalate(addr, host); },
+    // Which services this network filters (the autopilot turns on the mode
+    // their app needs), and a site whose connections keep being answered and
+    // then cut: the site may be turning the user away itself (checked, then
+    // explained). Only once the cuts are as many as the engine needs before
+    // it believes them (one means little), and only for a site's own page:
+    // a CDN, API or storage host answers / with an error page of its own.
+    onHostEvent: (kind, host, detail, info) => {
+      if (kind === 'fallback') torUsed(host);
+      if (autopilot) autopilot.noteHost(kind, host, info || { note: detail });
+      if (aroundWatch) aroundWatch.note(kind, host, info || { note: detail });
+      if (kind === 'unreachable' && detail === 'connect') checkServiceReach(host).catch(() => {});
+      if (kind === 'cut' && repeatedCut(host, detail) && ServiceCheck.isMainName(host)) checkServiceOnce(host).catch(() => {});
+    },
+    // A site that defeated every technique. Told once per site, and at most
+    // once every few minutes, so a page full of blocked resources cannot turn
+    // into a stream of notifications.
+    onSiteBlocked: (host) => {
+      // The autopilot first: its line about Advanced mode reaches the window
+      // before the site does. The window shows its own offer only when the
+      // autopilot does not ask (declined earlier, turned off by hand, asked
+      // already this session). Not held back by the pause between
+      // notifications below: the autopilot asks once a session anyway, and
+      // the site that needs it (Discord's gateway, say) may come minutes
+      // after another site was told.
+      const asked = !!(autopilot && autopilot.willAskAdvanced());
+      if (asked) autopilot.needAdvanced(host).catch(() => {});
+      // Nothing else left (Advanced mode on, or not to be had) and the last
+      // way out turned off: the Tor question again, now and then, instead of
+      // "keeps trying" (askTorAgain).
+      const nothingElse = !asked && (!(advanced && advanced.available()) || (advanced && advanced.active));
+      if (nothingElse && askTorAgain(host)) return;
+      // The question resting: said in the window that Tor, turned off in
+      // Settings, is what opens it, not that Shroudly "keeps trying".
+      if (nothingElse && tellTorOff(host)) return;
+      const now = Date.now();
+      if (now - lastBlockedNotice < 5 * 60 * 1000) return;
+      lastBlockedNotice = now;
+      // With Advanced mode already on there is nothing to suggest: it is
+      // still being tried.
+      // Without Advanced mode on this computer (macOS, or Windows and Linux
+      // where it cannot run), it is not offered either.
+      const advOn = !!(advanced && advanced.active);
+      const advCan = !!(advanced && advanced.available());
+      const body = advOn ? tr().notifySiteBlockedBodyAdvancedOn : advCan ? tr().notifySiteBlockedBody : tr().notifySiteBlockedBodyNoAdvanced;
+      notifyAuto(body.replace('{host}', host), tr().notifySiteBlockedTitle);
+      // Waits in the window for the next time it is opened (a click on the
+      // notification opens it); it never takes the screen from a game.
+      toWindow('dpi:site-blocked', { host, asked });
+    },
+  });
+  // Windows: the running programs and their connections from the engine
+  // while it runs, instead of tasklist.exe and netstat.exe (procnet.js).
+  if (process.platform === 'win32') {
+    ProcNet.setNative({
+      procs: () => (engine ? engine.nativeList('PROCS') : Promise.resolve(null)),
+      tcp: () => (engine ? engine.nativeList('TCP') : Promise.resolve(null)),
+    });
+  }
+  // "Share my connection": what the people sharing open goes through the
+  // engine while protection is on. On again at start when the user left it on.
+  share = new Share({
+    store, log: addLog, socksPort: () => (engine && engine.isActive() ? engine.port : null),
+    // The end-to-end test: on this computer only, and the test machine's
+    // router never asked to open anything.
+    ...(process.env.SHROUDLY_E2E === '1' ? { bindHost: '127.0.0.1', lan: () => ['127.0.0.1'], own: () => [], upnp: { map: async () => ({ ok: false, why: 'not asked in tests' }), unmap: async () => {} } } : {}),
+  });
+  if (store.get('shareOn') === true) share.start().catch((e) => addLog('warning', `Sharing this connection could not start: ${e.message}`));
+  // "Help people in censored countries" (snowflake.js): a Snowflake proxy for
+  // Tor, on again at start when the user left it on.
+  let snowflakeTest = null;
+  if (process.env.SHROUDLY_E2E === '1' && process.env.SHROUDLY_SNOWFLAKE_TEST) { try { snowflakeTest = JSON.parse(process.env.SHROUDLY_SNOWFLAKE_TEST); } catch {} }
+  snowflake = new Snowflake({ store, log: addLog, test: snowflakeTest });
+  if (store.get('snowflakeOn') === true) {
+    if (helpHidden()) addLog('info', 'Helping people in censored countries: not run here, Tor itself is blocked in this country');
+    else snowflake.start().catch((e) => addLog('warning', `Helping people in censored countries could not start: ${e.message}`));
+  }
+  advanced = new AdvancedMode(addLog);
+  // The backend ended by itself: the window must not keep saying it is on.
+  advanced.onExit = () => advancedState(false);
+  // Ended from outside while it ran, its files gone with it.
+  advanced.onSecurityBlock = (info) => securityBlocked(info);
+  // Protection as the user left it (see safeStart and below). Recovery needs
+  // it: with protection off, what was written for the next login goes.
+  const protectionOn = protectionWanted();
+  // Whatever goes wrong putting back what a previous run left, the tray,
+  // the window and protection still come up.
+  try { await engine.recover({ protectionOn }); } catch (e) { addLog('warning', `Recovery at start failed: ${e.message}`); }
+
+  // The relay goes through the engine while protection is on, straight to
+  // Discord while it is off, and runs whenever Shroudly does.
+  discordRelay = new DiscordRelay(addLog, () => (engine && engine.isActive() ? engine.port : null));
+  discordRelay.waitForEngine = waitForEngine;
+  discordRelay.engineDue = engineComing;
+  discordRelay.logGate = logGate;
+  if (store.get('discordMode') === true) applyDiscordMode(true, { interactive: false }).catch(() => {});
+
+  // Like the relay: through the engine while protection is on, direct while
+  // it is off, and up whenever Shroudly is with the mode on.
+  appProxy = new AppProxy(addLog, () => (engine && engine.isActive() ? engine.port : null), isRouted);
+  appProxy.waitForEngine = waitForEngine;
+  appProxy.engineDue = engineComing;
+  appProxy.logGate = logGate;
+  appProxy.onTunnel = onAppTunnel;
+  appProxy.onRequest = onAppRequest;
+  appEnv = new AppEnv({ stateFile: appEnvStateFile(), watchdog });
+  createAutopilot();
+  createStoreApps();
+  // The end-to-end tests look inside (tests/e2e): never in a normal run.
+  if (process.env.SHROUDLY_E2E === '1') global.shroudlyE2E = { engine, appProxy, discordRelay, autopilot, wake, store, addLog, require, trayCopyLogs: () => trayCopyLogs(tr()), saveLogs, share, snowflake };
+
+  updater = new Updater({
+    log: addLog,
+    store,
+    // "will restart to install it", or "open Shroudly to install it": an
+    // install that asks for a password (a Linux package) or an
+    // administrator's permission (Windows, installed for everyone), which
+    // only the button starts.
+    // Only when installing it needs the user (a password, an administrator):
+    // an update that installs itself at the next restart is the window's
+    // banner, not a notification.
+    notify: (version, kind) => { if (kind === 'password' || kind === 'admin') notify('Shroudly', (kind === 'password' ? tr().notifyUpdatePassword : tr().notifyUpdateAdmin).replace('{version}', version)); },
+    // macOS, Applications not this account's to change: what the password
+    // dialog says it is for.
+    adminPrompt: (version) => tr().updAdminPrompt.replace('{version}', version),
+    // What a restart would interrupt: the Roblox player or Studio and
+    // Discord, while their mode sends them through Shroudly and protection
+    // is on.
+    busy: () => Updater.inUse({
+      protection: !!(engine && engine.isActive()),
+      appMode: store.get('appMode') === true,
+      discordMode: store.get('discordMode') === true,
+      // A list that could not be read counts as in use: better to wait.
+      robloxPlaying: async () => { const p = await RobloxApp.pids(); const s = await RobloxApp.pids('studio'); return !p || !s || p.length > 0 || s.length > 0; },
+      discordOpen: async () => { for (const v of DiscordApp.installed()) { if (await DiscordApp.isRunning(v)) return true; } return false; },
+    }),
+    // A full-screen game or video while protection is on.
+    fullScreen: async () => !!(engine && engine.isActive()) && userBusy.fullScreen(),
+    // A game going on, with protection on or off: the Roblox player open, or
+    // any full-screen program in front. No update is downloaded by itself
+    // meanwhile (it would take the line the game needs).
+    playing: async () => {
+      try { const p = await RobloxApp.pids(); if (p && p.length > 0) return true; } catch {}
+      return userBusy.fullScreen();
+    },
+    // Installing quits the app: stop the engine first so the system proxy is
+    // put back, exactly as on a normal quit.
+    beforeInstall: async () => {
+      // Back the way it was: the window only if it was open on screen.
+      try { store.set('afterUpdate', Launch.afterUpdateRecord(windowAlive() && mainWindow.isVisible() && !mainWindow.isMinimized(), appVersion())); } catch {}
+      lineBeforeUpdate = keepDiscordLine;
+      exitInProgress = true;
+      keepDiscordLine = true;
+      app.isQuitting = true;
+      try { await engine.stop(); } catch {}
+      // As the user's own Stop: should the install not happen, Advanced mode
+      // comes back with their next Start, without a permission prompt now.
+      try { await advancedProtection.stopped({ user: true }); } catch {}
+      // Not left on standby: its program must not be running while the
+      // installer replaces it.
+      if (advanced && advanced.standby) { try { await advanced.stop(); } catch {} }
+    },
+    // The install did not happen (a folder it cannot write to, an installer
+    // that would not start): Shroudly carries on as before the install began,
+    // protection back on, the window's close button hiding it again.
+    onInstallFailed: () => {
+      exitInProgress = false;
+      app.isQuitting = false;
+      keepDiscordLine = lineBeforeUpdate;
+      try { store.delete('afterUpdate'); } catch {}
+      if (protectionWanted() && engine && !engine.isActive()) safeStart().catch(() => {});
+    },
+    // An AppImage update keeps this file's place and name (updater.js); should
+    // electron-updater ever put it under another name, "Start at login"
+    // follows it at once (this runs on the way out; the next start
+    // re-registers it anyway).
+    onAppImageMoved: (file) => { if (store.get('autoStart', false)) setAutoStart(true, file); },
+  });
+  updater.onState((s) => {
+    toWindow('update:state', s);
+  });
+
+  const trayChecked = createTray();
+  watchSessionEnd();
+  // Started at login into the tray, or back from an update installed while
+  // the window was closed: no window at all until it is opened, where the
+  // tray icon can be seen (launch.js). The update's note is read once, and
+  // only by the copy that update started.
+  await trayChecked;
+  const afterUpdate = store.get('afterUpdate');
+  if (afterUpdate !== undefined) store.delete('afterUpdate');
+  // Opened again by an update that failed after this copy had quit (the
+  // macOS swap, the Windows installer refused its permission), the same
+  // version still: as after an update, not as a start by hand.
+  const updateFailed = process.argv.includes(Updater.UPDATE_FAILED_ARG);
+  const relaunched = Launch.isUpdateRelaunch(afterUpdate, appVersion(), Date.now(), { failed: updateFailed });
+  const how = Launch.startWindow({
+    autoStart: isAutoStartLaunch(), minimizeToTray: store.get('minimizeToTray', true),
+    afterUpdate: relaunched ? afterUpdate : null, trayShown: canLeave(),
+  });
+  if (how === 'tray') { setDockIcon(false); addLog('info', 'Auto-started in tray'); }
+  // Back from an update with the window that was open: shown where it was,
+  // without taking the screen from a game or film in front.
+  else await createWindow({ show: true, minimised: how === 'minimised', quiet: relaunched });
+  addLog('success', 'Application started');
+  // Kept for the next time the settings file is found damaged.
+  SettingsFile.keepCopy(app.getPath('userData'));
+  if (windowsPathFixed) addLog('info', "Windows' own folders were missing from PATH or not first; Shroudly put them first for itself");
+  updater.start();
+  // Roblox installers downloaded in an earlier run have done their work.
+  if (process.platform === 'win32') RobloxApp.cleanDownloads(path.join(app.getPath('userData'), 'roblox'));
+
+  // After the window is up: on Windows this writes the registry, which takes
+  // a moment the window should not wait for.
+  if (store.get('appMode') === true && appModeSupported()) applyAppMode(true).catch(() => {});
+  else if (appModeSupported()) {
+    // Left by a run that never got to clean up. Ours are known by their mark,
+    // so they go even when the state file did not survive (a profile reset,
+    // a disk image taken while Shroudly ran).
+    try { if (AppEnv.recoverSync({ stateFile: appEnvStateFile() })) addLog('info', 'Games and apps: a setting left by an earlier run was removed'); } catch {}
+  }
+
+  /* The live counter is the one thing Shroudly sends on its own, and whoever
+   * is filtering this connection can see where it goes. For someone using this
+   * because their government blocks sites, a request to our domain is a signal
+   * that they run circumvention software — which is precisely what they came
+   * here to avoid.
+   *
+   * So it only runs while protection is on, which means it travels the same
+   * protected path as everything else rather than announcing itself in the
+   * clear beforehand, and it can be switched off outright. The number is worth
+   * having; it is not worth more than the safety of the people it counts. */
+  presence = new Presence({
+    onCount: (n) => toWindow('presence:count', n),
+  });
+  syncPresence();
+
+  // Re-register every launch so the entry always points at this install
+  // (moved app, updated AppImage, 2.0.0's broken Linux entry, legacy names).
+  setAutoStart(store.get('autoStart', false));
+
+  // Protection as the user left it with Start or Stop (see safeStart),
+  // whatever Auto mode is set to. Independent of the window, which may never
+  // be opened this session.
+  if (protectionOn) {
+    addLog('info', 'Starting protection, as it was left');
+    // An update that has waited its limit for a game or a call installs
+    // first, while nothing goes through Shroudly yet (updater.js); should
+    // the install not get as far as quitting, protection starts anyway,
+    // unless the user pressed Stop in the meantime (or the failed install
+    // has started it already: onInstallFailed).
+    launchStartPending = true;
+    const installing = await updater.installBeforeProtection().catch(() => false);
+    setTimeout(() => {
+      const started = protectionWanted() && !engine.isActive() ? safeStart() : null;
+      Promise.resolve(started).then(advancedAtLaunch).catch(() => {}).finally(() => { launchStartPending = false; });
+    }, installing ? 60000 : 1200);
+  } else {
+    // macOS: a proxy set with an administrator's password that the previous
+    // run could not put back (the Mac restarted under it). Asked with the
+    // window on screen (now, or when it is first opened), asynchronously;
+    // skipped when protection starts, whose own password request covers it.
+    setTimeout(askProxyRecovery, 1500);
+  }
+
+  // Protection left on that is not running (a start at login that timed
+  // out, a crash restart that failed): started again by itself
+  // (protection-keeper.js), unless an antivirus blocked the engine.
+  keeper = new ProtectionKeeper({
+    due: () => !exitInProgress && !app.isQuitting && !!engine && protectionWanted() && !engine.isActive() && !engineComing()
+      && !(engine.advice.security && engine.advice.security.part === 'engine'),
+    start: () => safeStart(),
+    log: addLog,
+    onFirst: () => notify('Shroudly', tr().notifyProtectionRetrying),
+  });
+  keeper.begin();
+  startedUp = true;
+
+  if (isDev) {
+    const { globalShortcut } = require('electron');
+    globalShortcut.register('F12', () => mainWindow && mainWindow.webContents.toggleDevTools());
+  }
+
+  app.on('activate', () => showWindow());
+  // The chosen logo back on the Dock whenever macOS may have made its tile
+  // anew (reapplyLogoSoon).
+  app.on('did-become-active', () => reapplyLogoSoon());
+  app.on('browser-window-focus', () => reapplyLogoSoon());
+});
+
+app.on('window-all-closed', () => { /* keep running in tray */ });
+
+/* Logoff / shutdown / reboot: the OS may kill us before before-quit finishes,
+ * so put the proxy back synchronously right away (reg.exe, networksetup,
+ * gsettings: all fast). The login hook covers the case where even this
+ * doesn't get to run. */
+/* Discord's line stays across logout and shutdown only when Shroudly starts
+ * by itself at the next login, so a Discord that starts then does not race it.
+ * Without that, a Discord opened next time would wait on "Checking for
+ * updates" for a Shroudly that is not coming: the line goes, as on a quit. */
+function discordLineOutlivesSession() { return store.get('autoStart', false) === true && !windowsStartupOff(); }
+
+function restoreForSessionEnd() {
+  keepDiscordLine = discordLineOutlivesSession();
+  if (!keepDiscordLine && store.get('discordMode') === true) {
+    try { patchDiscordSync(null); } catch {}
+    // Not put back by healDiscordLine in the moments left.
+    if (discordRelay) discordRelay.stop();
+  }
+  // Unlike Discord's line, HTTPS_PROXY would be read by every program at the
+  // next login, before Shroudly is back: it goes, and returns when we do. It
+  // goes first: the system may end us at any moment now.
+  try { if (appEnv && appEnv.applied) appEnv.clearSync(); } catch {}
+  try { if (flatpakEnv && flatpakEnv.applied) flatpakEnv.clearSync(); } catch {}
+  try { engine && engine.cleanupSync(); } catch {}
+  try { advanced && advanced.cleanupSync(); } catch {}
+}
+app.on('session-end', restoreForSessionEnd); // Windows
+app.whenReady().then(() => { powerMonitor.on('shutdown', restoreForSessionEnd); }); // macOS, Linux
+
+/* ── sleep, wake and clock changes (wake.js) ─────────────────────────────── */
+/* The system says it woke up; a timer that ran late or a clock that jumped
+ * says the same where it does not (macOS DarkWake, a frozen main process, a
+ * clock set by hand or by NTP). Every "nothing for N seconds" starts afresh:
+ * the engine is not taken for hung, encrypted DNS not for blocked, a Roblox
+ * program not for one going around Shroudly, an update countdown that ran
+ * out asleep starts again, and no service is judged until the network is
+ * back. Said once in the log. */
+let lastWakeLog = 0;
+function onWake(why) {
+  try { if (engine) engine.doh.resumed(); } catch {}
+  try { if (autopilot) autopilot.resumed(); } catch {}
+  try { robloxWatch.resumed(); } catch {}
+  try { if (updater) updater.resumed(); } catch {}
+  markActive();
+  // Programs (VPN clients among them) set their proxy again at a wake: the
+  // setting is read again soon, a takeover then counting from one.
+  if (engine) engine.checkProxySoon();
+  // What the network before the sleep answered is not kept either.
+  if (engine) engine.networkChanged();
+  if (keeper) keeper.poke().catch(() => {});
+  const now = Date.now();
+  if (now - lastWakeLog > 60000) {
+    lastWakeLog = now;
+    addLog('info', `The computer woke up or its clock changed (${why}); waiting times start afresh`);
+  }
+}
+wake.on('resume', onWake);
+wake.start();
+app.whenReady().then(() => {
+  powerMonitor.on('resume', () => { if (engine) engine.resumed(); else wake.resumed('system'); });
+  // Back at the computer: the window is in use, not idle for the time the
+  // screen was locked.
+  powerMonitor.on('unlock-screen', () => markActive());
+});
+
+/* Every way of quitting (Cmd+Q, Dock, tray, menu, updater) lands here. Mark
+ * the app as quitting first: otherwise the window's close handler turns the
+ * quit into "minimize to tray" and the app never exits (Cmd+Q on macOS while
+ * protection was off). Restoring the proxy is capped so a slow system call
+ * can't hold the quit hostage; the 'exit' handler still restores it
+ * synchronously as a last resort. */
+const QUIT_RESTORE_LIMIT_MS = 5000;
+app.on('before-quit', (e) => {
+  app.isQuitting = true;
+  // Nothing of Roblox's is stopped or started while Shroudly quits.
+  robloxWatch.halt();
+  robloxWatch.stop();
+  // Quitting on purpose: take the line out of Discord's settings, so Discord
+  // started without Shroudly goes to Discord directly, exactly as before.
+  if (!keepDiscordLine && store.get('discordMode') === true) {
+    try { patchDiscordSync(null); } catch {}
+    if (discordRelay) discordRelay.stop();
+  }
+  // Programs started after Shroudly has gone must go straight out again.
+  try { if (appEnv && appEnv.applied) appEnv.clearSync(); } catch {}
+  try { if (flatpakEnv && flatpakEnv.applied) flatpakEnv.clearSync(); } catch {}
+  // Those started before still have the address: named, to be restarted.
+  tellAppUsers();
+  if (appProxy) appProxy.stop();
+  // The router's way in for the share is taken away (upnp.js).
+  if (share && share.on) share.stop().catch(() => {});
+  if (snowflake && snowflake.on) snowflake.stop().catch(() => {});
+  if (presence && !presence.stopped) presence.leave();
+  try { updater && updater.installOnQuit(); } catch {}
+  if (exitInProgress) return;
+  const engineOn = engine && engine.isActive();
+  const advancedOn = advanced && (advanced.active || advanced.standby);
+  if (!engineOn && !advancedOn) return;
+  e.preventDefault();
+  exitInProgress = true;
+  addLog('info', 'Restoring system before exit...');
+  const stops = Promise.allSettled([engineOn ? engine.stop() : null, advancedOn ? advanced.stop() : null]);
+  Promise.race([stops, new Promise((r) => setTimeout(r, QUIT_RESTORE_LIMIT_MS))]).then(() => app.quit());
+});
+
+/* ── IPC ─────────────────────────────────────────────────────────────────── */
+ipcMain.on('window:minimize', () => { if (windowAlive()) mainWindow.minimize(); });
+ipcMain.on('window:maximize', () => {
+  if (!windowAlive()) return;
+  mainWindow.isMaximized() ? mainWindow.unmaximize() : mainWindow.maximize();
+});
+ipcMain.on('window:close', () => {
+  if (!windowAlive()) return;
+  if (canLeave()) { sentAway.add(mainWindow); mainWindow.hide(); } else mainWindow.minimize();
+});
+// Quit from the window itself, for desktops that show no tray icon.
+ipcMain.on('app:quit', () => { app.isQuitting = true; shutdownAndQuit(); });
+/* The interface reports use (throttled) and when it is listening. */
+ipcMain.on('ui:active', (e) => { if (windowAlive() && e.sender === mainWindow.webContents) markActive(); });
+ipcMain.on('ui:ready', (e) => {
+  if (!windowAlive() || e.sender !== mainWindow.webContents) return;
+  uiReady = true;
+  for (const [channel, payload] of pending) { try { mainWindow.webContents.send(channel, payload); } catch {} }
+  pending.clear();
+});
+
+ipcMain.handle('dpi:advice', () => (engine ? engine.advice : null));
+ipcMain.handle('proxy:status', () => (engine ? engine.proxyStatus : null));
+// macOS standard account: an administrator allows it once.
+ipcMain.handle('proxy:applyAsAdmin', async () => (engine ? engine.applyProxyAsAdmin() : { ok: false, code: 'not_active' }));
+// Taken over by another program, or could not be set ("Try again"): point
+// the system at Shroudly again. Says what came of it (a password dialog
+// dismissed is not "set again").
+ipcMain.handle('proxy:reapply', async () => {
+  if (!engine || !engine.isActive()) return { ok: false, code: 'not_active' };
+  try {
+    const st = (await engine.reapplyProxy({ userAsked: true }) || {}).status;
+    return { ok: !!(st && st.ok), code: st ? st.code : 'not_active' };
+  } catch (e) { return { ok: false, code: 'failed', detail: e.message }; }
+});
+// macOS: settings from before a restart, still waiting for an
+// administrator's password after the user dismissed the dialog once.
+ipcMain.handle('proxy:recovery', () => (engine ? engine.proxyRecovery : null));
+ipcMain.handle('proxy:recoverAsAdmin', async () => ({ ok: engine ? await engine.recoverProxyAsAdmin({ user: true }) : false }));
+ipcMain.handle('dpi:start', async () => safeStart({ user: true }));
+ipcMain.handle('dpi:stop', async () => safeStop({ user: true }));
+
+/* Advanced (packet-layer) mode — for filters that follow whole connections. */
+ipcMain.handle('advanced:available', () => ({
+  available: advanced ? advanced.available() : false,
+  reason: advanced ? advanced.reason() : 'not initialized',
+  reasonCode: advanced ? advanced.reasonCode() : 'not_built',
+  active: advanced ? advanced.active : false,
+}));
+ipcMain.handle('advanced:start', async () => {
+  // Advanced mode is part of protection. Asked for with protection off (a
+  // notice left from before a Stop), protection starts first, as wanted from
+  // now on; it ran alone while the window said "Not protected". Not the
+  // user's Start itself: that could bring Advanced mode back on its own
+  // while it is being started here.
+  if (engine && !engine.isActive()) {
+    store.set(PROTECTION_KEY, true);
+    const s = await safeStart();
+    if (!s.success) return { success: false, code: s.code === 'security_blocked' ? 'security_blocked' : 'start_failed' };
+  }
+  const r = await startAdvanced();
+  if (autopilot && r && r.success) autopilot.userSet('advancedMode', true);
+  // Declined at a prompt the user started: the autopilot does not ask again.
+  if (autopilot && r && r.code === 'declined') autopilot.recordDecline();
+  return r;
+});
+ipcMain.handle('advanced:stop', async () => {
+  advancedProtection.offByHand();
+  if (autopilot) autopilot.userSet('advancedMode', false);
+  try { await advanced.stop(); advancedState(false); return { success: true }; }
+  catch (e) { return { success: false, error: e.message }; }
+});
+ipcMain.handle('app:placement', () => ({ move: outsideApplications() }));
+
+/* The Mac copy from GitHub suggesting the Mac App Store one, once it is
+ * live in this Mac's country (store-suggest.js). Asked by the window; the
+ * App Store page is opened from here. */
+let storeSuggest = null;
+let storeSuggestUrl = null;
+function macStoreSuggest() {
+  if (!storeSuggest) {
+    storeSuggest = new StoreSuggest({
+      store,
+      packaged: app.isPackaged,
+      mas: !!process.mas,
+      country: () => app.getLocaleCountryCode(),
+      fetchJson: (url) => getJson(url, 8000),
+    });
+  }
+  return storeSuggest;
+}
+ipcMain.handle('app:storeSuggest', async () => {
+  try {
+    const s = await macStoreSuggest().pending();
+    if (!s) return null;
+    storeSuggestUrl = s.url;
+    macStoreSuggest().shown();
+    return { store: 'mac' };
+  } catch { return null; }
+});
+ipcMain.handle('app:storeSuggestAnswer', (e, opened) => {
+  try {
+    macStoreSuggest().answered(!!opened);
+    if (opened && storeSuggestUrl) shell.openExternal(storeSuggestUrl).catch(() => {});
+  } catch {}
+  return true;
+});
+ipcMain.handle('app:moveToApplications', () => {
+  if (!outsideApplications()) return { ok: true };
+  try {
+    // A copy already there that is not running is replaced; a running one is
+    // left alone. Moved, Shroudly starts again from Applications by itself.
+    const ok = app.moveToApplicationsFolder({ conflictHandler: (kind) => kind === 'exists' });
+    return { ok };
+  } catch (e) {
+    addLog('warning', `Could not move Shroudly to Applications: ${e.message}`);
+    return { ok: false };
+  }
+});
+ipcMain.handle('dpi:status', () => ({
+  active: engine ? engine.isActive() : false,
+  // On its way up (the start at launch, after an update, a start under way,
+  // a restart): "Starting…", not a red "Not protected" with a Start button.
+  starting: !!engine && !engine.isActive() && engineComing(),
+  // Meant to be on, and the last start failed: said, with Repair, in place
+  // of a toast with the system's error that was gone in six seconds, and
+  // of nothing at all for a start at login (protection-keeper.js tries
+  // again meanwhile).
+  failed: lastStartFailed && !!engine && !engine.isActive() && !engineComing() && protectionWanted(),
+  stats: engine ? engine.getStats() : {},
+  // An antivirus took or refused the engine: the window says so.
+  blocked: engineBlocked(),
+  // On, but browsers are not going through it, and why (proxyNotice.js).
+  notRouting: notRouting(),
+  proxy: engine ? engine.proxyStatus : null,
+  // What the window can offer where the proxy is not Shroudly's to set
+  // (looked at only then: it reads the files of Advanced mode).
+  advanced: engine && engine.proxyStatus && engine.proxyStatus.code === 'machine_policy'
+    ? { on: !!(advanced && advanced.active), available: !!(advanced && advanced.available()) } : null,
+  // The network itself has no internet (engine-manager.js, advice.offline).
+  offline: !!(engine && engine.isActive() && engine.advice && engine.advice.offline),
+  // ...because the network's own proxy, set before Shroudly's, is the only
+  // way out (system-proxy.js priorProxy).
+  ownProxy: !!(engine && engine.isActive() && engine.advice && engine.advice.offline && engine.advice.ownProxy),
+  // ...or only the country's own network answers: a shutdown of the rest of
+  // the world (national-net.js), which no app gets past.
+  nationalOnly: !!(engine && engine.isActive() && engine.advice && engine.advice.offline && engine.advice.nationalOnly),
+  // The last way out (tor-route.js): { state, progress, used } while it
+  // runs or has failed, else null.
+  lastResort: (engine && engine.isActive() && engine.tor && engine.tor.status().state !== 'off') ? engine.tor.status() : null,
+  // A site needs Tor and the user has not said yes yet (askTor): its name.
+  torAsk: (engine && engine.isActive() && torAsk) ? (torAsk.host || '') : null,
+  // The user's own server is not carrying connections: { server, why }.
+  ownServerDown: (engine && engine.isActive() && engine.advice && engine.advice.ownServerDown) || null,
+  // ...and while it does, the address sites see through it: { server, ip }.
+  ownServerExit: (engine && engine.isActive() && engine.advice && engine.advice.ownServerExit) || null,
+}));
+ipcMain.handle('dpi:probe', (e, host) => {
+  if (engine && typeof host === 'string' && host) { userTests.set(host.toLowerCase(), Date.now()); engine.probe(host); }
+  return { success: true };
+});
+
+/* A site test the user asked for: once the network is no longer in the way,
+ * also ask whether the site itself turns this user away (service-check.js).
+ * Background probes are passed on as they are. The window waits for its
+ * answer only so long (it gives up on a test after 25 s): a slower answer
+ * still comes, as the notice any refusal brings. */
+const userTests = new Map();   // host -> when the test was asked for
+const SITE_TEST_SERVICE_MS = 13000;
+async function onProbeResult(p) {
+  const asked = p && p.host ? userTests.get(String(p.host).toLowerCase()) : 0;
+  if (asked) userTests.delete(String(p.host).toLowerCase());
+  if (asked && Date.now() - asked < 120000 && engine && engine.isActive()) {
+    serviceChecked.delete(String(p.host).toLowerCase());
+    let timer = null;
+    const service = await Promise.race([
+      checkServiceOnce(p.host).catch(() => null),
+      new Promise((r) => { timer = setTimeout(() => r(null), SITE_TEST_SERVICE_MS); }),
+    ]);
+    clearTimeout(timer);
+    if (service) { toWindow('dpi:probe-result', { ...p, service }); return; }
+  }
+  toWindow('dpi:probe-result', p);
+}
+
+ipcMain.handle('app:getInfo', async () => ({
+  // app.getVersion() returns Electron's own version when unpackaged; read the
+  // real product version from package.json so the UI always shows it correctly.
+  version: appVersion(),
+  year: new Date().getFullYear(),
+  platform: process.platform,
+  isAdmin: false,
+  // The system's region, for the bank account shown under Support Shroudly.
+  country: (() => { try { return app.getLocaleCountryCode() || ''; } catch { return ''; } })(),
+  // Where Shroudly takes the user to be (a shutdown seen there, else the time
+  // zone; national-net.js): the card asking for help is not shown where Tor
+  // itself is blocked (components/helpNudge.js).
+  homeCountry: (() => { try { return NationalNet.homeCountry({ remembered: store.get('homeCountry') }) || ''; } catch { return ''; } })(),
+}));
+
+ipcMain.handle('settings:get', (e, key) => store.get(key));
+/* navigator.language is always en-US in packaged builds (electronLanguages
+ * strips Chromium's other locales), so the UI asks the OS directly. */
+ipcMain.handle('app:systemLanguages', () => systemLanguages());
+ipcMain.handle('settings:getAll', () => store.store);
+/* Settings the engine reads at start: while protection is on, changing one
+ * restarts the engine (debounced, since a strategy pick sets several keys). */
+const ENGINE_SETTINGS = new Set(['strategy', 'strategyId', 'autoMode', 'dnsProtection', 'preferIpv6', 'listenPort', 'torLastResort']);
+let engineRestartTimer = null;
+function scheduleEngineRestart() {
+  clearTimeout(engineRestartTimer);
+  engineRestartTimer = setTimeout(() => {
+    if (!engine || !engine.isActive()) return;
+    // An antivirus block has its own line already (securityBlocked).
+    engine.restart().catch((e) => { if (e.code !== 'security_blocked') addLog('error', `Start failed: ${e.message}`); broadcastStatus(false); });
+  }, 700);
+}
+
+// Route mode / site list change: re-apply the system proxy (no engine restart).
+const PROXY_SETTINGS = new Set(['routeMode', 'siteList']);
+let proxyReapplyTimer = null;
+function scheduleProxyReapply() {
+  clearTimeout(proxyReapplyTimer);
+  proxyReapplyTimer = setTimeout(() => {
+    if (!engine || !engine.isActive()) return;
+    engine.reapplyProxy().catch((err) => addLog('error', `Could not update proxy routing: ${err.message}`));
+  }, 700);
+}
+
+/* Is IPv6 actually usable here? A global address alone isn't enough (some
+ * networks hand one out without routing it), so also try to reach a public
+ * IPv6 host. */
+function ipv6Available() {
+  const nets = Object.values(os.networkInterfaces()).flat();
+  const global = nets.some((a) => a && (a.family === 'IPv6' || a.family === 6) && !a.internal && /^[23]/.test(a.address));
+  if (!global) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const sock = netModule.connect({ host: '2606:4700:4700::1111', port: 443, family: 6 });
+    const done = (ok) => { sock.destroy(); resolve(ok); };
+    sock.setTimeout(2500, () => done(false));
+    sock.once('connect', () => done(true));
+    sock.once('error', () => done(false));
+  });
+}
+ipcMain.handle('net:ipv6Available', () => ipv6Available());
+ipcMain.handle('settings:defaultSiteList', () => (siteList ? siteList.domains : EngineManager.DEFAULT_SITE_LIST));
+ipcMain.handle('sitelist:info', () => ({
+  ...(siteList ? siteList.info() : { count: EngineManager.DEFAULT_SITE_LIST.length, generated: null, checkedAt: 0 }),
+  custom: Array.isArray(store.get('siteList')),
+}));
+/* Repaint the system-drawn caption strip to match the theme. Only Windows and
+ * Linux have one; macOS draws its buttons over our own strip. A colour the
+ * renderer sends is only ever used as a colour, and an unparseable one is
+ * refused by Electron, so it is passed through inside a try. */
+ipcMain.handle('ui:titlebar', (_e, c) => {
+  if (process.platform === 'darwin') return false;
+  if (!mainWindow || mainWindow.isDestroyed() || !c) return false;
+  const ok = (v) => typeof v === 'string' && /^#[0-9a-f]{3,8}$|^rgba?\(/i.test(v.trim());
+  if (!ok(c.color) || !ok(c.symbolColor)) return false;
+  try { mainWindow.setTitleBarOverlay({ color: c.color, symbolColor: c.symbolColor, height: 36 }); return true; }
+  catch { return false; }
+});
+
+ipcMain.handle('presence:get', () => (presence ? presence.online : null));
+ipcMain.handle('presence:refresh', () => (presence ? presence.refresh() : null));
+
+/* ── Discord app mode ────────────────────────────────────────────────────── */
+/* What the window shows about it: whether a restart of Discord is still needed
+ * to pick the line up, and whether macOS is withholding access to its files. */
+const discordState = { needsRestart: false, needsPermission: false, locked: false, lockedReason: null, pendingOn: null, foreign: false, editFailed: null, changedAt: 0 };
+// A Discord already open when this run's relay came up (applyDiscordMode):
+// when it was found, 0 when there is none (DiscordApp.watchSince).
+let discordStartCheckAt = 0;
+
+function sendDiscordState() {
+  toWindow('discord:state', discordState);
+}
+
+/* Write our line (url) or remove it (null) in every Discord build present.
+ * Returns the builds whose file changed, and those that could not be read. */
+function patchDiscordSync(url, files) {
+  const changed = []; const denied = []; const failed = []; let foreign = false;
+  for (const v of DiscordApp.installed()) {
+    const file = (files && files[v.id]) || DiscordApp.settingsFile(v);
+    try {
+      const r = DiscordApp.patchSync(file, url);
+      if (r === 'changed') changed.push(v);
+      if (r === 'foreign') foreign = true;
+    } catch (e) {
+      if (e.code === 'EPERM' || e.code === 'EACCES') denied.push(v);
+      else failed.push({ v, file, message: e.message });
+    }
+  }
+  noteDiscordLine(files);
+  return { changed, denied, failed, foreign };
+}
+
+/* Which settings files carry our line now, for the watchdog and the next
+ * login should Shroudly end without taking it out (discord-line.js). */
+function noteDiscordLine(files) {
+  try {
+    const carrying = DiscordApp.installed().map((v) => (files && files[v.id]) || DiscordApp.settingsFile(v)).filter((f) => DiscordApp.hasOursIn(f));
+    const file = discordLineFile();
+    if (DiscordLine.note(file, carrying, SystemProxy._owner()) && watchdogOpts) Watchdog.watch(watchdogOpts, 'discord', file);
+  } catch {}
+}
+
+/* macOS keeps other apps' data behind a permission. Picking the folder in an
+ * open panel counts as the user's consent; the panel opens inside Discord's
+ * folder, so it is one click. */
+async function askDiscordFolder(v) {
+  const s = tr();
+  const win = windowAlive() && mainWindow.isVisible() ? mainWindow : undefined;
+  // The panel belongs to the window: it must not be closed for being idle.
+  modalOpen++;
+  let pick;
+  try {
+    pick = await dialog.showOpenDialog(win, {
+      defaultPath: v.settingsDir, properties: ['openDirectory'],
+      message: s.discordPickMessage, buttonLabel: s.discordPickButton,
+    });
+  } finally { modalOpen--; }
+  if (pick.canceled || !pick.filePaths[0]) return null;
+  const chosen = pick.filePaths[0];
+  return path.basename(chosen) === path.basename(v.settingsDir) ? path.join(chosen, 'settings.json') : null;
+}
+
+async function applyDiscordMode(on, { interactive = true } = {}) {
+  let url = null;
+  if (on) {
+    try {
+      const port = await discordRelay.start(store.get('discordRelayPort'));
+      store.set('discordRelayPort', port);
+      url = DiscordApp.endpointUrl(port);
+    } catch (e) {
+      addLog('error', `Discord app: the relay could not start (${e.message})`);
+      return { success: false, code: 'relay' };
+    }
+  }
+
+  let r = patchDiscordSync(url);
+  if (r.denied.length && interactive && process.platform === 'darwin') {
+    const files = {};
+    for (const v of r.denied) { const f = await askDiscordFolder(v); if (f) files[v.id] = f; }
+    const again = patchDiscordSync(url, files);
+    r = { ...again, changed: [...r.changed, ...again.changed] };
+  }
+  for (const f of r.failed) addLog('error', `Discord app: ${f.message}`);
+
+  // Being refused the file means different things. On macOS it is the system
+  // asking the user to allow Shroudly to change another app's settings, and
+  // there is a prompt for it. Everywhere else it means the file is in use
+  // (Discord still running) or write-protected — a different thing to say and
+  // a different thing to do, so never the macOS wording there.
+  discordState.needsPermission = r.denied.length > 0 && process.platform === 'darwin';
+  discordState.locked = r.denied.length > 0 && process.platform !== 'darwin';
+  if (discordState.locked) {
+    // Say which it is: the file a running Discord holds open (close it, from
+    // the tray too), or one that is write-protected even with Discord gone
+    // (the read-only attribute, or a security product guarding the folder —
+    // Windows' Controlled folder access). The retry button can then do the
+    // right thing.
+    const stillOpen = await DiscordApp.anyRunning().catch(() => false);
+    discordState.lockedReason = stillOpen ? 'running' : 'protected';
+    addLog('warning', stillOpen
+      ? `Discord app: Discord is still running, so its settings file (${r.denied.map((v) => v.id).join(', ')}) is held open and cannot be changed. Quit Discord completely — from the system tray too (its icon near the clock → Quit Discord) — then try again.`
+      : `Discord app: Discord's settings file (${r.denied.map((v) => v.id).join(', ')}) is write-protected even with Discord closed. It may be read-only, or a security product may be guarding the folder (on Windows, "Controlled folder access" in Windows Security → Virus & threat protection → Ransomware protection — allow Shroudly through it, or turn it off).`);
+  } else {
+    discordState.lockedReason = null;
+  }
+  discordState.foreign = r.foreign;
+  // What to do by hand, in which file: add our line when turning on, take
+  // it out when turning off (it said "add" with an empty address then).
+  discordState.editFailed = r.failed.length
+    ? { on: !!url, line: `"${DiscordApp.KEY}": "${url || ''}"`, key: DiscordApp.KEY, files: r.failed.map((f) => f.file) }
+    : null;
+  discordState.pendingOn = (r.denied.length || r.failed.length) ? on : null;
+  if (r.denied.length || r.failed.length) {
+    // Turning off must not leave Discord pointed at a relay that is gone, so
+    // the relay stays up until the line could actually be removed.
+    sendDiscordState();
+    return { success: false, code: r.denied.length ? 'permission' : 'edit_failed' };
+  }
+
+  store.set('discordMode', on);
+  if (on) discordLineSeenAt = Date.now();
+  if (!on) discordRelay.stop();
+
+  // Discord reads the line when it starts: one that is already open needs a
+  // restart to use it (or to stop using it).
+  let running = false;
+  for (const v of r.changed) if (await DiscordApp.isRunning(v)) running = true;
+  if (r.changed.length) {
+    discordState.needsRestart = on && running;
+    discordState.changedAt = Date.now();
+    addLog('success', on ? 'Discord app mode on: Discord updates through Shroudly' : 'Discord app mode off: Discord settings restored');
+  } else if (on && await DiscordApp.anyRunning()) {
+    // The line was there already (it stays across logout and shutdown), but
+    // a Discord that is open now started before this run's relay was up:
+    // at login it often starts first, reads the line while nothing answers
+    // it, and sits on "Starting" or "Update Failed" for good. It is looked
+    // at once (watchDiscord), without a word to the window.
+    discordStartCheckAt = Date.now();
+  }
+  sendDiscordState();
+  return { success: true, restartNeeded: discordState.needsRestart };
+}
+
+/* While the mode is on, the line stays in every build's settings, pointing
+ * at the relay's port: a build installed after the mode came on (PTB, Canary,
+ * a fresh install), a settings file Discord wrote back without it when it
+ * closed, or one reset by a reinstall or a cleaner, gets it again within
+ * seconds, before Discord is opened again. Reading the files changes nothing
+ * when the line is there.
+ *
+ * Some Discords (or programs that change Discord) write the file back every
+ * few minutes while they run: putting the line back is then routine. It is
+ * logged the first time and once more (DiscordApp.healNote), and changes
+ * nothing else: no system setting, no notice, and a restart of Discord only
+ * through watchDiscord, which leaves alone a Discord that already goes
+ * through Shroudly. */
+const discordHealed = new Map();   // build -> times its line was put back this session
+// When the line was last seen in every build's settings (or written there).
+let discordLineSeenAt = 0;
+async function healDiscordLine() {
+  if (store.get('discordMode') !== true || !discordRelay || !discordRelay.running || discordState.needsPermission) return;
+  const seenAt = discordLineSeenAt;
+  const r = patchDiscordSync(DiscordApp.endpointUrl(discordRelay.port));
+  if (!r.denied.length && !r.failed.length) discordLineSeenAt = Date.now();
+  if (!r.changed.length) return;
+  for (const line of DiscordApp.healNote(discordHealed, r.changed.map((v) => v.app))) addLog('info', line);
+  // Discord's settings were written anew. In issue #27's log, and in 2.6.3's
+  // reports, the system proxy was taken over seconds after that, every time
+  // (in 2.6.3's, both were a second copy of Shroudly opened from its icon):
+  // it is looked at again shortly.
+  if (engine) engine.checkProxySoon();
+  // A Discord running now has to be started again only if it may have read
+  // the file while the line was not there: one that started since the line
+  // was last seen. One that was already running read the line when it
+  // started, and goes on using it: it is not restarted for every rewrite.
+  let running = false;
+  for (const v of r.changed) {
+    if (!(await DiscordApp.isRunning(v))) continue;
+    let at = null;
+    try { at = await DiscordApp.startedAt(v); } catch {}
+    if (DiscordApp.readWithoutLine({ startedAt: at, lineSeenAt: seenAt })) running = true;
+  }
+  // Told to the window only when that changes what it shows.
+  if (running && !discordState.needsRestart) {
+    discordState.needsRestart = true;
+    discordState.changedAt = Date.now();
+    sendDiscordState();
+  }
+}
+let discordHealBusy = false;
+setInterval(() => {
+  if (discordHealBusy) return;
+  discordHealBusy = true;
+  healDiscordLine().catch(() => {}).finally(() => { discordHealBusy = false; });
+}, 3000).unref();
+
+ipcMain.handle('discord:status', async () => {
+  const builds = DiscordApp.installed();
+  try { await healDiscordLine(); } catch {}
+  let running = false;
+  for (const v of builds) if (await DiscordApp.isRunning(v)) { running = true; break; }
+  // The relay answering Discord since the change means Discord already uses it.
+  if (discordState.needsRestart && discordRelay && discordRelay.lastOkAt > discordState.changedAt) discordState.needsRestart = false;
+  return {
+    installed: builds.length > 0,
+    mode: store.get('discordMode') ?? null,  // true, false, or null (never asked)
+    running,
+    reached: discordRelay ? discordRelay.lastOkAt : 0,
+    ...discordState,
+  };
+});
+ipcMain.handle('discord:set', async (e, on) => {
+  if (autopilot) autopilot.userSet('discordMode', on === true);
+  return applyDiscordMode(on === true);
+});
+
+/* ── Games and apps mode ─────────────────────────────────────────────────── */
+/* Roblox and many other programs ignore the system proxy and only read
+ * HTTPS_PROXY from their environment: see app-proxy.js and app-env.js. The
+ * autopilot turns the mode on when this network blocks Roblox; robloxWatch
+ * then sees to Roblox's programs that started before the mode or around it.
+ * What the window shows: a proxy of the user's own in the way, a change that
+ * could not be made, and a Roblox Studio to reopen. */
+// studioReopenAt: when the user was last told about a Roblox Studio that
+// goes around Shroudly (0 while there is none); studioReopenId and
+// studioReopenParams: the line the window shows about it.
+const appState = { foreign: false, failed: false, studioReopenAt: 0, studioReopenId: null, studioReopenParams: null };
+const STUDIO_LINES = ['autoStudioReopen', 'autoStudioParent', 'autoStudioAgain'];
+
+function sendAppState() {
+  toWindow('apps:state', appState);
+}
+
+/* Evidence, not the setting: the local proxy reports every request and
+ * every tunnel. A request from Roblox is what shows it uses the setting,
+ * whether or not the server it asked for could then be reached; it is
+ * remembered for robloxWatch. The first tunnel of a session, and Roblox's
+ * first, are logged (so a support log shows the mode really works). */
+const appSeen = { any: false, roblox: false, robloxAt: 0 };
+function onAppRequest(host) {
+  if (RobloxApp.isRobloxHost(host)) appSeen.robloxAt = Date.now();
+}
+function onAppTunnel(host) {
+  if (!appSeen.any) { appSeen.any = true; addLog('info', `Games and apps: the first program connected through Shroudly (${host})`); }
+  if (RobloxApp.isRobloxHost(host) && !appSeen.roblox) {
+    appSeen.roblox = true;
+    addLog('success', 'Games and apps: Roblox is connecting through Shroudly');
+    checkServiceOnce('www.roblox.com').catch(() => {});
+  }
+}
+
+/* Services found to work without Shroudly on this network whose sign-in
+ * takes a proxy amiss go around it entirely, as with no Shroudly at all:
+ * Riot's (a TTNet user got a captcha at every sign-in with Shroudly on,
+ * though every Riot name went through untouched). Checked again with the
+ * network, and back through Shroudly the moment one is found blocked. */
+const DIRECT_WHEN_CLEAR = ['riot'];
+let directSaid = '';
+function applyDirectRoutes() {
+  if (!engine || !engine.proxy || !autopilot) return;
+  const open = DIRECT_WHEN_CLEAR.filter((id) => autopilot.clear.has(id) && !autopilot.blocked.has(id));
+  const names = open.flatMap((id) => Autopilot.OWN[id] || []);
+  if (!engine.proxy.setDirect(names)) return;
+  const said = open.join();
+  if (said === directSaid) return;
+  directSaid = said;
+  addLog('info', open.length
+    ? `${open.map((id) => (id === 'riot' ? 'Riot Games' : id)).join(', ')}: works without Shroudly on this network, so its sign-in and games go straight, around Shroudly`
+    : 'Services that went around Shroudly go through it again');
+}
+
+/* Programs that went through the program proxy this session (Games and apps
+ * mode), by name: started while the mode was on, they got its address in
+ * their environment, and Windows never takes it out of a program that runs.
+ * Once Shroudly quits or the mode goes off they still go to an address with
+ * nothing behind it until they are restarted (issue #80: Steam and the Epic
+ * Games Launcher stopped connecting "when Shroudly was closed"). So the ones
+ * still running then are named, in one notification. Looked at once a
+ * minute, from the connections open at that moment (ProcNet.owner, the
+ * same netstat everything shares). */
+const appUsers = new Map();   // name -> pid
+async function noteAppUsers() {
+  if (!appProxy || !appProxy.running || !appProxy.port) return;
+  const clients = [...appProxy.sockets].filter((s) => s.localPort === appProxy.port && s.remotePort).slice(0, 8);
+  for (const s of clients) {
+    let o = null;
+    try { o = await ProcNet.owner(s.remotePort, appProxy.port); } catch {}
+    const name = o && o.name ? programName(o.name) : null;
+    if (name && o.pid && o.pid !== process.pid && !/^shroudly/i.test(name)) appUsers.set(name, o.pid);
+  }
+}
+{ const h = setInterval(() => { noteAppUsers().catch(() => {}); }, 60 * 1000); if (h.unref) h.unref(); }
+
+/* The ones of them still running: said once, as the address goes. */
+function tellAppUsers() {
+  if (!appUsers.size) return;
+  const alive = [...appUsers].filter(([, pid]) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } }).map(([n]) => n);
+  appUsers.clear();
+  if (!alive.length) return;
+  const apps = alive.slice(0, 4).join(', ') + (alive.length > 4 ? ', …' : '');
+  addLog('info', `Games and apps: ${alive.join(', ')} still use Shroudly's address until restarted`);
+  try { notify('Shroudly', tr().appUsersRestart.replace('{apps}', apps)); } catch {}
+}
+
+/* The network can be beaten; a service that turns the user away itself (by
+ * country, by policy) cannot, since Shroudly never changes the address. When
+ * that happens it is said plainly, the same way for every site and country:
+ * the user's own site test (onProbeResult), a site the engine could not get
+ * through to, and the services the app modes are for (Roblox, Discord), each
+ * looked at once per session at most. */
+const repeatedCut = ServiceCheck.cutCounter();
+const serviceChecked = new Map();   // host -> when
+const serviceRefusals = new Map();  // host -> 'region' | 'stall'
+async function checkServiceOnce(host) {
+  const h = String(host || '').toLowerCase();
+  if (!h || !engine || !engine.isActive()) return null;
+  const last = serviceChecked.get(h) || 0;
+  if (Date.now() - last < 30 * 60 * 1000) return serviceRefusals.get(h) || null;
+  serviceChecked.set(h, Date.now());
+  const kind = await ServiceCheck.serviceCheck(h, engine.port, DiscordRelay.socksConnect).catch(() => null);
+  if (kind) reportServiceRefusal(h, kind);
+  else serviceRefusals.delete(h);
+  return kind;
+}
+function reportServiceRefusal(host, kind) {
+  const first = !serviceRefusals.has(host);
+  serviceRefusals.set(host, kind);
+  // Only a page that says so is the site's own refusal. Silence after the
+  // handshake may be the site, or a network that lets connections start and
+  // then stops them: both are said, never just one.
+  if (first) {
+    addLog('warning', kind === 'region'
+      ? `${host}: the site itself refuses this connection (it says it does not serve where you are); Shroudly does not change your address, so it cannot change this`
+      : `${host}: accepts the connection, then nothing comes back; either the site turns away visitors from where you are, or the network stops the connection after it is made`);
+  }
+  toWindow('dpi:service-refused', { host, service: kind });
+}
+
+/* Roblox's programs that go around Shroudly while this network blocks Roblox
+ * (roblox-watch.js: the rules, how soon, and what is done): looked at every
+ * few seconds while one is being judged or may be about to start, at once
+ * when the mode, protection or the verdict comes. */
+const robloxSigned = RobloxApp.signedCache(store.get('robloxSigned', []), (list) => store.set('robloxSigned', list));
+
+/* The env a Roblox started by Shroudly gets. Shroudly itself may have
+ * inherited an older value of ours (started from Explorer before a crash's
+ * leftovers were cleaned): only a proxy that is somebody else's is kept. */
+function robloxEnv() {
+  const env = {};
+  const ours = (v) => !v || /^http:\/\/127\.0\.0\.1:\d+$/.test(v);
+  if (appProxy && appProxy.url) {
+    if (ours(process.env.HTTPS_PROXY)) { env.HTTPS_PROXY = appProxy.url; env.https_proxy = appProxy.url; }
+    if (!process.env.NO_PROXY || process.env.NO_PROXY === AppEnv.NO_PROXY_VALUE) env.NO_PROXY = AppEnv.NO_PROXY_VALUE;
+  }
+  return env;
+}
+
+/* Roblox's current installer for the player or Studio, fetched through the
+ * engine and checked to be signed by Roblox (fetchRoblox), then started
+ * through Shroudly (startFetchedRoblox), if it is still that very file. */
+const robloxName = (kind) => (kind === 'studio' ? 'Roblox Studio' : 'Roblox');
+async function fetchRoblox(kind) {
+  if (!engine || !engine.isActive()) return { success: false, code: 'unreachable', detail: 'protection is off' };
+  const r = await RobloxApp.fetchInstaller({
+    kind, socksPort: engine.port, connect: DiscordRelay.socksConnect,
+    dir: path.join(app.getPath('userData'), 'roblox'), cache: robloxSigned,
+  });
+  if (r.code === 'unsigned') addLog('error', 'The downloaded Roblox installer was not signed by Roblox, so it was deleted and not started');
+  else if (!r.success) addLog('error', `${robloxName(kind)} could not be downloaded (${r.detail || r.code})`);
+  return r;
+}
+async function startFetchedRoblox(r) {
+  const pid = await RobloxApp.startFetched(r, robloxEnv());
+  if (pid) addLog('success', `${robloxName(r.kind)} installer downloaded through Shroudly and started (${r.version})`);
+  return pid;
+}
+
+function setStudioReopen(at, note) {
+  const id = at ? ((note && note.id) || 'autoStudioReopen') : null;
+  const params = at && note && note.params && Object.keys(note.params).length ? note.params : null;
+  if (appState.studioReopenAt === at && appState.studioReopenId === id && JSON.stringify(appState.studioReopenParams) === JSON.stringify(params)) return;
+  appState.studioReopenAt = at;
+  appState.studioReopenId = id;
+  appState.studioReopenParams = params;
+  sendAppState();
+}
+
+function soonProxy(r) { if (r && engine) engine.checkProxySoon(); return r; }
+const robloxWatch = new RobloxWatch({
+  now: () => Date.now(),
+  setTimeout: (fn, ms) => { const h = setTimeout(fn, ms); if (h.unref) h.unref(); return h; },
+  clearTimeout: (h) => clearTimeout(h),
+  watched: RobloxApp.routeWatched(),
+  on: () => store.get('appMode') === true && !!appProxy && appProxy.running,
+  active: () => !!(engine && engine.isActive()),
+  blocked: () => !!(autopilot && autopilot.isBlocked('roblox')),
+  stillBlocked: () => (autopilot ? autopilot.stillBlocked('roblox') : Promise.resolve(false)),
+  checkSoon: () => { if (autopilot) autopilot.checkSoon('roblox').catch(() => {}); },
+  lastRequestAt: () => appSeen.robloxAt,
+  list: () => RobloxApp.processes(),
+  info: process.platform === 'win32' ? (pids) => RobloxApp.processInfo(pids) : null,
+  // PowerShell started ahead (it can take 20 s to start on a slow machine),
+  // while Roblox's programs may need to be seen to.
+  prepare: process.platform === 'win32' ? () => RobloxApp.prepare() : null,
+  signed: (file, kind) => RobloxApp.signedInstaller(file, kind, { cache: robloxSigned }),
+  same: (file, hash) => RobloxApp.sameFile(file, hash),
+  kill: (pids) => RobloxApp.kill(pids),
+  // A program started again through Shroudly: the system proxy is looked at
+  // again shortly (issue #27).
+  startInstaller: (file) => soonProxy(RobloxApp.startInstaller(file, robloxEnv())),
+  fetch: (kind) => fetchRoblox(kind),
+  startFetched: async (r) => soonProxy(await startFetchedRoblox(r)),
+  restart: async (pids) => soonProxy(await RobloxApp.restart(robloxEnv(), pids)),
+  log: (level, msg) => addLog(level, msg),
+  tell: (id, params) => autoTell(id, params),
+  needAdvanced: () => { if (autopilot) autopilot.needAdvanced('www.roblox.com', { label: 'Roblox', why: 'Roblox does not get through' }).catch(() => {}); },
+  studioReopen: setStudioReopen,
+  // What started a Studio that went around Shroudly again (Windows).
+  parent: process.platform === 'win32' ? (pid) => RobloxApp.parentOf(pid) : null,
+  // Explorer started one without the setting: it is told again.
+  reannounce: () => { try { if (appEnv) appEnv.announce(); } catch {} },
+  // A program of Roblox's started: it, or its installer, may have written
+  // its links again (link-handlers.js).
+  newProcess: () => checkLinksSoon(),
+});
+robloxWatch.start();
+
+/* Windows: the setting told to Explorer again a little later. At login
+ * Explorer can still be too busy to take the first announcement (it is sent
+ * with a short wait and dropped when Explorer does not answer in time), and
+ * then every program started from the Start menu, the desktop or the
+ * taskbar goes without the setting for the whole session (issue #33: every
+ * Roblox Studio around Shroudly). Saying it again costs nothing when
+ * Explorer had it. */
+let announceTimers = [];
+function announceLater() {
+  if (process.platform !== 'win32') return;
+  for (const t of announceTimers) clearTimeout(t);
+  announceTimers = [15000, 60000].map((ms) => {
+    const t = setTimeout(() => { try { if (appEnv && appEnv.applied) appEnv.announce(); } catch {} }, ms);
+    if (t.unref) t.unref();
+    return t;
+  });
+}
+
+/* Windows: links that open Roblox's programs (the website's Play and Edit
+ * buttons, a bootstrapper's) go through Shroudly while the mode's setting is
+ * in place, so a program opened from a browser that was running before
+ * Shroudly gets the setting too (issue #30: Studio opened from the website
+ * went around Shroudly however often it was reopened). Put back with the
+ * setting (app-env.js clearSync: Stop, quit, the watchdog, the next start,
+ * the uninstaller). Programs write their links again when they update, or
+ * at each start: looked at again after one starts and every few minutes. */
+let linksSaid = '';
+async function applyLinks() {
+  if (process.platform !== 'win32' || !appEnv || !appEnv.links || !appEnv.applied) return;
+  try {
+    const r = await appEnv.links.apply(LinkHandlers.prefixFor(process.execPath, app.isPackaged ? null : app.getAppPath()));
+    const said = r.links.join(', ');
+    if (said && said !== linksSaid) addLog('info', `Games and apps: links that open ${said} go through Shroudly`);
+    linksSaid = said;
+  } catch (e) {
+    addLog('warning', `Games and apps: links could not be set to go through Shroudly (${String((e && e.message) || e).split(/\r?\n/)[0]})`);
+  }
+  // Turned off while this ran: nothing of it stays.
+  if (!appEnv.applied) { try { appEnv.links.restoreSync(); } catch {} }
+}
+let linkTimer = null;
+function checkLinksSoon(ms = 15000) {
+  if (process.platform !== 'win32') return;
+  if (linkTimer) clearTimeout(linkTimer);
+  linkTimer = setTimeout(() => {
+    linkTimer = null;
+    if (store.get('appMode') !== true || !appEnv || !appEnv.applied) return;
+    appModeQueue = appModeQueue.then(() => applyLinks()).catch(() => {});
+  }, ms);
+  if (linkTimer.unref) linkTimer.unref();
+}
+if (process.platform === 'win32') { const h = setInterval(() => checkLinksSoon(0), 5 * 60 * 1000); if (h.unref) h.unref(); }
+
+/* One change at a time: on and off in quick succession must not interleave
+ * (an "on" finishing after the "off" would leave the mode on behind a toggle
+ * that shows it off). */
+let appModeQueue = Promise.resolve();
+function applyAppMode(on) {
+  const run = appModeQueue.then(() => applyAppModeNow(on));
+  appModeQueue = run.catch(() => {});
+  return run;
+}
+
+/* The setting could not be put in place because Windows did not answer (a
+ * PC still starting up, an antivirus holding its tools back: app-env.js
+ * regKey): tried again by itself, a few times, further and further apart.
+ * It used to stay off for the whole session, with Roblox open and no way to
+ * the internet. Nothing is tried once the mode is off or on. */
+const APP_MODE_RETRY_MS = [8000, 30000, 90000, 300000];
+const appModeRetry = { timer: null, n: 0 };
+function appModeRetryLater() {
+  if (appModeRetry.timer || appModeRetry.n >= APP_MODE_RETRY_MS.length) return false;
+  const wait = APP_MODE_RETRY_MS[appModeRetry.n++];
+  appModeRetry.timer = setTimeout(() => {
+    appModeRetry.timer = null;
+    if (store.get('appMode') === true && appState.failed && appModeSupported()) applyAppMode(true).catch(() => {});
+  }, wait);
+  if (appModeRetry.timer.unref) appModeRetry.timer.unref();
+  return true;
+}
+function appModeRetryForget() {
+  clearTimeout(appModeRetry.timer);
+  appModeRetry.timer = null;
+  appModeRetry.n = 0;
+}
+
+async function applyAppModeNow(on) {
+  if (!appModeSupported()) return { success: false, code: 'unsupported' };
+  appState.failed = false;
+  if (!on) {
+    try { appEnv.clearSync(); } catch {}
+    tellAppUsers();
+    appModeRetryForget();
+    if (flatpakEnv) { try { await flatpakEnv.clear(); } catch {} }
+    appProxy.stop();
+    store.set('appMode', false);
+    appState.foreign = false;
+    appState.studioReopenAt = 0;
+    appState.studioReopenId = null;
+    appState.studioReopenParams = null;
+    linksSaid = '';
+    robloxWatch.modeOff();
+    addLog('success', 'Games and apps mode off: settings restored');
+    sendAppState();
+    return { success: true };
+  }
+
+  let port;
+  try {
+    port = await appProxy.start(store.get('appProxyPort'));
+    store.set('appProxyPort', port);
+  } catch (e) {
+    addLog('error', `Games and apps: the local proxy could not start (${e.message})`);
+    appState.failed = true;
+    sendAppState();
+    return { success: false, code: 'proxy' };
+  }
+  let r;
+  let setAt = 0;
+  if (!AppEnv.supported()) {
+    // Linux: the session's environment reaches no sandboxed program, so the
+    // Flatpak ones are pointed at Shroudly through their own override.
+    let done = [];
+    try { done = await flatpakEnv.apply(AppProxy.proxyUrl(port)); setAt = Date.now(); } catch (e) {
+      addLog('error', `Games and apps: ${e.message}`);
+      appProxy.stop();
+      appState.failed = true;
+      sendAppState();
+      return { success: false, code: 'edit_failed' };
+    }
+    if (!done.length) {
+      appProxy.stop();
+      addLog('warning', 'Games and apps: none of the Flatpak programs Shroudly covers is installed, so there was nothing to point at it');
+      appState.failed = true;
+      sendAppState();
+      return { success: false, code: 'no_apps' };
+    }
+    appState.foreign = false;
+    store.set('appMode', true);
+    addLog('success', `Games and apps mode on: ${done.join(', ')} go through Shroudly`);
+    sendAppState();
+    return { success: true };
+  }
+  try { r = appEnv.applySync(AppProxy.proxyUrl(port)); setAt = Date.now(); } catch (e) {
+    appProxy.stop();
+    appState.failed = true;
+    // Windows did not answer: not for good, so it is tried again by itself.
+    const again = e && e.code === 'EAGAIN' && store.get('appMode') === true && appModeRetryLater();
+    if (again) addLog('warning', `Games and apps: ${e.message}; trying again shortly`);
+    else addLog('error', `Games and apps: ${e.message}`);
+    sendAppState();
+    return { success: false, code: 'edit_failed' };
+  }
+  appModeRetryForget();
+  if (r === 'foreign') {
+    // Somebody else's proxy for programs (HTTPS_PROXY): never replaced.
+    appProxy.stop();
+    appState.foreign = true;
+    addLog('warning', 'Games and apps: another proxy is already set for programs (HTTPS_PROXY), so it was left as it is');
+    sendAppState();
+    return { success: false, code: 'foreign' };
+  }
+  appState.foreign = false;
+  store.set('appMode', true);
+  announceLater();
+  // Another program's proxy for programs that points at nothing any more
+  // (app-env.js _gone): set over, and said once.
+  const over = appEnv.overrode || [];
+  if (over.length) {
+    const names = [...new Set(over.map((o) => o.name))].join(', ');
+    const addrs = [...new Set(over.map((o) => o.value))].join(', ');
+    addLog('info', `Games and apps: ${names} pointed at ${addrs}, where nothing is running; Shroudly's is used while the mode is on, and the old one comes back when it goes off`);
+  }
+  if (r === 'changed') {
+    // Roblox reads the proxy when it starts: what is already open does not
+    // have it, installers included (robloxWatch sees to them at once, not
+    // after the quiet wait).
+    robloxWatch.modeOn(await RobloxApp.processes(), setAt);
+    addLog('success', 'Games and apps mode on: Roblox and similar programs go through Shroudly');
+  } else robloxWatch.warm();
+  sendAppState();
+  await applyLinks();
+  return { success: true };
+}
+
+/* Whether the Store edition is installed is asked once (PowerShell), when
+ * the window first shows the switch. */
+let storeEditionCache = null;
+ipcMain.handle('apps:status', async (e, opts) => {
+  if (opts && opts.running === true && process.platform === 'win32' && storeEditionCache === null) {
+    storeEditionCache = await RobloxApp.storeEdition().catch(() => false);
+  }
+  return {
+    available: appModeSupported(),
+    mode: store.get('appMode') ?? null,  // true, false, or null (never set)
+    storeEdition: storeEditionCache === true,
+    platform: process.platform,
+    ...appState,
+  };
+});
+ipcMain.handle('apps:set', async (e, on) => {
+  if (autopilot) autopilot.userSet('appMode', on === true);
+  return applyAppMode(on === true);
+});
+
+/* ── Autopilot ───────────────────────────────────────────────────────────── */
+/* What Shroudly turns on and restarts by itself (autopilot.js), and how it
+ * says so: a notification, and a line in the window, which also gets the
+ * last few when it opens later. */
+// The latest line for a window opened later. Studio's lines are not kept
+// here: they come with the apps state, for as long as that Studio runs.
+let autoLatest = null;
+// In the window only, never a notification:
+//  - lines that follow a notification of their own (the antivirus that
+//    blocked Advanced mode was told by securityBlocked);
+//  - what was done and needs nothing from the user: a mode turned on that
+//    just works, a setting put back, a site opened through Tor;
+//  - Advanced mode paused while a game runs (never over a game);
+//  - a reminder of a choice the user made (turned off, declined, no asking):
+//    the window says it, a notification at every block did not help.
+// What a notification is still for: something the user sees happen (an app
+// restarted or closed), a prompt about to come up, or something only the
+// user can fix.
+const WINDOW_ONLY = [
+  'autoSecurityAdvanced', 'autoSiteUnreachable', 'autoTorOff',
+  'autoDiscordOn', 'autoRobloxOn', 'autoRiotOn', 'autoAdvancedOn', 'autoAroundOn', 'autoAroundOnAny',
+  'autoStoreAppsOn', 'autoFirefoxFixed', 'autoForgedDnsOn', 'autoInstallerRestarted', 'torUsedDesktop',
+  'autoAdvancedPausedForGame',
+  'autoDiscordOffByHand', 'autoRobloxOffByHand', 'autoRiotOffByHand', 'autoForgedDnsOffByHand',
+  'autoAdvancedOffBefore', 'autoAdvancedDeclinedBefore', 'autoAdvancedFailedBefore', 'autoAdvancedNoAsk',
+  'autoAdvancedNoAskAfterGame', 'autoStoreAppsOffBefore', 'autoStoreAppsNoAsk', 'autoStoreAppsDeclinedBefore',
+];
+function autoTell(id, params = {}) {
+  const text = String(tr()[id] || '').replace(/\{(\w+)\}/g, (m, k) => (params[k] != null ? String(params[k]) : m));
+  if (text && !WINDOW_ONLY.includes(id)) notifyAuto(text);
+  const n = { id, params, at: Date.now() };
+  if (!STUDIO_LINES.includes(id)) autoLatest = n;
+  toWindow('auto:notice', n);
+}
+// The window is closed for real when it goes to the tray: a line the user
+// closed stays closed in the next window, and an older one never comes back.
+ipcMain.handle('auto:notices', () => (autoLatest && !autoLatest.dismissed ? [autoLatest] : []));
+ipcMain.on('auto:dismiss', (e, at) => { if (autoLatest && autoLatest.at <= at) autoLatest.dismissed = true; });
+
+/* A browser that goes around Shroudly (browser-check.js): its own proxy or
+ * VPN setting, an extension, a policy. Looked at every minute while every
+ * site goes through Shroudly; a browser seen going around twice in a row is
+ * named once a session. Firefox's own "no proxy" choice is put back while
+ * Firefox is closed, once per profile; its profiles are read only when they
+ * can have changed (browser-check.js firefoxLookout). */
+const browserAroundSeen = new Map();
+const browserTold = new Set();
+const firefoxDue = BrowserCheck.firefoxLookout();
+let browserBusy = false;
+async function watchBrowsers() {
+  if (browserBusy) return;
+  if (!engine || !engine.isActive() || store.get('routeMode') === 'listed') { firefoxDue.reset(); return; }
+  // Browsers that cannot follow Shroudly's proxy here (the administrator's
+  // setting for all users): not theirs to change, and the window says so.
+  if (engine.proxyStatus && engine.proxyStatus.code === 'machine_policy') { browserAroundSeen.clear(); return; }
+  // Just after a wake, connections opened before the sleep (or while the
+  // network came back) are no sign of a browser going around Shroudly.
+  if (wake.recent(2 * 60 * 1000)) { browserAroundSeen.clear(); return; }
+  browserBusy = true;
+  try {
+    const list = await BrowserCheck.runningBrowsers();
+    const ffOff = () => BrowserCheck.firefoxProfiles().some((p) => p.type === 0 || p.type === 4);
+    if (firefoxDue(list.some((b) => b.id === 'firefox')) && ffOff()) {
+      const done = BrowserCheck.fixFirefox(undefined, store.get('firefoxProxyFixed', []));
+      if (done.length) {
+        store.set('firefoxProxyFixed', [...store.get('firefoxProxyFixed', []), ...done]);
+        addLog('success', 'Firefox was set not to use the system proxy. Shroudly put it back to "Use system proxy settings".');
+        autoTell('autoFirefoxFixed');
+      }
+    }
+    if (!list.length) { browserAroundSeen.clear(); return; }
+    const ports = [engine.port, engine.proxy && engine.proxy.pacPort].filter(Boolean);
+    const rows = await ProcNet.connections(list.flatMap((b) => b.pids));
+    for (const b of [...browserAroundSeen.keys()]) if (!list.some((x) => x.id === b)) browserAroundSeen.delete(b);
+    for (const b of list) {
+      const seen = BrowserCheck.goesAround(rows.filter((r) => b.pids.includes(r.pid)), ports) ? (browserAroundSeen.get(b.id) || 0) + 1 : 0;
+      browserAroundSeen.set(b.id, seen);
+      if (seen < 2 || browserTold.has(b.id)) continue;
+      browserTold.add(b.id);
+      if (b.id === 'firefox' && ffOff()) {
+        addLog('warning', 'Firefox is set not to use the system proxy, so it does not go through Shroudly. Close Firefox and Shroudly will set it back.');
+        autoTell('autoFirefoxClose');
+      } else {
+        addLog('warning', `${b.name} is not going through Shroudly: a proxy or VPN setting of its own, or an extension, is in the way. Turn it off in ${b.name}, or use another browser.`);
+        autoTell('autoBrowserAround', { browser: b.name });
+      }
+    }
+  } finally { browserBusy = false; }
+}
+setInterval(() => { watchBrowsers().catch(() => {}); }, 60000).unref();
+
+/* A different network (another Wi-Fi, a cable, a hotspot): what the
+ * autopilot learnt about the last one no longer holds. Told by the networks
+ * this computer is on (each IPv4 address with its mask, each IPv6 /64), not
+ * its addresses: IPv6 privacy addresses change daily on the same network.
+ * Two networks that look the same from here are covered by
+ * autopilot.stillBlocked, which checks again before anything is restarted. */
+const networkFingerprint = () => Autopilot.networkFingerprint(os.networkInterfaces());
+let networkPrint = networkFingerprint();
+setInterval(() => {
+  const now = networkFingerprint();
+  // Encrypted DNS: connections and rests from the old network say nothing
+  // about the new one (doh-forwarder.js).
+  if (now !== networkPrint && engine && engine.doh) engine.doh.networkChanged();
+  if (now !== networkPrint && engine) engine.networkChanged();
+  if (now !== networkPrint) rawWatch.networkChanged();
+  if (now !== networkPrint && aroundWatch) aroundWatch.networkChanged();
+  if (now !== networkPrint) reachTold.clear();
+  // Protection that could not start may well start on the new network.
+  if (now !== networkPrint && keeper) keeper.poke().catch(() => {});
+  // IPv6 came or went: whether the PAC sends IPv6 addresses to the engine
+  // follows (system-proxy.js, hasGlobalIPv6).
+  if (now !== networkPrint && engine && engine.proxy && engine.proxy.updateRouting) {
+    try { engine.proxy.updateRouting(engine.proxy.mode, engine.proxy.list); } catch {}
+  }
+  if (now !== networkPrint && autopilot) {
+    autopilot.networkChanged();
+    if (engine && engine.isActive()) setTimeout(() => { autopilot.survey().catch(() => {}); }, 5000);
+  }
+  networkPrint = now;
+}, 30000).unref();
+
+/* A Discord that was open when its mode came on reads the line only when it
+ * starts. One past its updater works through the system proxy and is left
+ * alone (a call must not be cut); one that holds no connection to Shroudly at
+ * all is stuck before its window, and is restarted, once per build, while
+ * this network blocks Discord. */
+// Build -> when it was last restarted: at most once in ten minutes each.
+const discordRestarted = new Map();
+const DISCORD_RESTART_EVERY_MS = 10 * 60 * 1000;
+let discordBusy = false;
+async function watchDiscord() {
+  // Since when: the line written while it ran, or the relay come up while
+  // it was open already.
+  const since = DiscordApp.watchSince({ needsRestart: discordState.needsRestart, changedAt: discordState.changedAt, startCheckAt: discordStartCheckAt, now: Date.now() });
+  if (since === null) { discordStartCheckAt = 0; return; }
+  if (discordBusy || store.get('discordMode') !== true) return;
+  if (!engine || !engine.isActive() || !autopilot || !autopilot.isBlocked('discord')) return;
+  // The system proxy not pointing at Shroudly (another program took it over,
+  // or it still needs an administrator): no program's connections reach
+  // Shroudly then, a Discord that works included, so "no connection to
+  // Shroudly" says nothing about Discord, and a restart would only cut its
+  // call. Looked at again once the proxy is back.
+  if (engine.proxyStatus && engine.proxyStatus.ok === false) return;
+  const done = () => {
+    discordStartCheckAt = 0;
+    if (discordState.needsRestart) { discordState.needsRestart = false; sendDiscordState(); }
+  };
+  if (Date.now() - since < 20000) return;
+  if (discordRelay && discordRelay.lastOkAt > since) { done(); return; }
+  discordBusy = true;
+  try {
+    const ports = [engine.port, discordRelay && discordRelay.port].filter(Boolean);
+    let still = false;
+    for (const v of DiscordApp.installed()) {
+      const pids = await DiscordApp.pids(v);
+      if (!pids.length || Date.now() - (discordRestarted.get(v.id) || 0) < DISCORD_RESTART_EVERY_MS) continue;
+      if (await ProcNet.connectsTo(pids, ports)) continue;
+      // Sent elsewhere by another tool, to a proxy that is gone: a restart
+      // would only come back to the same place.
+      const dead = await discordDeadProxy(v, pids, ports);
+      if (dead) { await handleDiscordDeadProxy(v, dead); continue; }
+      if (!(await autopilot.stillBlocked('discord'))) break;
+      // Its window would come up over a full-screen game or video (and a
+      // call in it would drop): restarted once the user is out of it.
+      if (await userBusy.fullScreen()) { still = true; continue; }
+      discordRestarted.set(v.id, Date.now());
+      if (await DiscordApp.restart(v)) {
+        addLog('success', `Autopilot: ${v.app} did not get through Shroudly; restarted it`);
+        autoTell('autoDiscordRestarted');
+        engine.checkProxySoon();
+      } else still = true;
+    }
+    if (!still) done();
+  } finally { discordBusy = false; }
+}
+setInterval(() => { watchDiscord().catch(() => {}); }, 20000).unref();
+
+/* Discord sent by another tool to a proxy on this computer where nothing
+ * runs any more (Discord Drover's drover.ini, a --proxy-server launch
+ * option): it reaches neither Shroudly nor Discord, and sits on "Starting"
+ * however often it is restarted. With 2.6.4 a user's Discord made one
+ * connection only, a SYN to 127.0.0.1:1080 (ByeDPI's port), left there by
+ * Discord Drover after ByeDPI was gone. Looked at every minute while a
+ * Discord runs and holds no connection to Shroudly (on any network: sent to
+ * a proxy that is gone, it reaches nothing anywhere). */
+function portAnswers(host, port) {
+  return new Promise((resolve) => {
+    const s = netModule.connect({ host, port });
+    const done = (v) => { try { s.destroy(); } catch {} resolve(v); };
+    s.setTimeout(1000, () => done(true));   // no answer either way: not said to be gone
+    s.once('connect', () => done(true));
+    s.once('error', (e) => done(!(e && e.code === 'ECONNREFUSED')));
+  });
+}
+/* { addr, file } (file: the drover.ini that sends it there), or null. */
+async function discordDeadProxy(v, pids, ours) {
+  const gone = async (host, port) => !!host && ProcNet.LOOPBACK.test(host) && port > 0 && !ours.includes(port) && !(await portAnswers(host, port));
+  const d = process.platform === 'win32' ? DiscordApp.drover(v) : null;
+  if (d && await gone(d.host, d.port)) return { addr: `${d.host}:${d.port}`, file: d.file };
+  // Anything else: only a Discord whose connections all stay on this
+  // computer (one that reaches anything outside is not held by a proxy), to
+  // a port where nothing runs.
+  const rows = await ProcNet.connections(pids);
+  if (rows.some((r) => !ProcNet.LOOPBACK.test(r.remote.host))) return null;
+  for (const r of rows) {
+    if (await gone(r.remote.host, r.remote.port)) return { addr: `${r.remote.host}:${r.remote.port}`, file: null };
+  }
+  return null;
+}
+/* Found gone twice, a minute apart (a proxy program started at login may
+ * come up a little after Discord), and Discord still without Shroudly: then
+ * Discord Drover's two files are set aside (moved into Shroudly's folder,
+ * never deleted, with a note saying how to put them back) and Discord is
+ * started again, which is all it takes; anything else that sends Discord
+ * there (a launch option) is only said, with what to remove. Once a session
+ * for each build and address. */
+const discordDeadSeen = new Map();
+const discordDeadDone = new Set();
+const DISCORD_DEAD_CONFIRM_MS = 60000;
+async function handleDiscordDeadProxy(v, dead) {
+  const key = `${v.id} ${dead.addr}`;
+  if (discordDeadDone.has(key)) return;
+  const first = discordDeadSeen.get(key);
+  if (!first) { discordDeadSeen.set(key, Date.now()); return; }
+  if (Date.now() - first < DISCORD_DEAD_CONFIRM_MS) return;
+  // Not over a full-screen game or video (see watchDiscord): a later look.
+  if (dead.file && await userBusy.fullScreen()) return;
+  discordDeadDone.add(key);
+  if (!dead.file) { tellHeld(v.app, dead.addr); return; }
+  const folder = path.dirname(dead.file);
+  const backup = path.join(app.getPath('userData'), 'Discord Drover', `${v.id}-${path.basename(folder)}`);
+  let moved = null;
+  let why = null;
+  discordRestarted.set(v.id, Date.now());
+  await DiscordApp.restart(v, async () => {
+    try { moved = DiscordApp.setDroverAside(dead, backup); } catch (e) { why = e.code || e.message; }
+  });
+  if (moved && moved.length) {
+    const params = { addr: dead.addr, backup, folder };
+    const note = String(tr().autoDiscordDroverMoved || '').replace(/\{(\w+)\}/g, (m, k) => (params[k] != null ? String(params[k]) : m));
+    try { fs.writeFileSync(path.join(backup, 'README.txt'), `${note}\r\n`); } catch {}
+    addLog('success', `Autopilot: Discord Drover sent ${v.app} to ${dead.addr}, where nothing is running; its files (${moved.join(', ')}) were moved to ${backup} and it was restarted`);
+    autoTell('autoDiscordDroverMoved', params);
+    engine.checkProxySoon();
+  } else {
+    addLog('warning', `Autopilot: Discord Drover (${dead.file}) sends ${v.app} to ${dead.addr}, where nothing is running; its files could not be moved (${why || 'none found'})`);
+    autoTell('autoDiscordDroverDead', { addr: dead.addr, folder });
+  }
+}
+async function checkDiscordProxies() {
+  // Whether the network blocks Discord or not: sent to a proxy that is gone,
+  // it reaches nothing anywhere.
+  if (discordBusy || !engine || !engine.isActive()) return;
+  if (engine.proxyStatus && engine.proxyStatus.ok === false) return;
+  const ports = [engine.port, discordRelay && discordRelay.port].filter(Boolean);
+  discordBusy = true;
+  try {
+    for (const v of DiscordApp.installed()) {
+      const pids = await DiscordApp.pids(v);
+      if (!pids.length || await ProcNet.connectsTo(pids, ports)) continue;
+      const dead = await discordDeadProxy(v, pids, ports);
+      if (dead) await handleDiscordDeadProxy(v, dead);
+    }
+  } finally { discordBusy = false; }
+}
+setInterval(() => { checkDiscordProxies().catch(() => {}); }, 60000).unref();
+
+/* A program that sends every connection to a proxy on this computer where
+ * nothing runs (its own proxy setting, a launch option, a DLL put beside
+ * it): it reaches nothing, with or without Shroudly, and only its own
+ * setting can change that. Named once a run with the address. */
+const heldTold = new Set();
+function tellHeld(app, addr) {
+  const key = `${String(app).toLowerCase()} ${addr}`;
+  if (heldTold.has(key)) return;
+  heldTold.add(key);
+  addLog('warning', `Autopilot: ${app} sends every connection to a proxy at ${addr}, where nothing is running; it cannot connect until that proxy runs again or its setting is removed`);
+  autoTell('autoAppProxyDead', { app, addr });
+}
+
+/* Windows: any program held by such a proxy (procnet.js heldLocally), found
+ * from three looks at the connection table 0.7 s apart (a SYN no one
+ * answers lasts a second or two, and a held program keeps trying), seen
+ * again a minute later, and the port still refusing. Discord is looked
+ * after on its own (its Drover is set aside), Shroudly is never named. */
+const heldSeen = new Map();   // "pid port" -> when first seen
+/* netstat -ano's TCP lines (procnet.js netstatText: the engine's table
+ * where it runs); fresh: not one another look took a moment ago. */
+function netstatTcp(fresh = false) {
+  return ProcNet.netstatText(fresh ? 0 : 4000);
+}
+function processName(pid) {
+  return new Promise((resolve) => require('child_process').execFile('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { windowsHide: true, timeout: 8000 },
+    (err, out) => resolve(err ? null : ProcNet.parseTasklistName(String(out || ''), pid))));
+}
+async function checkHeldPrograms() {
+  if (process.platform !== 'win32') return;
+  const ours = [engine && engine.port, discordRelay && discordRelay.port, appProxy && appProxy.port].filter(Boolean);
+  // One look first: almost always nothing waits on a proxy port here, and
+  // netstat on a busy Windows is not free. Only then two more, 0.7 s apart,
+  // so a program reaching anywhere else in any of them is not taken as held.
+  const rows = ProcNet.parseNetstat(await netstatTcp());
+  if (!ProcNet.heldLocally(rows, { ours }).size) { heldSeen.clear(); return; }
+  for (let i = 0; i < 2; i++) {
+    await new Promise((r) => setTimeout(r, 700));
+    rows.push(...ProcNet.parseNetstat(await netstatTcp(true)));
+  }
+  const now = Date.now();
+  const live = new Set();
+  for (const [pid, ports] of ProcNet.heldLocally(rows, { ours })) {
+    if (pid === process.pid) continue;
+    for (const port of ports) {
+      const key = `${pid} ${port}`;
+      live.add(key);
+      const first = heldSeen.get(key);
+      if (!first) { heldSeen.set(key, now); continue; }
+      if (now - first < 60000 || await portAnswers('127.0.0.1', port)) continue;
+      const name = await processName(pid);
+      if (!name || /^(shroudly|shroudly-core|discord|discordptb|discordcanary|discorddevelopment)(\.exe)?$/i.test(name)) continue;
+      tellHeld(name.replace(/\.exe$/i, ''), `127.0.0.1:${port}`);
+    }
+  }
+  for (const k of [...heldSeen.keys()]) if (!live.has(k)) heldSeen.delete(k);
+}
+if (process.platform === 'win32') {
+  app.whenReady().then(() => { setInterval(() => { checkHeldPrograms().catch(() => {}); }, 60000).unref(); });
+}
+
+/* Windows: the WinHTTP proxy (winhttp.js) pointing at a program on this
+ * computer that is gone: Windows Update, the Microsoft Store and some
+ * programs stop connecting, whatever Shroudly does. Said once a run;
+ * clearing it is offered in the window (Windows then asks for an
+ * administrator), at once when the window is open, else the next time it
+ * is shown; asked once. */
+let winhttpGone = null;   // the proxy list found gone, until it is asked about
+let winhttpTold = false;
+const fillIn = (text, params) => String(text || '').replace(/\{(\w+)\}/g, (m, k) => (params[k] != null ? String(params[k]) : m));
+// again: Settings → Repair, which looks again even after "Later".
+async function checkWinHttp({ again = false } = {}) {
+  if (process.platform !== 'win32') return;
+  if (again) { winhttpTold = false; try { store.delete('winhttpLater'); } catch {} }
+  if (winhttpTold) return;
+  const list = await WinHttp.read();
+  const gone = list ? WinHttp.goneList(list, (port) => ProcNet.listeningSync(port)) : null;
+  if (!gone) return;
+  winhttpTold = true;
+  addLog('warning', `Windows' WinHTTP proxy points at ${gone}, where nothing is running: Windows Update, the Microsoft Store and some programs cannot connect`);
+  // The same leftover the user already answered "Later" to: not asked again
+  // (it came back at every start, as a dialog); a different one is.
+  if (store.get('winhttpLater') === gone) return;
+  autoTell('autoWinhttpDead', { addr: gone });
+  // A standard account could not clear it: Windows would ask for an
+  // administrator's password it does not have. The line says what it is,
+  // and Settings > Repair is there for an administrator; no dialog.
+  if (storeApps && (await storeApps.canConsent().catch(() => null)) === false) return;
+  winhttpGone = gone;
+  if (windowAlive() && mainWindow.isVisible()) offerWinHttpReset().catch(() => {});
+}
+async function offerWinHttpReset() {
+  if (!winhttpGone || modalOpen > 0 || !windowAlive()) return;
+  const s = tr();
+  const gone = winhttpGone;
+  winhttpGone = null;
+  modalOpen++;
+  let r;
+  try {
+    r = await dialog.showMessageBox(mainWindow, {
+      type: 'warning', noLink: true, buttons: [s.winhttpReset, s.updLater], defaultId: 0, cancelId: 1,
+      message: s.winhttpDeadTitle, detail: fillIn(s.autoWinhttpDead, { addr: gone }),
+    });
+  } finally { modalOpen--; }
+  if (r.response !== 0) { try { store.set('winhttpLater', gone); } catch {} return; }
+  await clearWinHttp();
+}
+async function clearWinHttp() {
+  const ok = await WinHttp.reset();
+  addLog(ok ? 'success' : 'warning', ok ? "Windows' WinHTTP proxy cleared" : "Windows' WinHTTP proxy could not be cleared (no administrator's permission)");
+  return ok;
+}
+// The window's line about it has the button its words promise ("Shroudly
+// can clear it"): after "Later", or where no dialog was shown, it was the
+// only thing left, and it had none.
+ipcMain.handle('winhttp:clear', async () => {
+  if (process.platform !== 'win32') return { ok: false };
+  winhttpGone = null;
+  return { ok: await clearWinHttp() };
+});
+if (process.platform === 'win32') {
+  app.whenReady().then(() => {
+    setTimeout(() => { checkWinHttp().catch(() => {}); }, 20000);
+    setInterval(() => { checkWinHttp().catch(() => {}); }, 30 * 60 * 1000).unref();
+  });
+}
+
+/* Advanced mode, started from the window or by the autopilot. */
+async function startAdvanced() {
+  try {
+    const ttl = Number(store.get('fakeTtl', 4)) || 4;
+    // QUIC forced to TCP and Discord-voice decoys are on by default; a user can
+    // turn either off in settings without the browser losing TCP coverage.
+    const opts = {
+      quicBlock: store.get('advancedQuicBlock', true) !== false,
+      udpFake: store.get('advancedUdpFake', true) !== false,
+      // Programs that ignore the proxy (a bot on Node, a launcher) get their
+      // DNS from the encrypted-DNS forwarder too, not the network's forged
+      // answers. Its port stays the same across a Stop and Start.
+      dnsGate: engine && engine.dohPort ? engine.dohPort : 0,
+      // Split the ClientHello's TLS record for networks that reassemble the TCP
+      // stream before they inspect (Türkiye's Superonline, #48). OPT-IN, not a
+      // default: Advanced mode's broadened capture would otherwise also catch
+      // the engine's own proxy connections — which the engine has already
+      // shaped — and grow them a second time, breaking them (regression seen in
+      // 2.6.29). Until Advanced mode skips the engine's own connections, this
+      // stays off unless the user turns it on for direct-connection cases
+      // (Serein and the like).
+      tlsrec: store.get('advancedTlsRec', false) === true,
+      // Decoys carry the names of large sites in the user's country (a network
+      // that lets only allowed sites through keeps those open).
+      decoyNames: engine ? engine.decoyNames() : [],
+    };
+    // Another program that changes the same packets (rivals.js) may use the
+    // same WinDivert driver: then the engine leaves it loaded at stop (#56).
+    let rival = [];
+    try { rival = await Rivals.running(); } catch {}
+    opts.keepDriver = rival.length > 0;
+    const r = await advanced.start(ttl, opts);
+    addLog('success', 'Advanced mode enabled');
+    // Running: an antivirus block told earlier is over.
+    advancedBlocked = false;
+    if (engine && engine.advice.security && engine.advice.security.part === 'advanced') engine._setAdvice({ security: null });
+    // It undoes Advanced mode without either of them failing; say so as soon
+    // as it is on.
+    if (rival.length) {
+      addLog('warning', `${rival.join(', ')} is running: it changes the same connections Advanced mode does, and two of them undo each other. Turn one of them off.`);
+      autoTell('autoRivalTool', { rival: rival.join(', ') });
+    }
+    advancedState(true);
+    return r || { success: true };
+  } catch (e) {
+    // An antivirus that removed its files or refused it: told as that, in
+    // its own line (securityBlocked).
+    const blocked = (e.code === 'security_blocked' || e.code === 'files_missing') && e.info;
+    if (blocked) securityBlocked(e.info);
+    else if (e.message !== advancedFailSaid.msg || Date.now() - advancedFailSaid.at > 60000) {
+      addLog('error', `Advanced mode failed: ${e.message}`);
+      advancedFailSaid = { msg: e.message, at: Date.now() };
+    }
+    // Its working folder could not be made: the temporary folder made again
+    // (a cleaning program deleted it), or new files refused on this computer,
+    // said once, and not asked for again by itself this session.
+    if (!blocked && writeGuard && writeGuard.note(e)) advancedBlocked = true;
+    // Windows 7 without the SHA-2 update: it fails the same way until the
+    // update is in; not asked for again by itself this session.
+    if (e.code === 'needs_sha2') advancedBlocked = true;
+    return {
+      success: false, error: e.message, code: e.code || 'start_failed',
+      kind: blocked ? e.info.kind : null, win32: blocked ? e.info.win32 : null, certain: blocked ? e.info.certain !== false : null,
+    };
+  }
+}
+
+/* Is host blocked on this network for a program that goes to it directly
+ * (blockcheck.js), through the engine while protection is on. */
+function checkBlocked(host) {
+  return BlockCheck.check(host, { socksPort: engine && engine.isActive() ? engine.port : null, connect: DiscordRelay.socksConnect });
+}
+
+function createAutopilot() {
+  autopilot = new Autopilot({
+    store,
+    log: addLog,
+    tell: autoTell,
+    // Windows: a standard account is not asked for Advanced mode by itself.
+    canConsent: process.platform === 'win32' ? () => (storeApps ? storeApps.canConsent() : null) : null,
+    protectionOn: () => !!(engine && engine.isActive()),
+    check: checkBlocked,
+    services: [
+      {
+        id: 'discord', name: 'Discord', probe: 'discord.com', mode: 'discordMode', needsApp: true,
+        present: () => DiscordApp.installed().length > 0,
+        // Its app open (any system, any build): what a failing gateway is
+        // judged by for Advanced mode.
+        running: () => DiscordApp.anyRunning(),
+        // The macOS permission panel only with the window there to show it.
+        enable: () => applyDiscordMode(true, { interactive: windowAlive() && mainWindow.isVisible() }),
+        logOn: 'Autopilot: Discord is blocked on this network; Discord app mode turned on',
+        told: 'autoDiscordOn',
+        toldOff: 'autoDiscordOffByHand',
+        toldFailed: 'autoDiscordFailed',
+      },
+      {
+        id: 'roblox', name: 'Roblox', probe: 'clientsettingscdn.roblox.com', mode: 'appMode', needsApp: false,
+        present: () => appModeSupported() && (RobloxApp.installed() || RobloxApp.installed('studio')),
+        enable: () => (appModeSupported() ? applyAppMode(true) : Promise.resolve({ success: false, code: 'unsupported' })),
+        logOn: 'Autopilot: Roblox is blocked on this network; Games and apps mode turned on',
+        told: 'autoRobloxOn',
+        toldOff: 'autoRobloxOffByHand',
+        toldFailed: 'autoRobloxFailed',
+      },
+      {
+        // League of Legends, VALORANT and their installer (#76): the same
+        // mode as Roblox, for the same reason (they never use the system
+        // proxy). Its app is not needed: someone on the website, about to
+        // run the installer, needs it most.
+        id: 'riot', name: 'Riot Games', probe: 'www.leagueoflegends.com', mode: 'appMode', needsApp: false,
+        present: () => appModeSupported() && RiotApp.installed(),
+        enable: () => (appModeSupported() ? applyAppMode(true) : Promise.resolve({ success: false, code: 'unsupported' })),
+        logOn: 'Autopilot: Riot Games is blocked on this network; Games and apps mode turned on',
+        told: 'autoRiotOn',
+        toldOff: 'autoRiotOffByHand',
+        toldFailed: 'autoRiotFailed',
+      },
+    ],
+    // Roblox found blocked: its programs that go around Shroudly are seen
+    // to at once, not at the next look.
+    onBlocked: (id) => { if (id === 'roblox') robloxWatch.warm(); },
+    onRouting: () => applyDirectRoutes(),
+    advanced: {
+      available: () => !!(advanced && advanced.available()),
+      active: () => !!(advanced && advanced.active),
+      // On protection's behalf: a Stop while it waits wins, and it waits
+      // for the Store apps' permission prompt if one is on screen.
+      session: () => advancedProtection.session(),
+      start: (since) => advancedProtection.start(since),
+      antiCheat: () => Autopilot.antiCheatRunning(),
+    },
+  });
+  // Apps installed later, and the check that is due again after a while.
+  setInterval(() => { autopilot.survey().catch(() => {}); }, 10 * 60 * 1000).unref();
+  // A network that forges DNS answers: Games and apps mode for the programs
+  // that do not use the system proxy (autopilot.js forgedDns).
+  // Its forged answers are also what a program around Shroudly is seen
+  // landing on (around-watch.js).
+  if (engine) {
+    engine.onDnsTampering = (hosts) => {
+      if (aroundWatch) aroundWatch.forged(hosts);
+      autopilot.forgedDns((hosts || []).map((h) => h.host)).catch(() => {});
+    };
+  }
+  createAroundWatch();
+}
+
+/* A service's own name whose addresses take no connection, through Shroudly
+ * (the engine's "unreachable" at the connection stage; Roblox's servers on
+ * some networks): checked directly (blockcheck.addressesAnswer), the
+ * addresses encrypted DNS gives and those the network's DNS gives (the
+ * engine may reach a service at the latter, see "the network's own DNS"),
+ * and where none of them answers while the internet does, the network
+ * blocks the service's servers by address, which no technique on this
+ * computer gets past. Said in one line, once a network per service, instead of leaving
+ * the user waiting on the app with only a line in the log. */
+const SERVICE_NAME = { discord: 'Discord', roblox: 'Roblox' };
+const reachTold = new Set();
+let lastSiteReach = 0;
+const reachBusy = new Set();
+/* Another name of the service got answers through Shroudly in the last ten
+ * minutes (the engine's Connections list): at least 16 KB came back. Pure,
+ * for the tests. */
+function serviceWorks(family, host, rows) {
+  const h = String(host || '').toLowerCase();
+  return (rows || []).some((r) => r && typeof r.host === 'string' && r.host.toLowerCase() !== h
+    && Autopilot.familyOf(r.host) === family && Number(r.down) >= 16 * 1024 && Number(r.ago) < 10 * 60 * 1000);
+}
+
+/* Tor is the way to a site the network blocks by address, and here it is
+ * turned off in Settings (no server of the user's own either): what is
+ * said names it, instead of "only a VPN" or nothing at all (an Iran report:
+ * Tor turned off, YouTube and Instagram dead, not a word said). */
+function torOffHere() {
+  return store.get('torLastResort', false) === false && !store.get('ownServer') && !torUnsupported();
+}
+
+/* A site no technique opens (still blocked after them all) while Tor is
+ * turned off: said once a session per site, and at
+ * most once a minute, in the window. Only a site's own name, not the CDN and
+ * API names a page loads. */
+const torOffTold = new Set();
+let torOffLast = 0;
+function tellTorOff(host) {
+  if (!torOffHere() || !engine || !engine.isActive() || wake.recent(2 * 60 * 1000)) return false;
+  const site = ServiceCheck.isMainName(host) ? String(host).toLowerCase().replace(/\.$/, '').replace(/^www\./, '') : null;
+  const family = Autopilot.familyOf(host);
+  const name = (family && SERVICE_NAME[family]) || site;
+  if (!name || torOffTold.has(name)) return false;
+  const now = Date.now();
+  if (now - torOffLast < 60000) return false;
+  torOffLast = now;
+  torOffTold.add(name);
+  addLog('warning', `${name}: no technique opens it on this network; the last way out (Tor) would, but it is turned off in Settings`);
+  autoTell('autoTorOff', { host: name });
+  return true;
+}
+
+async function checkServiceReach(host) {
+  const family = Autopilot.familyOf(host);
+  const service = family && SERVICE_NAME[family];
+  // Any other site a person opens (example.com, not the CDN and API hosts
+  // a page loads): the same check, said in the window only, and at most
+  // one such check a minute. Before, only Discord and Roblox were told
+  // that the network blocks their addresses; every other such site just
+  // failed, with a line in the log.
+  const site = !service && ServiceCheck.isMainName(host) ? String(host).toLowerCase().replace(/\.$/, '').replace(/^www\./, '') : null;
+  const id = service ? family : site;
+  const name = service || site;
+  if (!id || reachTold.has(id) || reachBusy.has(id) || wake.recent(2 * 60 * 1000)) return;
+  if (!engine || !engine.isActive() || !engine.dohPort) return;
+  if (site) {
+    const now = Date.now();
+    if (now - lastSiteReach < 60000) return;
+    lastSiteReach = now;
+  }
+  reachBusy.add(id);
+  try {
+    // The service's other names working through Shroudly right now: then it
+    // is one name of it that the network blocks by address (Roblox's
+    // silver.roblox.com on Turkish networks, while its game servers and
+    // every API opened), not the service. Said as a block of the whole
+    // service, it told people in the middle of a game that Roblox does not
+    // work on this network and only a VPN gets there.
+    if (service && serviceWorks(family, host, await engine.connsList().catch(() => []))) return;
+    const [ours, theirs] = await Promise.all([AroundWatch.addrsVia(engine.dohPort)(host), Diagnostics.systemResolve(host).then((a) => a || [])]);
+    // Both kinds in what is tried (it tries the first eight).
+    const other = theirs.filter((ip) => !Diagnostics.looksForged(ip));
+    const mixed = Array.from({ length: Math.max(ours.length, other.length) }, (_, i) => [ours[i], other[i]]).flat().filter(Boolean);
+    const addrs = [...new Set(mixed)].filter(AroundWatch.isPublic);
+    const ok = await BlockCheck.addressesAnswer(addrs);
+    if (ok !== false || reachTold.has(id)) return;
+    reachTold.add(id);
+    // Another program changing the same packets can stop a connection just as
+    // a blocked address does. Name it rather than blame the network (rivals.js).
+    const rival = await Rivals.running();
+    if (rival.length) {
+      addLog('warning', `${name}: its servers do not answer, and ${rival.join(', ')} is running: it changes the same connections Advanced mode does, and two of them undo each other. Turn one of them off.`);
+      autoTell('autoRivalTool', { rival: rival.join(', ') });
+      return;
+    }
+    if (torOffHere()) {
+      addLog('warning', `${name}: its servers (${host}: ${addrs.slice(0, 8).join(', ')}) do not answer on this network at all; the last way out (Tor) gets there, but it is turned off in Settings`);
+      if (askTorAgain(name)) return;
+      if (!torOffTold.has(name)) { torOffTold.add(name); autoTell('autoTorOff', { host: name }); }
+      return;
+    }
+    addLog('warning', `${name}: its servers (${host}: ${addrs.slice(0, 8).join(', ')}) do not answer on this network at all, while the internet does; the network blocks their addresses, and only a VPN gets around that`);
+    if (service) autoTell('autoServiceUnreachable', { app: service });
+    else autoTell('autoSiteUnreachable', { host: site });
+  } finally { reachBusy.delete(id); }
+}
+
+/* Programs that go around Shroudly and that this network stops (a bot, a
+ * command-line tool): Advanced mode carries them too, so the autopilot asks
+ * for it, naming the program (around-watch.js). Looked for only while it is
+ * available and off, and the autopilot would still ask or say why not; not
+ * with only listed sites going through Shroudly (the rest going around is
+ * the user's choice), nor just after a wake (connections from before it). */
+function createAroundWatch() {
+  aroundWatch = new AroundWatch({
+    wanted: () => !!(engine && engine.isActive() && advanced && advanced.available() && !advanced.active && !advanced._starting
+      && autopilot && autopilot.advancedPending() && store.get('routeMode') !== 'listed' && !wake.recent(2 * 60 * 1000)),
+    connections: (want) => ProcNet.outbound(want),
+    dnsCache: () => ProcNet.dnsCache(),
+    check: checkBlocked,
+    blockedServices: () => (autopilot ? autopilot.blockedAtHandshake() : []),
+    // From encrypted DNS: the network's DNS is never told the sites.
+    resolve: (name) => (engine && engine.dohPort ? AroundWatch.addrsVia(engine.dohPort)(name) : Promise.resolve([])),
+    modeOn: (mode) => store.get(mode) === true,
+    // Every process of the app (its network service too) and the engine.
+    ownPids: () => {
+      let pids = [process.pid];
+      try { pids = pids.concat(app.getAppMetrics().map((m) => m.pid)); } catch {}
+      if (engine && engine.proc && engine.proc.pid) pids.push(engine.proc.pid);
+      return pids;
+    },
+    need: (host, opts) => autopilot.needAdvanced(host, opts),
+    log: addLog,
+  });
+  setInterval(() => { aroundWatch.look().catch(() => {}); }, AroundWatch.LOOK_MS).unref();
+}
+
+/* Microsoft Store apps (Windows): Windows keeps the ones that run in an app
+ * container away from programs on this computer, Shroudly's proxy too, unless
+ * they have a loopback exemption. Once one of them is open, the autopilot
+ * adds them with one administrator prompt and says so (never by itself to an
+ * account that cannot say Yes); the switch in Settings asks at once, or takes
+ * Shroudly's own out again (store-apps.js). */
+function createStoreApps() {
+  storeApps = new StoreApps({
+    store,
+    log: addLog,
+    tell: autoTell,
+    protectionOn: () => !!(engine && engine.isActive()),
+    // Advanced mode's permission prompt on screen: never a second one beside it.
+    busy: () => !!(advanced && advanced._starting),
+    fullScreen: () => userBusy.fullScreen(),
+    mayAsk: () => store.get('askByItself', true) !== false,
+    onChange: () => toWindow('storeapps:state', storeApps.status()),
+  });
+  if (!storeApps.available()) return;
+  // A Store app opened later is seen at the next look, once a minute: a
+  // sign-in broker an app calls on may not run for long. Cheap: tasklist
+  // /apps; the programs' app containers are looked at only once that list
+  // changed, the app containers' list read only for a sign not seen before
+  // (or every half hour).
+  setInterval(() => { storeApps.survey().catch(() => {}); }, 60 * 1000).unref();
+}
+ipcMain.handle('storeapps:status', () => (storeApps ? storeApps.status() : { available: false, on: false }));
+ipcMain.handle('storeapps:set', async (e, on) => (storeApps ? storeApps.setMode(on === true) : { success: false }));
+
+/* "Block ads and trackers" (adblock.js): the list fetched through the engine
+ * when there is none or it is a week old, checked by the engine, then put to
+ * use without a restart. A failed or wrong download leaves things as they
+ * were and is tried again later. */
+let adblockList = null;
+async function ensureAdblock() {
+  if (store.get('adBlock') !== true || !adblockList || !engine || !engine.isActive() || !adblockList.due()) return;
+  addLog('info', 'Ad blocking: fetching the list');
+  let tmp;
+  try { tmp = await adblockList.fetch(engine.port); } catch (e) {
+    addLog('warning', `Ad blocking: the list could not be fetched (${e.message}); Shroudly tries again later`);
+    return;
+  }
+  const v = await engine.adblockCheck(tmp);
+  if (!v.ok) {
+    adblockList.discard(tmp);
+    addLog('warning', `Ad blocking: the list fetched is not one to use (${v.error || 'unknown'})`);
+    return;
+  }
+  adblockList.adopt(tmp);
+  if (store.get('adBlock') === true && engine.isActive()) engine.adblockApply();
+}
+setInterval(() => { ensureAdblock().catch(() => {}); }, 60 * 60 * 1000).unref();
+
+/* Settings, "Your own server" (own-server.js): a link, or null for none.
+ * Refused with the reason when it cannot be read; the engine restarts with
+ * it (or without). */
+function setOwnServer(value) {
+  const was = store.get('ownServer') || null;
+  if (value == null || value === '') {
+    if (!was) return { success: true };
+    store.delete('ownServer');
+    addLog('info', 'Your own server: off; sites go straight again');
+  } else {
+    const p = OwnServer.parseLink(value);
+    if (!p.ok) return { success: false, error: p.error, method: p.method, what: p.what };
+    const link = String(value).trim();
+    if (link === was) return { success: true };
+    store.set('ownServer', link);
+    addLog('info', `Your own server: ${OwnServer.describe(p)}; every site goes through it`);
+  }
+  scheduleEngineRestart();
+  return { success: true };
+}
+ipcMain.handle('ownserver:test', (e, link) => (engine ? engine.testOwnServer(link) : { ok: false, why: 'noAnswer' }));
+
+/* Settings, "Share my connection" (share.js): on or off, kept for the next
+ * start; its links and counts; a new link. */
+ipcMain.handle('share:set', async (e, on) => {
+  if (!share) return { on: false };
+  store.set('shareOn', on === true);
+  try {
+    if (on === true) await share.start(); else await share.stop();
+  } catch (err) {
+    store.set('shareOn', false);
+    addLog('warning', `Sharing this connection could not start: ${err.message}`);
+    return { on: false, error: err.message };
+  }
+  return share.status();
+});
+ipcMain.handle('share:status', () => (share ? share.status() : { on: false }));
+ipcMain.handle('share:newLink', () => (share ? share.newLink() : { on: false }));
+
+/* Where Tor itself is blocked (national-net.js TOR_BLOCKED): helping others
+ * is not offered, and a proxy left on is not run. */
+function helpHidden() {
+  try { return NationalNet.torBlocked(NationalNet.homeCountry({ remembered: store.get('homeCountry') })); } catch { return false; }
+}
+
+/* Settings, "Help people in censored countries" (snowflake.js): on or off,
+ * kept for the next start; how many are helped. */
+ipcMain.handle('snowflake:set', async (e, on) => {
+  if (!snowflake) return { on: false, state: 'off', now: 0, total: 0 };
+  if (on === true && helpHidden()) return { on: false, state: 'off', now: 0, total: 0 };
+  store.set('snowflakeOn', on === true);
+  try {
+    if (on === true) return await snowflake.start();
+    return await snowflake.stop();
+  } catch (err) {
+    store.set('snowflakeOn', false);
+    addLog('warning', `Helping people in censored countries could not start: ${err.message}`);
+    try { await snowflake.stop(); } catch {}
+    return { on: false, state: 'off', now: 0, total: 0, error: err.message };
+  }
+});
+ipcMain.handle('snowflake:status', () => (snowflake ? snowflake.status() : { on: false, state: 'off', now: 0, total: 0 }));
+
+/* Settings, "DNS server" (issue #34): automatic (null), or the user's own
+ * { kind, server }, refused with the reason when it cannot be read. Used
+ * from the next lookup on; nothing restarts. */
+function setCustomDns(value) {
+  if (value && typeof value === 'object') {
+    const spec = CustomDnsLib.parse(value.kind, value.server);
+    if (spec.error) return { success: false, error: spec.error };
+    // Through the user's proxy (#58): not for UDP, which proxies hardly relay.
+    const proxyText = spec.kind === 'udp' ? '' : String(value.proxy || '').trim();
+    const proxy = CustomDnsLib.parseProxy(proxyText);
+    if (proxy && proxy.error) return { success: false, error: 'proxy' };
+    const was = store.get('customDns');
+    const next = { kind: spec.kind, server: String(value.server).trim(), strict: value.strict === true };
+    if (proxy) next.proxy = proxyText;
+    if (was && was.kind === next.kind && was.server === next.server && (was.strict === true) === next.strict
+      && (was.proxy || '') === (next.proxy || '')) return { success: true };
+    store.set('customDns', next);
+    addLog('info', `DNS server: ${CustomDnsLib.shown(spec)}${next.strict ? ' (only this one)' : ''}`);
+    if (proxy) addLog('info', `DNS server proxy: ${CustomDnsLib.shownProxy(proxy)}`);
+  } else {
+    if (!store.get('customDns')) return { success: true };
+    store.delete('customDns');
+    addLog('info', 'DNS server: automatic');
+  }
+  if (engine) engine.applyCustomDns();
+  return { success: true };
+}
+ipcMain.handle('dns:test', async (e, value) => {
+  const spec = CustomDnsLib.parse(value && value.kind, value && value.server);
+  if (spec.error) return { ok: false, invalid: spec.error };
+  const proxy = spec.kind === 'udp' ? null : CustomDnsLib.parseProxy(value && value.proxy);
+  if (proxy && proxy.error) return { ok: false, invalid: 'proxy' };
+  if (!engine) return { ok: false, error: 'not ready' };
+  return engine.testDns(spec, proxy);
+});
+
+ipcMain.handle('settings:set', (e, key, value) => {
+  if (key === 'customDns') return setCustomDns(value);
+  if (key === 'ownServer') return setOwnServer(value);
+  // No list of one's own: follow the automatic list again.
+  if (key === 'siteList' && !Array.isArray(value)) store.delete('siteList');
+  else store.set(key, value);
+  // The Tor toggle turned on by hand is the user's yes to it (issue #77);
+  // off, it asks again the next time it is turned on.
+  if (key === 'torLastResort') { store.set('torApproved', value === true); if (value === false) store.set('torAskRest', Date.now()); torAsk = null; }
+  if (ENGINE_SETTINGS.has(key)) scheduleEngineRestart();
+  if (PROXY_SETTINGS.has(key)) { routing = null; scheduleProxyReapply(); scheduleSiteListCheck(5000); }
+  if (key === 'adBlock' || key === 'adBlockAllow') {
+    if (engine && engine.isActive()) engine.adblockApply();
+    ensureAdblock().catch(() => {});
+  }
+  if (key === 'language') { rebuildTrayMenu(); setAppMenu(); }
+  if (key === 'showTrayIcon') setTrayIcon(value !== false);
+  if (key === 'logo') applyLogo();
+  if (key === 'autoUpdate' && updater) updater.autoChanged();
+  if (key === 'autoStart') {
+    const ok = setAutoStart(value);
+    if (!ok) { store.set('autoStart', false); return { success: false, error: 'Could not set auto-start' }; }
+  }
+  return { success: true };
+});
+
+/* Settings → Application, where Shroudly keeps its data (data-dir.js,
+ * issue #72): the folder now and the other places; a folder picked; a
+ * change, after which Shroudly restarts from there (protection stopped and
+ * the system's settings put back first, as on any quit). */
+ipcMain.handle('datadir:get', () => DataDir.choices({ current: dataPlace, defaultDir: defaultUserData }));
+ipcMain.handle('datadir:pick', async () => {
+  modalOpen++;
+  try {
+    const r = await dialog.showOpenDialog(mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined, { properties: ['openDirectory', 'createDirectory'] });
+    return r.canceled || !r.filePaths[0] ? null : r.filePaths[0];
+  } catch { return null; } finally { modalOpen--; }
+});
+ipcMain.handle('datadir:set', (e, target) => {
+  const r = DataDir.choose(target, { current: dataPlace, defaultDir: defaultUserData });
+  if (!r.ok) {
+    addLog('warning', `Data folder: could not change to ${target === 'default' || target === 'portable' ? target : `"${target}"`} (${r.error}${r.detail ? `: ${r.detail}` : ''})`);
+    return r;
+  }
+  if (r.same) return r;
+  addLog('info', `Data folder: everything copied to "${r.dir}"; Shroudly restarts from there (the old folder is left as it was)`);
+  setTimeout(() => { app.relaunch(); app.quit(); }, 300);
+  return r;
+});
+
+/* The Connections list (Stats; issue #74): what went through Shroudly, by
+ * name, with the names Shroudly itself uses marked, and the user's blocks. */
+ipcMain.handle('conns:list', async () => {
+  const rows = engine ? await engine.connsList() : [];
+  let own = null;
+  try { const p = OwnServer.parseLink(store.get('ownServer')); if (p.ok) own = p.host; } catch {}
+  return {
+    rows: rows.map((r) => ({ ...r, system: SystemHosts.isSystemHost(r.host, [own]) })),
+    blocked: store.get('userBlocked', []),
+    torSites: store.get('torSites', []),
+    // "Apps always through Tor": the ones picked, and the list to pick from.
+    torApps: store.get('torApps', []),
+    torAppList: TorApps.APPS.map((a) => ({ id: a.id, name: a.name })),
+    // The names the picked apps send through Tor (their buttons decide those).
+    torAppNames: TorApps.entriesOf(store.get('torApps', [])).filter((n) => !n.includes('/')),
+    // Whether a site can be sent through Tor here (not on Windows 7/8 or a
+    // processor with no Tor, not while your own server carries everything).
+    torOk: !torUnsupported() && !store.get('ownServer'),
+    // The names Shroudly needs: never offered for blocking (typed ones neither).
+    ownNames: [...SystemHosts.SYSTEM_HOSTS, ...(own ? [own] : [])],
+    // What the ad list stopped lately, the names already let through left
+    // out: a page that "does not open" is often one the list blocks whole
+    // (a link shortener's, SR-G563), and nothing said so until 2.6.78.
+    ads: adsShown(),
+  };
+});
+function adsShown() {
+  if (!engine || store.get('adBlock') !== true) return [];
+  const allow = Array.isArray(store.get('adBlockAllow')) ? store.get('adBlockAllow') : [];
+  return (engine.lastAds || []).filter((a) => a.host && !allow.some((n) => a.host === n || a.host.endsWith(`.${n}`))).slice(0, 30);
+}
+/* One the user let through from Connections: added to Sites never to block,
+ * and the running engine told at once (as the setting itself). */
+ipcMain.handle('adblock:allow', (_e, host) => {
+  const h = String(host || '').trim().toLowerCase();
+  if (!/^[a-z0-9.-]{1,253}$/.test(h) || !h.includes('.')) return { ok: false };
+  const allow = Array.isArray(store.get('adBlockAllow')) ? store.get('adBlockAllow') : [];
+  if (!allow.includes(h)) store.set('adBlockAllow', [...allow, h]);
+  if (engine && engine.isActive()) engine.adblockApply();
+  if (engine) engine.lastAds = (engine.lastAds || []).filter((a) => a.host !== h && !a.host.endsWith(`.${h}`));
+  return { ok: true, ads: adsShown() };
+});
+/* Settings, the last way out: whether Tor is on this computer yet, and
+ * fetching it ahead of time ("Prepare it now", issue #75). */
+/* Windows 7, 8 and 8.1 (the legacy build): Tor 16 needs Windows 10. */
+function torOldWindows() {
+  return process.platform === 'win32' && Number(String(require('os').release()).split('.')[0]) < 10;
+}
+/* No Tor for this system: Windows 7 and 8, or a processor the Tor Project
+ * builds no Tor for (32-bit ARM Linux). */
+function torUnsupported() {
+  return torOldWindows() || !TorFiles.DESKTOP[TorDownload.target()];
+}
+ipcMain.handle('tor:status', () => {
+  if (torUnsupported()) return { present: false, state: 'off', progress: 0, unsupported: torOldWindows() ? 'windows' : 'arch' };
+  const t = engine && engine.tor;
+  return t ? { present: t.present(), state: t.status().state, progress: t.status().progress } : { present: false, state: 'off', progress: 0 };
+});
+ipcMain.handle('tor:prepare', async () => {
+  const t = engine && engine.tor;
+  return t ? { ok: await t.getReady() } : { ok: false };
+});
+ipcMain.handle('conns:block', (e, host, on) => {
+  if (!engine) return { ok: false };
+  // A name Shroudly itself needs is never blocked (the window offers no
+  // button for it); unblocking one blocked before stays possible.
+  if (on === true) {
+    let own = null;
+    try { const p = OwnServer.parseLink(store.get('ownServer')); if (p.ok) own = p.host; } catch {}
+    if (SystemHosts.isSystemHost(host, [own])) return { ok: false, why: 'system' };
+  }
+  return engine.setBlocked(host, on === true);
+});
+
+/* "Send through Tor" in the Connections list: choosing it is the user's
+ * consent to Tor, so the last way out is turned on (the engine starts again
+ * with it) and allowed; Tor itself starts when the site is next opened. */
+ipcMain.handle('conns:tor', (e, host, on) => {
+  if (!engine) return { ok: false };
+  if (on === true && torUnsupported()) return { ok: false, why: 'unsupported' };
+  const r = engine.setTorSite(host, on === true);
+  if (r.ok && on === true) {
+    if (!store.get('torApproved', false)) {
+      store.set('torApproved', true);
+      addLog('info', `The last way out: allowed by the user (sending ${String(host)} through Tor); Tor starts when it is needed`);
+    }
+    if (store.get('torLastResort', false) === false) { store.set('torLastResort', true); scheduleEngineRestart(); }
+    else if (engine.isActive() && engine.tor) engine.tor.need();
+  }
+  return r;
+});
+
+/* "Apps always through Tor": an app picked is, like a site sent through
+ * Tor, the user's consent to Tor (see conns:tor). */
+ipcMain.handle('conns:torApp', (e, id, on) => {
+  if (!engine) return { ok: false };
+  if (on === true && torUnsupported()) return { ok: false, why: 'unsupported' };
+  const r = engine.setTorApp(String(id || ''), on === true);
+  if (r.ok && on === true) {
+    if (!store.get('torApproved', false)) {
+      store.set('torApproved', true);
+      addLog('info', `The last way out: allowed by the user (sending ${String(id)} through Tor); Tor starts when it is needed`);
+    }
+    if (store.get('torLastResort', false) === false) { store.set('torLastResort', true); scheduleEngineRestart(); }
+    else if (engine.isActive() && engine.tor) engine.tor.need();
+  }
+  return r;
+});
+
+ipcMain.handle('update:getState', () => (updater ? updater.state : { status: 'unsupported' }));
+ipcMain.handle('update:check', () => (updater ? updater.check(true) : null));
+ipcMain.handle('update:download', () => updater && updater.download());
+ipcMain.handle('update:install', () => updater && updater.install());
+ipcMain.handle('update:postpone', () => updater && updater.postpone());
+ipcMain.handle('update:moveToApplications', () => updater && updater.moveToApplications());
+
+/* Repair, and Reset all settings (Settings → Application, issue #46;
+ * repair.js). */
+ipcMain.handle('app:repair', () => Repair.repair({
+  files: () => {
+    const core = EngineManager.coreBinaryPath();
+    const list = [{ name: path.basename(core), path: core }];
+    // Advanced mode's own files, where this system has Advanced mode.
+    const code = advanced ? advanced.reasonCode() : null;
+    if (code === 'not_built') list.push({ name: 'shroudly-core-adv', path: '' });
+    if (code === 'windivert_missing') list.push({ name: 'WinDivert', path: '' });
+    // Taken from an installed Shroudly: named one by one.
+    if (code === 'files_missing') for (const f of advanced._files()) list.push({ name: path.basename(f), path: f });
+    return list;
+  },
+  forgetLearned: () => { store.delete('learnedTechniques'); store.delete('learnedRawTechniques'); store.delete('avoidTechniques'); store.delete('avoidTechniques2'); },
+  engineOn: () => !!(engine && engine.isActive()),
+  restartEngine: async () => {
+    if (engine.doh && engine.doh.networkChanged) engine.doh.networkChanged();
+    await engine.restart();
+    await engine.reapplyProxy({ userAsked: true });
+  },
+  flushDns: () => Repair.flushDnsCache(),
+  adblock: async () => {
+    if (store.get('adBlock') !== true || !adblockList) return;
+    try { fs.unlinkSync(adblockList.sourceFile); } catch {}
+    adblockList.lastTry = -Infinity;
+    await ensureAdblock();
+  },
+  winHttp: () => (process.platform === 'win32' ? checkWinHttp({ again: true }) : null),
+  log: addLog,
+}));
+ipcMain.handle('app:resetSettings', () => Repair.resetSettings({
+  store,
+  turnOffModes: async () => {
+    if (advanced && (advanced.active || advanced.standby)) {
+      advancedProtection.offByHand();
+      await advanced.stop();
+      advancedState(false);
+    }
+    if (store.get('discordMode') === true) await applyDiscordMode(false, { interactive: false });
+    if (store.get('appMode') === true) await applyAppMode(false);
+    if (storeApps && store.get('storeAppsMode') === true) await storeApps.setMode(false);
+  },
+  // The app again, with the settings a new install has (auto-start is
+  // written to the system at every start).
+  relaunch: () => { app.relaunch({ args: Launch.relaunchArgs(process.argv) }); shutdownAndQuit(); },
+  log: addLog,
+}));
+
+ipcMain.handle('logs:get', () => systemLogs);
+// A short version of the log, with what a report needs to know, to the
+// clipboard only; the whole log to a file the user attaches.
+ipcMain.handle('logs:copy', () => copyLogs());
+ipcMain.handle('clipboard:write', (e, text) => typeof text === 'string' && text.length <= 300 && toClipboard(text, clipboard));
+ipcMain.handle('logs:save', () => saveLogs());
+
+/* "Something not working?" (electron/report.js): the reports sent from this
+ * computer (references kept 60 days) and whether one may go now; sending
+ * one, only from the dialog, after the user read what goes. One at a time. */
+let reportSending = false;
+
+/* What the report adds after the log, so the problem can be seen at once:
+ * the state the window shows (what is wrong now, in the app's own terms),
+ * the engine's counters, and the settings: switches, numbers and short
+ * choices only. Nothing that can hold an address, a password, a server's
+ * link or the user's own lists (those only by how many entries they have). */
+/* For a report: the Discord apps on this computer, whether each runs and
+ * whether its connections reach Shroudly (the engine or the updater relay),
+ * and what the relay served. A Discord stuck on "Starting" was otherwise
+ * read from the Connections list alone. At most 3 s; never throws. */
+async function reportApps() {
+  const out = {};
+  const work = (async () => {
+    const ports = [engine && engine.isActive() ? engine.port : null, discordRelay && discordRelay.port].filter(Boolean);
+    for (const v of DiscordApp.installed()) {
+      const pids = await DiscordApp.pids(v).catch(() => []);
+      const row = { running: pids.length > 0 };
+      if (pids.length && ports.length) row.reachesShroudly = await ProcNet.connectsTo(pids, ports).catch(() => null);
+      // Discord's own last words (a build stuck on "Starting" says why there).
+      try { row.updaterThroughShroudly = DiscordApp.hasOurs(v); } catch {}
+      const log = DiscordApp.logTail(v);
+      if (log) row.log = log;
+      out[v.app || v.id] = row;
+    }
+    if (discordRelay) {
+      out.discordUpdaterRelay = {
+        on: !!discordRelay.server,
+        requests: discordRelay.requests || 0,
+        lastOkSecondsAgo: discordRelay.lastOkAt ? Math.round((Date.now() - discordRelay.lastOkAt) / 1000) : null,
+      };
+    }
+  })().catch((e) => { out.error = e.message; });
+  await Promise.race([work, new Promise((r) => setTimeout(r, 3000))]);
+  return out;
+}
+
+function reportSituation() {
+  let all = {};
+  try { all = { ...store.store }; } catch {}
+  // Every setting as it acts, defaults included, and which were changed
+  // (report-settings.js): never a link, an address or a password.
+  const { settings, changed } = ReportSettings.effective(all);
+  const a = engine && engine.advice ? engine.advice : {};
+  let tor = null;
+  try { tor = engine && engine.tor ? engine.tor.status().state : null; } catch {}
+  const safe = (f) => { try { return f(); } catch { return null; } };
+  return {
+    now: new Date().toISOString(),
+    utcOffsetMin: -new Date().getTimezoneOffset(),
+    uptimeMin: Math.round(process.uptime() / 60),
+    state: {
+      active: !!(engine && engine.isActive()),
+      starting: !!engine && !engine.isActive() && engineComing(),
+      lastStartFailed: !!lastStartFailed,
+      blocked: engineBlocked(),
+      notRouting: (() => { try { return notRouting(); } catch { return null; } })(),
+      proxy: engine && engine.proxyStatus ? engine.proxyStatus.code || null : null,
+      offline: !!a.offline, ownProxy: !!a.ownProxy, nationalOnly: !!a.nationalOnly,
+      ownServerDown: a.ownServerDown ? String(a.ownServerDown.why || 'yes') : null,
+      ownServerExitCountry: a.ownServerExit ? a.ownServerExit.loc || null : null,
+      lastResort: tor,
+    },
+    stats: engine ? engine.getStats() : null,
+    // What runs beside the engine, and why not where it does not.
+    parts: {
+      advanced: safe(() => ({ on: !!(advanced && advanced.active), available: !!(advanced && advanced.available()), why: advanced ? advanced.reasonCode() : 'not loaded',
+        // What the packet engine did (its raw_stats line): servers escalated
+        // after a cut, first segments sent the stronger way, with timestamps.
+        stats: advanced && advanced.active ? advanced.stats() : null })),
+      discordRelay: safe(() => !!(discordRelay && discordRelay.running)),
+      appProxy: safe(() => !!(appProxy && appProxy.running)),
+      tor: safe(() => (engine && engine.tor ? { here: engine.tor.present(), ...engine.tor.status() } : null)),
+      helpingOthers: safe(() => !!(snowflake && snowflake.on)),
+    },
+    // What the autopilot found on this network: blocked services and how,
+    // and those that work without Shroudly.
+    autopilot: safe(() => (autopilot ? {
+      blocked: Object.fromEntries([...autopilot.blocked].map(([id, b]) => [id, `${b.how} (${b.host})`])),
+      clear: [...autopilot.clear.keys()],
+    } : null)),
+    // The engine's own advice: other VPNs or proxies, a cut, DNS down.
+    advice: safe(() => ({ conflicts: (a.conflicts || []).map((c) => (c && (c.name || c.kind)) || String(c)).slice(0, 10), cut: a.cut ? String(a.cut.kind || 'yes') : null, dnsDown: !!a.dnsDown, security: a.security ? String(a.security.part || 'yes') : null })),
+    settings,
+    changed,
+  };
+}
+ipcMain.handle('report:offered', () => reportOffered());
+ipcMain.handle('report:info', () => {
+  const past = Report.history(store.get('reports'));
+  store.set('reports', past);
+  return { past, wait: Report.wait(past) };
+});
+ipcMain.handle('report:send', async (_e, fields) => {
+  if (reportSending) return { ok: false, error: 'busy' };
+  if (!fields || typeof fields !== 'object' || typeof fields.what !== 'string') return { ok: false, error: 'bad' };
+  const n = Report.chars(fields.what);
+  if (n < Report.WHAT_MIN || n > Report.WHAT_MAX) return { ok: false, error: 'what' };
+  // What happened in words, the site or app, and an e-mail address (report-check.js).
+  const fault = require('./report-check').problem(fields);
+  if (fault) return { ok: false, error: fault };
+  // Tried with protection on first: a log where the engine never started
+  // says nothing about what does not work.
+  if (!systemLogs.some((l) => /Starting engine/.test(l.message))) return { ok: false, error: 'tried' };
+  const past = Report.history(store.get('reports'));
+  const w = Report.wait(past);
+  if (w.ms > 0) return { ok: false, error: 'rate', limit: w.limit, retryAfter: Math.ceil(w.ms / 1000) };
+  reportSending = true;
+  try {
+    const st = reportState();
+    // What went through this session, by name (the Connections list); with
+    // protection off, the last session's, kept until the next start.
+    const on = !!(engine && engine.isActive());
+    const conns = on ? await engine.connsList(3000).catch(() => []) : [];
+    const lastConns = !on && engine && engine.lastConns ? engine.lastConns : null;
+    const apps = await reportApps().catch(() => ({}));
+    const body = Report.payload({
+      fields,
+      version: appVersion(),
+      platform: { win32: 'windows', darwin: 'macos', linux: 'linux' }[process.platform] || 'linux',
+      os: st.os,
+      device: process.arch,
+      lang: i18n.resolveLanguage(store.get('language'), systemLanguages()),
+      log: `${buildReport({ ...st, verb: 'sent' }, systemLogs)}\n== Situation now ==\n${(() => { try { return JSON.stringify(reportSituation(), null, 1); } catch (e) { return `(not available: ${e.message})`; } })()}\n${Report.connsSection(on, conns, lastConns)}\n${store.get('adBlock') === true ? `${Report.adsSection(engine && engine.lastAds)}\n` : ''}${Report.siteEventsSection(engine && engine.siteEvents)}\n== Apps ==\n${JSON.stringify(apps, null, 1)}\n`,
+    });
+    let r = await Report.send((o) => require('electron').net.request(o), body);
+    // Not through the usual way, with Tor ready: once more through Tor
+    // (Russia's networks slow Cloudflare, where codeshare.me is, down until
+    // nothing gets through, and other VPNs there with it).
+    const torDone = !r.ok && r.error === 'network' && engine ? await torForReport() : null;
+    if (torDone) {
+      const back = engine.torForNow(new URL(Report.URL_REPORT).hostname);
+      if (back) {
+        addLog('info', 'Report: not through the usual way; sending it through Tor');
+        // The same report, every part of it, only by another way.
+        try { r = await Report.send((o) => require('electron').net.request(o), body, { timeoutMs: 90000 }); } finally { back(); }
+      }
+      torDone();
+    }
+    if (r.ok) {
+      store.set('reports', Report.history([{ ref: r.ref, at: Date.now() }, ...past]));
+      addLog('info', `Report sent to the developer: ${r.ref}`);
+      toWindow('report:offered', reportOffered());
+    } else {
+      addLog('warning', `Report not sent (${r.error})`);
+    }
+    return r.error === 'rate' ? { ...r, limit: 'hour' } : r;
+  } finally {
+    reportSending = false;
+  }
+});
+
+ipcMain.handle('net:stats', async () => {
+  const s = engine ? engine.getStats() : {};
+  return {
+    connsActive: s.connsActive || 0,
+    connsTotal: s.connsTotal || 0,
+    bytesUp: s.bytesUp || 0,
+    bytesDown: s.bytesDown || 0,
+    desync: s.desync || 0,
+    // The ad blocker's count (engine-manager.js): the Stats tab shows it
+    // once there is one; it was left out here, so the tile never came.
+    adsBlocked: s.adsBlocked || 0,
+    uptime: s.uptime || 0,
+    sampledAt: s.sampledAt || 0,
+  };
+});

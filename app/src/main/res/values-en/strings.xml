@@ -18,7 +18,7 @@
     <string name="status_disconnected">Disconnected</string>
     <string name="status_error">Connection error</string>
     <string name="no_server_title">No server yet</string>
-    <string name="no_server_hint">Add a VLESS, VMess, Trojan or Shadowsocks link from the Servers tab, or add a subscription.</string>
+    <string name="no_server_hint">Simorgh free configs are added automatically; if the list stays empty, switch the source from the Servers tab or add your own link.</string>
     <string name="add_server_now">Add server</string>
     <string name="current_server">Current server</string>
     <string name="upload">Upload</string>
@@ -51,6 +51,18 @@
     <string name="share">Share</string>
     <string name="server_deleted">Server deleted</string>
     <string name="no_servers_yet">List is empty</string>
+    <string name="servers_count">%1$d servers</string>
+
+    <!-- builtin free configs -->
+    <string name="source_name">Simorgh %1$d</string>
+    <string name="builtin_sub_title">Simorgh free configs</string>
+    <string name="builtin_sub_desc">Auto-updated every 4 hours from public sources</string>
+    <string name="change_source">Change source</string>
+    <string name="pick_source">Pick a config source</string>
+    <string name="pick_source_hint">Each source is a different pool of free public configs; if one doesn’t work, try another.</string>
+    <string name="source_switched_n">Source switched: %1$d servers</string>
+    <string name="switch_failed">Source switch failed; previous source kept</string>
+    <string name="builtin_refresh_failed">Refresh failed; keeping previous servers</string>
 
     <!-- settings -->
     <string name="routing">Routing</string>

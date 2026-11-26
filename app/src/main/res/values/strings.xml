@@ -18,7 +18,7 @@
     <string name="status_disconnected">قطع</string>
     <string name="status_error">خطا در اتصال</string>
     <string name="no_server_title">هنوز سروری نداری</string>
-    <string name="no_server_hint">از تب «سرورها» لینک VLESS، VMess، Trojan یا Shadowsocks اضافه کن، یا یه اشتراک (subscription) بذار.</string>
+    <string name="no_server_hint">کانفیگ‌های رایگان سیمرغ به‌طور خودکار اضافه می‌شوند؛ اگر خالی ماند، از تب «سرورها» منبع را عوض کن یا لینک خودت را اضافه کن.</string>
     <string name="add_server_now">افزودن سرور</string>
     <string name="current_server">سرور فعلی</string>
     <string name="upload">ارسال</string>
@@ -51,6 +51,18 @@
     <string name="share">اشتراک‌گذاری</string>
     <string name="server_deleted">سرور حذف شد</string>
     <string name="no_servers_yet">لیست خالی است</string>
+    <string name="servers_count">%1$d سرور</string>
+
+    <!-- builtin free configs -->
+    <string name="source_name">سیمرغ %1$d</string>
+    <string name="builtin_sub_title">کانفیگ‌های رایگان سیمرغ</string>
+    <string name="builtin_sub_desc">به‌طور خودکار هر ۴ ساعت از منابع عمومی به‌روز می‌شود</string>
+    <string name="change_source">تغییر منبع</string>
+    <string name="pick_source">انتخاب منبع کانفیگ</string>
+    <string name="pick_source_hint">هر منبع یک مجموعه متفاوت از کانفیگ‌های رایگان عمومی است؛ اگر یکی کار نکرد، یکی دیگر را امتحان کن.</string>
+    <string name="source_switched_n">منبع عوض شد: %1$d سرور</string>
+    <string name="switch_failed">تعویض منبع ناموفق بود؛ منبع قبلی نگه داشته شد</string>
+    <string name="builtin_refresh_failed">به‌روزرسانی ناموفق بود؛ سرورهای قبلی حفظ شدند</string>
 
     <!-- settings -->
     <string name="routing">مسیریابی</string>

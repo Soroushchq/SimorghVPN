@@ -1,0 +1,43 @@
+SimorghVPN (سیمرغ)
+Copyright (C) 2026 Soroushchq and contributors
+
+This program is free software licensed under the GNU AGPL-3.0 (see LICENSE).
+
+ATTRIBUTION NOTICE (required by upstream licenses)
+==================================================
+
+1. mlmvpn_android — https://github.com/mlmvpn/mlmvpn_android (GPL-3.0-or-later
+   with additional term under GPL §7):
+   "This app is derived from or includes code of mlmvpn. Any use, fork or
+   derivative — in source or compiled form — must visibly attribute "mlmvpn"
+   (About screen, README, or store listing)."
+
+2. MSN-GUARD — https://github.com/mbm110/MSN-GUARD (AGPL-3.0):
+   Engine architecture patterns (TunEngine seam, MTU probing, ECH roster,
+   remote policy) and the Aether Rust core (core/aether) are derived from
+   MSN-GUARD and its vendored Aether engine.
+
+3. Nova-Android — https://github.com/confeden/Nova-Android (GPL-3.0):
+   AUTO connection ladder, SNI masking regime detection, DNS obfuscation
+   racing and multi-Go-core isolation patterns are derived from Nova.
+
+4. OpenRung — https://github.com/openrung/openrung and
+   https://github.com/openrung/openrung-mobile-app (GPL-3.0):
+   connectcore policy-engine pattern and Ed25519-signed directory design.
+
+5. Shroudly — https://github.com/umutxyp/Shroudly (MIT):
+   The DPI-desync engine (core/) is ported from Shroudly (Copyright Codeshare
+   Technology Ltd, MIT). MIT notice: permission is granted free of charge to
+   any person obtaining a copy of this software and associated documentation
+   files to deal in the Software without restriction.
+
+6. defyxVPN — https://github.com/UnboundTechCo/defyxVPN (MIT):
+   UX patterns and Vazirmatn font integration.
+
+7. Derafsh VPN — https://github.com/Soroushchq/Derafsh-Vpn (GPL-3.0):
+   Base Xray client (fork of V2rayNG, Apache-2.0) and hev-socks5-tunnel
+   (MIT) TUN integration.
+
+8. V2rayNG — https://github.com/2dust/v2rayNG (Apache-2.0)
+9. hev-socks5-tunnel — https://github.com/heiher/hev-socks5-tunnel (MIT)
+10. Xray-core — https://github.com/XTLS/Xray-core (Apache-2.0)

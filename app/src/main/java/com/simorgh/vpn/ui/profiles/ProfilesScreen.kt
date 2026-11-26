@@ -21,6 +21,7 @@ import androidx.compose.material.icons.outlined.CloudDownload
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Share
+import androidx.compose.material.icons.outlined.SwapHoriz
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -31,6 +32,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -58,6 +60,8 @@ import com.simorgh.vpn.core.VpnBus
 import com.simorgh.vpn.core.VpnStatus
 import com.simorgh.vpn.core.XrayConfigBuilder
 import com.simorgh.vpn.core.XrayRunner
+import com.simorgh.vpn.data.BuiltInSources
+import com.simorgh.vpn.data.BuiltinConfigManager
 import com.simorgh.vpn.data.Profile
 import com.simorgh.vpn.data.SettingsStore
 import com.simorgh.vpn.data.ShareLinkParser
@@ -84,6 +88,8 @@ fun ProfilesScreen() {
     var showSubDialog by remember { mutableStateOf(false) }
     var deleteTarget by remember { mutableStateOf<Profile?>(null) }
     var testingAll by remember { mutableStateOf(false) }
+    var showSourcePicker by remember { mutableStateOf(false) }
+    var switching by remember { mutableStateOf(false) }
 
     val connected = vpnState.status == VpnStatus.CONNECTED || vpnState.status == VpnStatus.CONNECTING
 
@@ -178,22 +184,41 @@ fun ProfilesScreen() {
             if (subscriptions.isNotEmpty()) {
                 Spacer(Modifier.height(8.dp))
                 subscriptions.forEach { sub ->
-                    SubscriptionRow(
-                        sub = sub,
-                        onRefresh = {
-                            scope.launch {
-                                runCatching {
-                                    val n = ServiceLocator.subscriptionRepo.refresh(sub)
-                                    snackbar.showSnackbar(context.getString(R.string.sub_updated_n, n))
-                                }.onFailure {
-                                    snackbar.showSnackbar(context.getString(R.string.sub_failed))
+                    if (sub.id == BuiltInSources.BUILTIN_SUB_ID) {
+                        BuiltinSubscriptionRow(
+                            sub = sub,
+                            serverCount = profiles.count { it.subscriptionId == sub.id },
+                            activeSourceName = BuiltinConfigManager.sourceName(
+                                context, settings.builtinSourceIndex
+                            ),
+                            switching = switching,
+                            onRefresh = {
+                                scope.launch {
+                                    runCatching { ServiceLocator.subscriptionRepo.refresh(sub) }
+                                        .onSuccess { snackbar.showSnackbar(context.getString(R.string.sub_updated_n, it)) }
+                                        .onFailure { snackbar.showSnackbar(context.getString(R.string.builtin_refresh_failed)) }
                                 }
+                            },
+                            onSwitchSource = { showSourcePicker = true }
+                        )
+                    } else {
+                        SubscriptionRow(
+                            sub = sub,
+                            onRefresh = {
+                                scope.launch {
+                                    runCatching {
+                                        val n = ServiceLocator.subscriptionRepo.refresh(sub)
+                                        snackbar.showSnackbar(context.getString(R.string.sub_updated_n, n))
+                                    }.onFailure {
+                                        snackbar.showSnackbar(context.getString(R.string.sub_failed))
+                                    }
+                                }
+                            },
+                            onDelete = {
+                                scope.launch { ServiceLocator.profileRepo.removeSubscription(sub.id) }
                             }
-                        },
-                        onDelete = {
-                            scope.launch { ServiceLocator.profileRepo.removeSubscription(sub.id) }
-                        }
-                    )
+                        )
+                    }
                 }
             }
 
@@ -320,6 +345,72 @@ fun ProfilesScreen() {
         )
     }
 
+    // -------------------------------------------------- built-in source picker
+
+    if (showSourcePicker) {
+        AlertDialog(
+            onDismissRequest = { if (!switching) showSourcePicker = false },
+            title = { Text(stringResource(R.string.pick_source)) },
+            text = {
+                Column {
+                    Text(
+                        stringResource(R.string.pick_source_hint),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Column(
+                        Modifier
+                            .weight(1f, fill = false)
+                            .verticalScroll(rememberScrollState())
+                    ) {
+                        repeat(BuiltInSources.count()) { i ->
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clickable(enabled = !switching && i != settings.builtinSourceIndex) {
+                                        switching = true
+                                        scope.launch {
+                                            runCatching {
+                                                BuiltinConfigManager.switchSource(context, i)
+                                            }.onSuccess { n ->
+                                                snackbar.showSnackbar(
+                                                    context.getString(R.string.source_switched_n, n)
+                                                )
+                                            }.onFailure {
+                                                snackbar.showSnackbar(
+                                                    context.getString(R.string.switch_failed)
+                                                )
+                                            }
+                                            switching = false
+                                            showSourcePicker = false
+                                        }
+                                    },
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                RadioButton(
+                                    selected = i == settings.builtinSourceIndex,
+                                    onClick = null,
+                                    enabled = !switching
+                                )
+                                Text(BuiltinConfigManager.sourceName(context, i))
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                if (switching) {
+                    CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                } else {
+                    TextButton(onClick = { showSourcePicker = false }) {
+                        Text(stringResource(R.string.cancel))
+                    }
+                }
+            }
+        )
+    }
+
     deleteTarget?.let { target ->
         AlertDialog(
             onDismissRequest = { deleteTarget = null },
@@ -346,6 +437,71 @@ fun ProfilesScreen() {
 }
 
 // ---------------------------------------------------------------------- rows
+
+/**
+ * The built-in free-configs subscription row (Derafsh pattern): neutral title,
+ * active source label, no URL and no delete — plus a source-switch action.
+ */
+@Composable
+private fun BuiltinSubscriptionRow(
+    sub: Subscription,
+    serverCount: Int,
+    activeSourceName: String,
+    switching: Boolean,
+    onRefresh: () -> Unit,
+    onSwitchSource: () -> Unit
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.secondaryContainer
+        )
+    ) {
+        Row(
+            Modifier.padding(start = 14.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(
+                    stringResource(R.string.builtin_sub_title),
+                    style = MaterialTheme.typography.titleSmall
+                )
+                Text(
+                    "$activeSourceName · ${stringResource(R.string.servers_count, serverCount)}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    stringResource(R.string.builtin_sub_desc),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            if (switching) {
+                CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(8.dp))
+            }
+            IconButton(onClick = onRefresh) {
+                Icon(
+                    Icons.Outlined.Refresh,
+                    contentDescription = stringResource(R.string.refresh)
+                )
+            }
+            IconButton(onClick = onSwitchSource) {
+                Icon(
+                    Icons.Outlined.SwapHoriz,
+                    contentDescription = stringResource(R.string.change_source)
+                )
+            }
+        }
+    }
+}
 
 @Composable
 private fun SubscriptionRow(sub: Subscription, onRefresh: () -> Unit, onDelete: () -> Unit) {

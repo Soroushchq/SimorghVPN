@@ -1,0 +1,292 @@
+package com.simorgh.vpn.vpn
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.net.VpnService
+import android.os.Build
+import android.os.ParcelFileDescriptor
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
+import com.simorgh.vpn.MainActivity
+import com.simorgh.vpn.R
+import com.simorgh.vpn.ServiceLocator
+import com.simorgh.vpn.core.CoreBootstrap
+import com.simorgh.vpn.core.VpnBus
+import com.simorgh.vpn.core.VpnStatus
+import com.simorgh.vpn.core.XrayConfigBuilder
+import com.simorgh.vpn.core.XrayRunner
+import com.simorgh.vpn.data.TunnelMode
+import com.simorgh.vpn.util.Fmt
+import com.simorgh.vpn.util.LogBuffer
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.io.File
+
+class SimorghVpnService : VpnService() {
+
+    companion object {
+        const val ACTION_START = "com.simorgh.vpn.action.START"
+        const val ACTION_STOP = "com.simorgh.vpn.action.STOP"
+        const val EXTRA_PROFILE_ID = "profileId"
+        const val CHANNEL_ID = "simorgh_vpn_channel"
+        const val NOTIFICATION_ID = 1001
+
+        fun start(context: Context, profileId: String) {
+            val i = Intent(context, SimorghVpnService::class.java)
+                .setAction(ACTION_START)
+                .putExtra(EXTRA_PROFILE_ID, profileId)
+            ContextCompat.startForegroundService(context, i)
+        }
+
+        fun stop(context: Context) {
+            val i = Intent(context, SimorghVpnService::class.java).setAction(ACTION_STOP)
+            ContextCompat.startForegroundService(context, i)
+        }
+    }
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val opsMutex = Mutex()
+
+    private var tun: ParcelFileDescriptor? = null
+    private var runner: XrayRunner? = null
+    private var statsJob: Job? = null
+    private var lastUp = 0L
+    private var lastDown = 0L
+
+    override fun onCreate() {
+        super.onCreate()
+        createChannel()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_STOP -> {
+                enterForeground(getString(R.string.notif_stopped), "")
+                scope.launch { opsMutex.withLock { stopVpnLocked() } }
+            }
+            else -> {
+                enterForeground(getString(R.string.notif_connecting), "")
+                val pid = intent?.getStringExtra(EXTRA_PROFILE_ID)
+                scope.launch { opsMutex.withLock { startVpnLocked(pid) } }
+            }
+        }
+        return START_STICKY
+    }
+
+    // ------------------------------------------------------------------ start/stop
+
+    private suspend fun startVpnLocked(profileId: String?) {
+        try {
+            val settings = ServiceLocator.settings.value
+            val all = ServiceLocator.profileRepo.profiles.value
+            val profile = all.firstOrNull { it.id == profileId }
+                ?: all.firstOrNull { it.id == settings.activeProfileId }
+                ?: all.firstOrNull()
+                ?: error("no profile configured")
+
+            // restart if already running
+            if (runner != null) stopEngineLocked()
+
+            VpnBus.update {
+                it.copy(
+                    status = VpnStatus.CONNECTING,
+                    profileId = profile.id,
+                    profileName = profile.name,
+                    sinceMs = 0,
+                    error = ""
+                )
+            }
+            enterForeground(getString(R.string.notif_connecting), profile.name)
+
+            CoreBootstrap.ensureInit(this)
+
+            val needsTun = settings.tunnelMode != TunnelMode.PROXY_ONLY
+            tun = if (needsTun) establishTun(settings) else null
+
+            val logPath = File(filesDir, "simorgh-xray.log").absolutePath
+            val config = XrayConfigBuilder.build(profile, settings, logPath)
+            LogBuffer.d("Vpn", "config generated (${config.length} chars) mode=${settings.tunnelMode}")
+
+            val r = XrayRunner()
+            val xrayFd = if (settings.tunnelMode == TunnelMode.XRAY_TUN) (tun?.fd ?: 0) else 0
+            if (!r.start(config, xrayFd)) error("xray core failed to start")
+            runner = r
+
+            if (settings.tunnelMode == TunnelMode.HEV && tun != null) {
+                HevTunnel.start(this, tun!!, settings)
+                if (!HevTunnel.running) error("hev-socks5-tunnel failed to start")
+            }
+
+            lastUp = 0L
+            lastDown = 0L
+            VpnBus.update { it.copy(status = VpnStatus.CONNECTED, sinceMs = System.currentTimeMillis()) }
+            enterForeground(getString(R.string.notif_connected), profile.name)
+            LogBuffer.i(
+                "Vpn",
+                "connected: ${profile.name} [${profile.protocol}/${profile.network}/${profile.security}] mode=${settings.tunnelMode}"
+            )
+
+            statsJob = scope.launch { statsLoop() }
+        } catch (t: Throwable) {
+            LogBuffer.e("Vpn", "start failed", t)
+            stopEngineLocked()
+            VpnBus.update { it.copy(status = VpnStatus.ERROR, error = t.message ?: "unknown error") }
+            enterForeground(getString(R.string.status_error), t.message ?: "")
+            delay(3500)
+            VpnBus.reset(VpnStatus.DISCONNECTED)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
+    }
+
+    private suspend fun stopVpnLocked() {
+        VpnBus.update { it.copy(status = VpnStatus.STOPPING) }
+        stopEngineLocked()
+        VpnBus.reset(VpnStatus.DISCONNECTED)
+        LogBuffer.i("Vpn", "disconnected")
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    private suspend fun stopEngineLocked() {
+        statsJob?.cancel()
+        statsJob = null
+        HevTunnel.stop()
+        val r = runner
+        if (r != null) {
+            r.stop()
+            var waited = 0
+            while (r.isRunning && waited < 3000) {
+                delay(150)
+                waited += 150
+            }
+            r.release()
+        }
+        runner = null
+        runCatching { tun?.close() }
+        tun = null
+    }
+
+    private fun establishTun(s: com.simorgh.vpn.data.SimorghSettings): ParcelFileDescriptor? {
+        val b = Builder()
+            .setSession(getString(R.string.app_name))
+            .setMtu(s.mtu)
+            .addAddress("10.10.14.2", 30)
+            .addDnsServer("1.1.1.1")
+            .addRoute("0.0.0.0", 0)
+            .setMetered(false)
+        if (s.ipv6) {
+            b.addAddress("fc00::10:10:14:2", 126)
+            b.addRoute("::", 0)
+        }
+        try {
+            b.addDisallowedApplication(packageName)
+        } catch (e: Exception) {
+            LogBuffer.w("Vpn", "addDisallowedApplication: ${e.message}")
+        }
+        val t = b.establish() ?: error("VPN establish failed (permission revoked?)")
+        LogBuffer.i("Vpn", "tun established mtu=${s.mtu} ipv6=${s.ipv6}")
+        return t
+    }
+
+    // ------------------------------------------------------------------ stats
+
+    private suspend fun statsLoop() {
+        var notifAcc = 0
+        while (true) {
+            delay(1000)
+            val (up, down) = XrayRunner.parseStats(runner?.statsRaw())
+            val dUp = (up - lastUp).coerceAtLeast(0)
+            val dDown = (down - lastDown).coerceAtLeast(0)
+            lastUp = up
+            lastDown = down
+            VpnBus.update {
+                it.copy(upSpeedBps = dUp, downSpeedBps = dDown, upTotal = up, downTotal = down)
+            }
+            if (++notifAcc >= 2 && VpnBus.state.value.status == VpnStatus.CONNECTED) {
+                notifAcc = 0
+                val line = "↑ ${Fmt.speed(dUp)} · ↓ ${Fmt.speed(dDown)}"
+                notificationManager().notify(
+                    NOTIFICATION_ID,
+                    buildNotification(getString(R.string.notif_connected), line)
+                )
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ notification
+
+    private fun notificationManager(): NotificationManager =
+        getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+
+    private fun createChannel() {
+        val ch = NotificationChannel(
+            CHANNEL_ID,
+            getString(R.string.notif_channel_name),
+            NotificationManager.IMPORTANCE_LOW
+        )
+        ch.setShowBadge(false)
+        notificationManager().createNotificationChannel(ch)
+    }
+
+    private fun enterForeground(text: String, subText: String) {
+        val n = buildNotification(text, subText)
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(NOTIFICATION_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else {
+            startForeground(NOTIFICATION_ID, n)
+        }
+    }
+
+    private fun buildNotification(text: String, subText: String): Notification {
+        val open = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val stop = PendingIntent.getService(
+            this, 1,
+            Intent(this, SimorghVpnService::class.java).setAction(ACTION_STOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(getString(R.string.app_name))
+            .setContentText(if (subText.isBlank()) text else "$text · $subText")
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setContentIntent(open)
+            .addAction(0, getString(R.string.stop), stop)
+            .build()
+    }
+
+    // ------------------------------------------------------------------ lifecycle
+
+    override fun onRevoke() {
+        LogBuffer.w("Vpn", "onRevoke — system revoked the VPN")
+        scope.launch { opsMutex.withLock { stopVpnLocked() } }
+    }
+
+    override fun onDestroy() {
+        HevTunnel.stop()
+        runner?.stop()
+        runner = null
+        runCatching { tun?.close() }
+        tun = null
+        scope.cancel()
+        super.onDestroy()
+    }
+}

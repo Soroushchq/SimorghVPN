@@ -1,72 +1,88 @@
-<div align="center">
+<div dir="rtl">
 
-# سیمرغ | SimorghVPN
+# سیمرغ — SimorghVPN
 
-**کلاینت فیلترشکن فارسی‌محور — یک اپ، همهٔ موتورها**
+**کلاینت VPN یکپارچه اندروید برای کاربران فارسی‌زبان** — ادغام بهترین ایده‌های ۷ پروژه مرجع ضدسانسور در یک بدنه واحد.
 
-_Persian-first, multi-engine, anti-censorship VPN client for Android._
+> «چون سی مرغ شدند و همه کس، طائر سیمرغ شد آن‌ها» — منطق‌الطیر، عطار
 
-[![Status](https://img.shields.io/badge/Status-Phase%200%20·%20Architecture-orange)](docs/ARCHITECTURE.md) [![Platform](https://img.shields.io/badge/Platform-Android-3ddc84?logo=android&logoColor=white)]() [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
+سی پروژه مرجع (در پوشه [`elham/`](elham/))، هر کدام پرنده‌ای با بالی ویژه؛ سیمرغ ترکیب همه آنهاست.
 
-</div>
+## امکانات نسخه ۰.۱ (آلفا)
 
----
-
-## سیمرغ چیست؟
-
-در منطق‌الطیر عطار، سی پرنده به جست‌وجوی شاه‌مرغ برمی‌خیزند و درمی‌یابند که سیمرغ کسی جز خودشان نیست — **قدرت آزادی در خود ماست.** سیمرغ‌وی‌پی‌ان هم همین است: یک اپ واحد که بهترینِ هفت پروژهٔ ضدسانسور متن‌باز را زیر یک قرارداد جمع کرده است.
-
-```
-سی + مرغ = سی پرنده که با هم، قله‌ی قاف را فتح می‌کنند
-```
-
-کاربر فقط دکمهٔ اتصال را می‌زند. سیاست‌گذار سیمرغ به‌صورت خودکار از میان موتورها (دی‌سینک DPI، Xray/VLESS+Reality، WARP، MASQUE، Psiphon، …) بهترین مسیر شبکهٔ فعلی را پیدا می‌کند، سلامتش را با **پروب دادهٔ واقعی** تأیید می‌کند و در صورت خرابی بی‌درنگ مسیر بعدی را برمی‌دارد.
-
-| | |
-|---|---|
-| 🚀 **یک‌ضربه‌ای** | بدون کانفیگ هم کار می‌کند (صفر-کانفیگ اول) |
-| 🇮🇷 **فارسی‌محور** | رابط کامل فارسی/RTL، فونت وزیرمتن، Smart-Iran |
-| 🛡️ **اتصال صادقانه** | «متصل» = دادهٔ واقعی از داخل تونل رد شده |
-| 🎭 **ضدسانسور** | دی‌سینک DPI، SNI-mask، DNS-obfs، ECH، uTLS/fragmentation |
-| 🆓 **آزاد** | AGPL-3.0 — برای همیشه متن‌باز |
-
-## مستندات
-
-- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — سند یکپارچه‌سازی: تصمیم‌ها، معماری لایه‌ای، قرارداد Engine API، فازبندی
-- **[docs/research/](docs/research/)** — ۶ گزارش تحلیل عمیق پروژه‌های مرجع
-- **[elham/](elham/)** — اسنپ‌شات پروژه‌های مرجع (فقط مطالعه)
-
-## نقشه راه
-
-| فاز | هدف | وضعیت |
-|-----|-----|--------|
-| ۰ | اسکلت چندماژوله، قرارداد Engine API، CI | 🟡 در جریان |
-| ۱ | MVP: موتور Xray (مهاجرت درفش) + TUN/hev + UI یک‌ضربه + اشتراک | ⚪ |
-| ۲ | صفر-کانفیگ: موتور Desync (پورت Shroudly) + نردبان AUTO | ⚪ |
-| ۳ | موتورهای آزاد: WARP/MASQUE (Aether) + Psiphon + failover | ⚪ |
-| ۴ | هوشمند: مسیریابی تطبیقی per-app (MAE) + Smart-Iran + cfnet | ⚪ |
-| ۵ | سخت‌افشاری: MTU-scan + SNI-pool ایران + remote policy امضاشده | ⚪ |
+- **هسته Xray** — VLESS (شامل REALITY + Vision + uTLS)، VMess، Trojan، Shadowsocks
+- **مسیریابی هوشمند ایران** — دامنه‌ها و IPهای ایرانی به‌صورت مستقیم، بقیه ترافیک از تونل (`geoip:ir` / `geosite:category-ir`)
+- **DNS تقطیع‌شده** — DNS داخلی برای دامنه‌های ایرانی، DNS از طریق پروکسی برای بقیه + هدایت پورت ۵۳ به هسته
+- **دو موتور تونل** — hev-socks5-tunnel (پیش‌فرض، پایدارترین مسیر) یا TUN داخلی Xray + حالت فقط-پروکسی محلی
+- **مدیریت سرور** — افزودن با لینک، اشتراک (subscription) با به‌روزرسانی، تست پینگ واقعی از طریق هسته
+- **رابط فارسی راست‌به‌چپ** با فونت وزیرمتن، تم روشن/تاریک، بدون تبلیغ و بدون تله‌متری
 
 ## معماری در یک نگاه
 
 ```
-UI (Compose, فارسی/RTL)
-  └── SimorghCore — سیاست‌گذار: نردبان AUTO + پروب صادقانه + failover
-        └── Engine API — Xray | Desync | WARP/MASQUE | Psiphon | Tor
-              └── TunEngine — hev → tun2proxy → tun2socks (با fallback)
-                    └── Data — پروفایل، اشتراک، remote policy امضاشده
+┌─────────────────────────────────────────────┐
+│  UI (Jetpack Compose, فارسی/RTL)             │
+│  خانه │ سرورها │ تنظیمات │ لاگ               │
+├─────────────────────────────────────────────┤
+│  data/  پروفایل‌ها + اشتراک + تنظیمات        │
+├─────────────────────────────────────────────┤
+│  core/  تولید کانفیگ Xray + پل هسته          │
+│         (libv2ray.aar — همان هسته Derafsh)   │
+├─────────────────────────────────────────────┤
+│  vpn/   SimorghVpnService                    │
+│   ├─ TUN (fd) ──► hev-socks5-tunnel ──┐      │
+│   └─ TUN (fd) ──► Xray tun inbound ───┤      │
+│                    SOCKS 127.0.0.1:10808 ◄───┘
+│                    │ مسیریابی + DNS + STATS  │
+└─────────────────────────────────────────────┘
 ```
 
-## مشارکت
+جزئیات کامل: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — نقشه راه: [`docs/ROADMAP.md`](docs/ROADMAP.md)
 
-- لایسنس: **AGPL-3.0** (به دلیل استفاده از کد AGPL/GPL بالادست‌ها — جزئیات در `NOTICE`)
-- قبل از شروع، `docs/ARCHITECTURE.md` را بخوانید
-- Issue های فازبندی‌شده در بخش Issues ریپو
+## چه چیزی از کدام پروژه؟
 
----
+| قابلیت | پروژه منبع | وضعیت |
+|---|---|---|
+| هسته Xray + چرخه حیات سرویس | Derafsh / mlmvpn | ✅ نسخه ۰.۱ |
+| مسیریابی ایران‌محور + DNS تقطیع‌شده | Derafsh | ✅ نسخه ۰.۱ |
+| شاسی Kotlin + Compose با موتور قابل‌افزوده | mlmvpn | ✅ نسخه ۰.۱ |
+| تست تأخیر واقعی از طریق هسته | Derafsh / defyx | ✅ نسخه ۰.۱ |
+| زنجیره اتصال‌های جایگزین خودکار | nova / msn-guard | 🔜 ۰.۲ |
+| فرگمنت‌سازی TLS ClientHello | msn-guard | 🔜 ۰.۲ |
+| MASQUE + WARP بدون سرور | msn-guard / nova | 🔜 ۰.۳ |
+| مسیریابی تطبیقی هر-اپلیکیشن (MAE) | mlmvpn | 🔜 ۰.۳ |
+| تترینگ بدون روت (شارژ اینترنت گوشی) | nova | 🔜 بعدی |
 
-<div align="center">
+## دریافت
 
-**«چون این همه راه آمدیم، اینجا خانه‌ی ماست.»**
+از صفحه [Releases](https://github.com/Soroushchq/SimorghVPN/releases) — برای اکثر گوشی‌های مدرن `app-arm64-v8a-release.apk` مناسب است.
+
+> نسخه‌های آلفا با کلید debug امضا می‌شوند و مناسب نصب کناری (sideload) هستند.
+
+## بیلد
+
+بیلد هر پوش به `main` به‌صورت خودکار در GitHub Actions انجام می‌شود. برای بیلد محلی:
+
+```bash
+./gradlew assembleDebug
+```
+
+هسته Xray (`libv2ray.aar`) در اولین بیلد به‌طور خودکار از ریلیز رسمی [2dust/AndroidLibXrayLite](https://github.com/2dust/AndroidLibXrayLite) دانلود می‌شود. `hev-socks5-tunnel.aar` داخل ریپو موجود است.
+
+## پروژه‌های مرجع (elham/)
+
+| پروژه | لایسنس | سهم در سیمرغ |
+|---|---|---|
+| [MSN-GUARD](elham/msn-guard) | AGPL-3.0 | اسکن اندپوینت، فرگمنت‌سازی TLS، MASQUE، WARP |
+| [openrung](elham/openrung) | GPL-3.0 | شبکه رله داوطلبانه، ECH، Reality-over-WSS |
+| [openrung-mobile-app](elham/openrung-mobile-app) | GPL-3.0 | sing-box موبایل، split-tunneling منطقه‌ای |
+| [mlmvpn-android](elham/mlmvpn-android) | GPL-3.0 | شاسی چندموتوره، FLUX، MAE، Compose UI |
+| [Nova-Android](elham/nova-android) | GPL-3.0 | uTLS rotation، زنجیره جایگزین، تترینگ بدون روت |
+| [Shroudly](elham/shroudly) | MIT | desync ضد-DPI، مدل بدون سرور |
+| [defyxVPN](elham/defyxvpn) | MIT | مرجع UX فارسی، تست سرعت درون‌برنامه‌ای |
+
+## لایسنس
+
+کد سیمرغ تحت **[GPL-3.0](LICENSE)** منتشر می‌شود. اجزای بسته‌بندی‌شده و لایسنس آنها در [NOTICE](NOTICE) آمده است.
 
 </div>

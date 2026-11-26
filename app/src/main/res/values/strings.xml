@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">سیمرغ</string>
+    <string name="app_tagline">سی مرغ، یک سیمرغ</string>
+
+    <!-- nav -->
+    <string name="nav_home">خانه</string>
+    <string name="nav_profiles">سرورها</string>
+    <string name="nav_settings">تنظیمات</string>
+    <string name="nav_logs">لاگ</string>
+
+    <!-- home -->
+    <string name="connect">اتصال</string>
+    <string name="disconnect">قطع اتصال</string>
+    <string name="connecting">در حال اتصال…</string>
+    <string name="disconnecting">در حال قطع…</string>
+    <string name="status_connected">متصل</string>
+    <string name="status_disconnected">قطع</string>
+    <string name="status_error">خطا در اتصال</string>
+    <string name="no_server_title">هنوز سروری نداری</string>
+    <string name="no_server_hint">از تب «سرورها» لینک VLESS، VMess، Trojan یا Shadowsocks اضافه کن، یا یه اشتراک (subscription) بذار.</string>
+    <string name="add_server_now">افزودن سرور</string>
+    <string name="current_server">سرور فعلی</string>
+    <string name="upload">ارسال</string>
+    <string name="download">دریافت</string>
+    <string name="duration">مدت اتصال</string>
+    <string name="vpn_permission_needed">برای ادامه باید اجازه VPN را بدهی</string>
+    <string name="select_profile_first">اول یک سرور انتخاب کن</string>
+
+    <!-- profiles -->
+    <string name="add_server">افزودن سرور</string>
+    <string name="add_link_hint">لینک vless / vmess / trojan / ss یا چند لینک در خطوط جدا</string>
+    <string name="import_links">وارد کردن</string>
+    <string name="cancel">انصراف</string>
+    <string name="imported_n">%1$d سرور اضافه شد</string>
+    <string name="import_failed">هیچ لینک معتبری پیدا نشد</string>
+    <string name="subscription">اشتراک</string>
+    <string name="sub_name_hint">نام (مثلاً فروشنده کانفیگ)</string>
+    <string name="sub_url_hint">آدرس اشتراک (https://…)</string>
+    <string name="add">افزودن</string>
+    <string name="refresh">به‌روزرسانی</string>
+    <string name="sub_updated_n">اشتراک به‌روز شد: %1$d سرور</string>
+    <string name="sub_failed">دریافت اشتراک ناموفق بود</string>
+    <string name="test">تست پینگ</string>
+    <string name="test_all">تست همه</string>
+    <string name="testing">در حال تست…</string>
+    <string name="timeout">تایم‌اوت</string>
+    <string name="ms_fmt">%1$d م‌ث</string>
+    <string name="delete_server_q">این سرور حذف شود؟</string>
+    <string name="delete">حذف</string>
+    <string name="share">اشتراک‌گذاری</string>
+    <string name="server_deleted">سرور حذف شد</string>
+    <string name="no_servers_yet">لیست خالی است</string>
+
+    <!-- settings -->
+    <string name="routing">مسیریابی</string>
+    <string name="routing_ir">عبور مستقیم سایت‌های ایرانی</string>
+    <string name="routing_ir_desc">دامنه‌ها و IPهای ایران مستقیم و بقیه از تونل — پیشنهادی</string>
+    <string name="routing_global">همه‌چیز از تونل</string>
+    <string name="routing_global_desc">کل ترافیک از پروکسی عبور می‌کند</string>
+    <string name="tunnel_mode">حالت تونل</string>
+    <string name="tunnel_hev">hev-socks5-tunnel</string>
+    <string name="tunnel_hev_desc">پیش‌فرض و پایدار (توصیه‌شده)</string>
+    <string name="tunnel_xray">TUN داخلی Xray</string>
+    <string name="tunnel_xray_desc">هسته Xray مستقیماً تون را می‌خواند</string>
+    <string name="tunnel_proxy">فقط پروکسی محلی</string>
+    <string name="tunnel_proxy_desc">بدون VPN؛ socks روی 127.0.0.1:10808</string>
+    <string name="advanced">پیشرفته</string>
+    <string name="ipv6">IPv6 داخل تونل</string>
+    <string name="allow_insecure">پذیرش گواهی نامعتبر (allowInsecure)</string>
+    <string name="allow_insecure_desc">فقط وقتی سرورت مشکل گواهی دارد فعال کن</string>
+    <string name="socks_port">پورت SOCKS</string>
+    <string name="mtu">MTU</string>
+    <string name="remote_dns">DNS خارجی</string>
+    <string name="domestic_dns">DNS داخلی (برای دامنه‌های ایرانی)</string>
+    <string name="about">درباره</string>
+    <string name="version">نسخه</string>
+    <string name="core_version">نسخه هسته Xray</string>
+    <string name="licenses_note">سیمرغ پروژه‌ای آزاد تحت GPL-3.0 است؛ اجزای همراه در فایل NOTICE ریپو آمده‌اند.</string>
+    <string name="open_github">مشاهده در گیت‌هاب</string>
+
+    <!-- logs -->
+    <string name="logs_title">گزارش رویدادها</string>
+    <string name="auto_scroll">پیمایش خودکار</string>
+    <string name="clear">پاک کردن</string>
+    <string name="share_logs">اشتراک‌گذاری لاگ</string>
+    <string name="empty_logs">هنوز رویدادی ثبت نشده</string>
+
+    <!-- service notification -->
+    <string name="notif_channel_name">سرویس VPN سیمرغ</string>
+    <string name="notif_connecting">در حال اتصال…</string>
+    <string name="notif_connected">متصل — لمس برای باز کردن</string>
+    <string name="notif_stopped">قطع شد</string>
+    <string name="stop">توقف</string>
+
+    <string name="copied">کپی شد</string>
+</resources>

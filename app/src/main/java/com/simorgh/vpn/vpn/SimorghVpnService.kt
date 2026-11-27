@@ -20,6 +20,8 @@ import com.simorgh.vpn.core.VpnBus
 import com.simorgh.vpn.core.VpnStatus
 import com.simorgh.vpn.core.XrayConfigBuilder
 import com.simorgh.vpn.core.XrayRunner
+import com.simorgh.vpn.data.PerAppMode
+import com.simorgh.vpn.data.SimorghSettings
 import com.simorgh.vpn.data.TunnelMode
 import com.simorgh.vpn.util.Fmt
 import com.simorgh.vpn.util.LogBuffer
@@ -64,6 +66,7 @@ class SimorghVpnService : VpnService() {
     private var statsJob: Job? = null
     private var lastUp = 0L
     private var lastDown = 0L
+    private var wasConnected = false
 
     override fun onCreate() {
         super.onCreate()
@@ -89,15 +92,16 @@ class SimorghVpnService : VpnService() {
 
     private suspend fun startVpnLocked(profileId: String?) {
         try {
+            // full cleanup of any previous state (also clears a kill-switch hold)
+            stopEngineLocked()
+            wasConnected = false
+
             val settings = ServiceLocator.settings.value
             val all = ServiceLocator.profileRepo.profiles.value
             val profile = all.firstOrNull { it.id == profileId }
                 ?: all.firstOrNull { it.id == settings.activeProfileId }
                 ?: all.firstOrNull()
                 ?: error("no profile configured")
-
-            // restart if already running
-            if (runner != null) stopEngineLocked()
 
             VpnBus.update {
                 it.copy(
@@ -131,6 +135,7 @@ class SimorghVpnService : VpnService() {
 
             lastUp = 0L
             lastDown = 0L
+            wasConnected = true
             VpnBus.update { it.copy(status = VpnStatus.CONNECTED, sinceMs = System.currentTimeMillis()) }
             enterForeground(getString(R.string.notif_connected), profile.name)
             LogBuffer.i(
@@ -141,18 +146,61 @@ class SimorghVpnService : VpnService() {
             statsJob = scope.launch { statsLoop() }
         } catch (t: Throwable) {
             LogBuffer.e("Vpn", "start failed", t)
-            stopEngineLocked()
-            VpnBus.update { it.copy(status = VpnStatus.ERROR, error = t.message ?: "unknown error") }
-            enterForeground(getString(R.string.status_error), t.message ?: "")
-            delay(3500)
-            VpnBus.reset(VpnStatus.DISCONNECTED)
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+            failLocked(t)
         }
+    }
+
+    /** Engine failure: kill-switch hold if enabled+connected, else normal error teardown. */
+    private suspend fun failLocked(t: Throwable) {
+        val settings = ServiceLocator.settings.value
+        val hold = wasConnected && settings.killSwitch && tun != null
+        if (hold) {
+            holdBlackholeLocked(t)
+            return
+        }
+        stopEngineLocked()
+        wasConnected = false
+        VpnBus.update { it.copy(status = VpnStatus.ERROR, error = t.message ?: "unknown error") }
+        enterForeground(getString(R.string.status_error), t.message ?: "")
+        delay(3500)
+        VpnBus.reset(VpnStatus.DISCONNECTED)
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    /**
+     * Kill-switch (msn-guard/Derafsh "block on disconnect" pattern): when the
+     * engine dies unexpectedly after a successful connection, keep the TUN
+     * interface up with no reader — traffic black-holes instead of leaking
+     * to the direct (censored) network. The user stops or reconnects manually.
+     */
+    private suspend fun holdBlackholeLocked(cause: Throwable) {
+        LogBuffer.w("Vpn", "kill-switch engaged — holding TUN black-hole: ${cause.message}")
+        statsJob?.cancel()
+        statsJob = null
+        HevTunnel.stop()
+        val r = runner
+        if (r != null) {
+            r.stop()
+            var waited = 0
+            while (r.isRunning && waited < 3000) {
+                delay(150)
+                waited += 150
+            }
+            r.release()
+        }
+        runner = null
+        // tun stays open on purpose — that is the whole point
+        wasConnected = false
+        VpnBus.update {
+            it.copy(status = VpnStatus.BLOCKED, error = cause.message ?: "engine stopped")
+        }
+        enterForeground(getString(R.string.notif_blocked), "")
     }
 
     private suspend fun stopVpnLocked() {
         VpnBus.update { it.copy(status = VpnStatus.STOPPING) }
+        wasConnected = false
         stopEngineLocked()
         VpnBus.reset(VpnStatus.DISCONNECTED)
         LogBuffer.i("Vpn", "disconnected")
@@ -179,7 +227,7 @@ class SimorghVpnService : VpnService() {
         tun = null
     }
 
-    private fun establishTun(s: com.simorgh.vpn.data.SimorghSettings): ParcelFileDescriptor? {
+    private fun establishTun(s: SimorghSettings): ParcelFileDescriptor? {
         val b = Builder()
             .setSession(getString(R.string.app_name))
             .setMtu(s.mtu)
@@ -191,11 +239,34 @@ class SimorghVpnService : VpnService() {
             b.addAddress("fc00::10:10:14:2", 126)
             b.addRoute("::", 0)
         }
-        try {
-            b.addDisallowedApplication(packageName)
-        } catch (e: Exception) {
-            LogBuffer.w("Vpn", "addDisallowedApplication: ${e.message}")
+
+        // per-app proxy (split tunneling) — Derafsh/V2rayNG PerAppProxy pattern
+        val pkgs = s.perAppPackages
+        when {
+            s.perAppMode == PerAppMode.ALLOW && pkgs.isNotEmpty() -> {
+                pkgs.forEach { p ->
+                    runCatching { b.addAllowedApplication(p) }
+                        .onFailure { LogBuffer.w("Vpn", "allow $p: ${it.message}") }
+                }
+                LogBuffer.i("Vpn", "per-app: allow-list (${pkgs.size} apps)")
+            }
+            s.perAppMode == PerAppMode.DENY && pkgs.isNotEmpty() -> {
+                try { b.addDisallowedApplication(packageName) } catch (_: Exception) {}
+                pkgs.forEach { p ->
+                    runCatching { b.addDisallowedApplication(p) }
+                        .onFailure { LogBuffer.w("Vpn", "deny $p: ${it.message}") }
+                }
+                LogBuffer.i("Vpn", "per-app: deny-list (${pkgs.size} apps)")
+            }
+            else -> {
+                try {
+                    b.addDisallowedApplication(packageName)
+                } catch (e: Exception) {
+                    LogBuffer.w("Vpn", "addDisallowedApplication: ${e.message}")
+                }
+            }
         }
+
         val t = b.establish() ?: error("VPN establish failed (permission revoked?)")
         LogBuffer.i("Vpn", "tun established mtu=${s.mtu} ipv6=${s.ipv6}")
         return t
@@ -207,7 +278,17 @@ class SimorghVpnService : VpnService() {
         var notifAcc = 0
         while (true) {
             delay(1000)
-            val (up, down) = XrayRunner.parseStats(runner?.statsRaw())
+            val r = runner
+            if (r != null && !r.isRunning) {
+                // engine died unexpectedly → kill-switch hold or honest error
+                scope.launch {
+                    opsMutex.withLock {
+                        if (runner === r) failLocked(RuntimeException("core exited unexpectedly"))
+                    }
+                }
+                return
+            }
+            val (up, down) = XrayRunner.parseStats(r?.statsRaw())
             val dUp = (up - lastUp).coerceAtLeast(0)
             val dDown = (down - lastDown).coerceAtLeast(0)
             lastUp = up

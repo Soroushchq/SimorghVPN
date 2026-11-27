@@ -127,4 +127,46 @@ class ProfileRepo(private val context: Context) {
     suspend fun replaceSubscriptionProfiles(subId: String, list: List<Profile>) = persist { st ->
         st.copy(profiles = st.profiles.filter { it.subscriptionId != subId } + list)
     }
+
+    /**
+     * Merge a backup into the store (BackupManager). Duplicates by content key
+     * are skipped; id collisions get fresh ids. The built-in subscription is
+     * never imported (it is self-managing). Returns (profilesAdded, subsAdded).
+     */
+    suspend fun importBackup(
+        incoming: List<Profile>,
+        subs: List<Subscription>
+    ): Pair<Int, Int> {
+        var addedP = 0
+        var addedS = 0
+        persist { st ->
+            var ps = st.profiles
+            val usedIds = ps.map { it.id }.toMutableSet()
+            val seen = ps.map { contentKey(it) }.toMutableSet()
+            incoming.forEach { p ->
+                if (p.subscriptionId == BuiltInSources.BUILTIN_SUB_ID) return@forEach
+                val k = contentKey(p)
+                if (k in seen) return@forEach
+                seen.add(k)
+                val id = if (p.id in usedIds) ShareLinkParser.newId() else p.id
+                usedIds.add(id)
+                ps = ps + p.copy(id = id)
+                addedP++
+            }
+            var ss = st.subscriptions
+            val seenUrls = ss.map { it.url }.toMutableSet()
+            subs.forEach { s ->
+                if (s.id == BuiltInSources.BUILTIN_SUB_ID) return@forEach
+                if (s.url in seenUrls) return@forEach
+                seenUrls.add(s.url)
+                ss = ss + s
+                addedS++
+            }
+            st.copy(profiles = ps, subscriptions = ss)
+        }
+        return addedP to addedS
+    }
+
+    private fun contentKey(p: Profile) =
+        "${p.protocol}|${p.host}|${p.port}|${p.secret}|${p.network}|${p.path}|${p.serviceName}"
 }

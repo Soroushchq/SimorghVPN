@@ -103,6 +103,24 @@ fun HomeScreen(onOpenProfiles: () -> Unit) {
             delay(1000)
         }
     }
+
+    // v0.2: auto-connect on app open (only when VPN permission is already granted)
+    LaunchedEffect(Unit) {
+        if (ServiceLocator.settings.value.autoConnect &&
+            VpnBus.state.value.status == VpnStatus.DISCONNECTED
+        ) {
+            delay(1200) // give profiles a moment to load
+            val st = ServiceLocator.settings.value
+            val profiles = ServiceLocator.profileRepo.profiles.value
+            val pid = st.activeProfileId.ifBlank { profiles.firstOrNull()?.id }
+            if (pid != null &&
+                VpnBus.state.value.status == VpnStatus.DISCONNECTED &&
+                VpnService.prepare(context) == null
+            ) {
+                SimorghVpnService.start(context, pid)
+            }
+        }
+    }
     val durSec =
         if (vpnState.status == VpnStatus.CONNECTED && vpnState.sinceMs > 0) (now - vpnState.sinceMs) / 1000
         else 0L
@@ -111,6 +129,7 @@ fun HomeScreen(onOpenProfiles: () -> Unit) {
         VpnStatus.CONNECTED -> stringResource(R.string.disconnect)
         VpnStatus.CONNECTING -> stringResource(R.string.connecting)
         VpnStatus.STOPPING -> stringResource(R.string.disconnecting)
+        VpnStatus.BLOCKED -> stringResource(R.string.connect)
         else -> stringResource(R.string.connect)
     }
     val statusText = when (vpnState.status) {
@@ -118,6 +137,7 @@ fun HomeScreen(onOpenProfiles: () -> Unit) {
         VpnStatus.CONNECTING -> stringResource(R.string.connecting)
         VpnStatus.STOPPING -> stringResource(R.string.disconnecting)
         VpnStatus.ERROR -> stringResource(R.string.status_error)
+        VpnStatus.BLOCKED -> stringResource(R.string.status_blocked)
         else -> stringResource(R.string.status_disconnected)
     }
 
@@ -153,9 +173,14 @@ fun HomeScreen(onOpenProfiles: () -> Unit) {
                 label = buttonLabel,
                 onClick = {
                     if (vpnState.status == VpnStatus.CONNECTED ||
-                        vpnState.status == VpnStatus.CONNECTING
+                        vpnState.status == VpnStatus.CONNECTING ||
+                        vpnState.status == VpnStatus.BLOCKED
                     ) {
-                        SimorghVpnService.stop(context)
+                        if (vpnState.status == VpnStatus.BLOCKED) {
+                            connect()
+                        } else {
+                            SimorghVpnService.stop(context)
+                        }
                     } else {
                         connect()
                     }
@@ -166,11 +191,14 @@ fun HomeScreen(onOpenProfiles: () -> Unit) {
             Text(
                 statusText,
                 style = MaterialTheme.typography.titleSmall,
-                color = if (vpnState.status == VpnStatus.ERROR) MaterialTheme.colorScheme.error
+                color = if (vpnState.status == VpnStatus.ERROR || vpnState.status == VpnStatus.BLOCKED)
+                    MaterialTheme.colorScheme.error
                 else MaterialTheme.colorScheme.onSurfaceVariant
             )
 
-            if (vpnState.status == VpnStatus.ERROR && vpnState.error.isNotBlank()) {
+            if ((vpnState.status == VpnStatus.ERROR || vpnState.status == VpnStatus.BLOCKED) &&
+                vpnState.error.isNotBlank()
+            ) {
                 Spacer(Modifier.height(8.dp))
                 Card(
                     colors = CardDefaults.cardColors(

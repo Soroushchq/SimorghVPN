@@ -3,7 +3,7 @@ package com.simorgh.vpn.core
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 
-enum class VpnStatus { DISCONNECTED, CONNECTING, CONNECTED, STOPPING, ERROR }
+enum class VpnStatus { DISCONNECTED, CONNECTING, CONNECTED, STOPPING, ERROR, BLOCKED }
 
 data class VpnUiState(
     val status: VpnStatus = VpnStatus.DISCONNECTED,

@@ -17,8 +17,8 @@ android {
         applicationId = "com.simorgh.vpn"
         minSdk = 26
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.1.3"
+        versionCode = 5
+        versionName = "0.2.0"
     }
 
     splits {
@@ -71,6 +71,7 @@ dependencies {
     implementation(libs.androidx.datastore.preferences)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.serialization.json)
+    implementation(libs.zxing.embedded) // QR scanner (Derafsh/V2rayNG pattern)
     debugImplementation(libs.androidx.ui.tooling)
 }
 
@@ -85,23 +86,36 @@ tasks.register("downloadXrayCore") {
     onlyIf { !xrayCoreAar.exists() }
     doLast {
         val repo = "2dust/AndroidLibXrayLite"
-        logger.lifecycle("[simorgh] resolving latest release of $repo ...")
-        val conn = URI("https://api.github.com/repos/$repo/releases/latest").toURL()
-            .openConnection() as HttpURLConnection
-        conn.connectTimeout = 15000
-        conn.readTimeout = 30000
-        conn.setRequestProperty("Accept", "application/vnd.github+json")
-        System.getenv("GITHUB_TOKEN")?.takeIf { it.isNotBlank() }?.let {
-            conn.setRequestProperty("Authorization", "Bearer $it")
-        }
-        val body = conn.inputStream.bufferedReader().use { it.readText() }
-        val url = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*libv2ray\\.aar)\"")
-            .find(body)?.groupValues?.get(1)
-            ?: error("libv2ray.aar not found in latest $repo release")
-        logger.lifecycle("[simorgh] downloading $url")
         xrayCoreAar.parentFile.mkdirs()
         val tmp = File(xrayCoreAar.parentFile, "libv2ray.aar.part")
-        URI(url).toURL().openStream().use { input -> tmp.outputStream().use { input.copyTo(it) } }
+
+        // 1) direct redirect (no API — survives API rate limits)
+        val direct = "https://github.com/$repo/releases/latest/download/libv2ray.aar"
+        logger.lifecycle("[simorgh] downloading $direct")
+        val directOk = runCatching {
+            URI(direct).toURL().openStream().use { input -> tmp.outputStream().use { input.copyTo(it) } }
+            tmp.length() > 1_000_000
+        }.getOrDefault(false)
+
+        // 2) fallback: resolve asset url via the GitHub API
+        if (!directOk) {
+            logger.lifecycle("[simorgh] direct download failed; resolving via API ...")
+            val conn = URI("https://api.github.com/repos/$repo/releases/latest").toURL()
+                .openConnection() as HttpURLConnection
+            conn.connectTimeout = 15000
+            conn.readTimeout = 30000
+            conn.setRequestProperty("Accept", "application/vnd.github+json")
+            System.getenv("GITHUB_TOKEN")?.takeIf { it.isNotBlank() }?.let {
+                conn.setRequestProperty("Authorization", "Bearer $it")
+            }
+            val body = conn.inputStream.bufferedReader().use { it.readText() }
+            val url = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*libv2ray\\.aar)\"")
+                .find(body)?.groupValues?.get(1)
+                ?: error("libv2ray.aar not found in latest $repo release")
+            logger.lifecycle("[simorgh] downloading $url")
+            URI(url).toURL().openStream().use { input -> tmp.outputStream().use { input.copyTo(it) } }
+        }
+
         check(tmp.length() > 1_000_000) { "downloaded file too small: ${tmp.length()}" }
         check(tmp.renameTo(xrayCoreAar)) { "cannot move downloaded aar" }
         logger.lifecycle("[simorgh] Xray core ready: ${xrayCoreAar.absolutePath} (${xrayCoreAar.length()} bytes)")

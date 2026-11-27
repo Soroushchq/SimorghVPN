@@ -5,16 +5,26 @@ import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.serialization.Serializable
 
 private val Context.settingsStore by preferencesDataStore(name = "simorgh_settings")
 
+@Serializable
 enum class RoutingMode { IR_BYPASS, GLOBAL }
 
+@Serializable
 enum class TunnelMode { HEV, XRAY_TUN, PROXY_ONLY }
 
+/** Per-app proxy (split tunneling) mode — Derafsh/V2rayNG perAppProxy pattern. */
+@Serializable
+enum class PerAppMode { OFF, ALLOW, DENY }
+
+@Serializable
 data class SimorghSettings(
     val routingMode: RoutingMode = RoutingMode.IR_BYPASS,
     val tunnelMode: TunnelMode = TunnelMode.HEV,
@@ -26,7 +36,15 @@ data class SimorghSettings(
     val domesticDns: String = "1.1.1.1",
     val activeProfileId: String = "",
     /** Active index in [BuiltInSources.SOURCE_URLS]. */
-    val builtinSourceIndex: Int = 0
+    val builtinSourceIndex: Int = 0,
+    /** Kill-switch: on unexpected engine death, hold the TUN black-hole instead of leaking. */
+    val killSwitch: Boolean = true,
+    /** Auto-connect when the app opens. */
+    val autoConnect: Boolean = false,
+    /** Auto-connect after device boot / app update (needs the BootReceiver toggle). */
+    val autoStartBoot: Boolean = false,
+    val perAppMode: PerAppMode = PerAppMode.OFF,
+    val perAppPackages: Set<String> = emptySet()
 )
 
 object SettingsStore {
@@ -42,6 +60,11 @@ object SettingsStore {
         val DOMESTIC_DNS = stringPreferencesKey("domestic_dns")
         val ACTIVE = stringPreferencesKey("active_profile_id")
         val BUILTIN_SOURCE = intPreferencesKey("builtin_source_index")
+        val KILL_SWITCH = booleanPreferencesKey("kill_switch")
+        val AUTO_CONNECT = booleanPreferencesKey("auto_connect")
+        val AUTO_START_BOOT = booleanPreferencesKey("auto_start_boot")
+        val PER_APP_MODE = stringPreferencesKey("per_app_mode")
+        val PER_APP_PACKAGES = stringSetPreferencesKey("per_app_packages")
     }
 
     fun flow(context: Context): Flow<SimorghSettings> {
@@ -57,10 +80,18 @@ object SettingsStore {
                 remoteDns = p[Keys.REMOTE_DNS]?.trim().takeUnless { it.isNullOrBlank() } ?: "1.1.1.1",
                 domesticDns = p[Keys.DOMESTIC_DNS]?.trim().takeUnless { it.isNullOrBlank() } ?: "1.1.1.1",
                 activeProfileId = p[Keys.ACTIVE] ?: "",
-                builtinSourceIndex = (p[Keys.BUILTIN_SOURCE] ?: 0).coerceIn(0, BuiltInSources.count() - 1)
+                builtinSourceIndex = (p[Keys.BUILTIN_SOURCE] ?: 0).coerceIn(0, BuiltInSources.count() - 1),
+                killSwitch = p[Keys.KILL_SWITCH] ?: true,
+                autoConnect = p[Keys.AUTO_CONNECT] ?: false,
+                autoStartBoot = p[Keys.AUTO_START_BOOT] ?: false,
+                perAppMode = enumOf(p[Keys.PER_APP_MODE], PerAppMode.OFF),
+                perAppPackages = p[Keys.PER_APP_PACKAGES] ?: emptySet()
             )
         }
     }
+
+    /** One-shot synchronous snapshot (BootReceiver, TileService). */
+    suspend fun snapshot(context: Context): SimorghSettings = flow(context).first()
 
     private inline fun <reified T : Enum<T>> enumOf(raw: String?, def: T): T {
         if (raw.isNullOrBlank()) return def
@@ -82,4 +113,10 @@ object SettingsStore {
     suspend fun setActiveProfile(context: Context, id: String) = edit(context) { it[Keys.ACTIVE] = id }
     suspend fun setBuiltinSourceIndex(context: Context, index: Int) =
         edit(context) { it[Keys.BUILTIN_SOURCE] = index.coerceIn(0, BuiltInSources.count() - 1) }
+    suspend fun setKillSwitch(context: Context, v: Boolean) = edit(context) { it[Keys.KILL_SWITCH] = v }
+    suspend fun setAutoConnect(context: Context, v: Boolean) = edit(context) { it[Keys.AUTO_CONNECT] = v }
+    suspend fun setAutoStartBoot(context: Context, v: Boolean) = edit(context) { it[Keys.AUTO_START_BOOT] = v }
+    suspend fun setPerAppMode(context: Context, v: PerAppMode) = edit(context) { it[Keys.PER_APP_MODE] = v.name }
+    suspend fun setPerAppPackages(context: Context, pkgs: Set<String>) =
+        edit(context) { it[Keys.PER_APP_PACKAGES] = pkgs }
 }

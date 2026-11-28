@@ -40,7 +40,13 @@ class ProfileRepo(private val context: Context) {
         withContext(Dispatchers.IO) {
             mutex.withLock {
                 val ns = transform(readStore())
-                file.writeText(json.encodeToString(ns))
+                // atomic tmp+rename so the :daemon process never reads a torn file
+                val tmp = File(file.parentFile, file.name + ".tmp")
+                tmp.writeText(json.encodeToString(ns))
+                if (!tmp.renameTo(file)) {
+                    file.delete()
+                    check(tmp.renameTo(file)) { "atomic profiles rename failed" }
+                }
                 profiles.value = ns.profiles
                 subscriptions.value = ns.subscriptions
             }

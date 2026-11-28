@@ -9,7 +9,14 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.os.Message
+import android.os.Messenger
 import android.os.ParcelFileDescriptor
+import android.os.RemoteException
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.simorgh.vpn.MainActivity
@@ -17,9 +24,11 @@ import com.simorgh.vpn.R
 import com.simorgh.vpn.ServiceLocator
 import com.simorgh.vpn.core.VpnBus
 import com.simorgh.vpn.core.VpnStatus
+import com.simorgh.vpn.core.VpnUiState
 import com.simorgh.vpn.core.engine.EngineRegistry
 import com.simorgh.vpn.core.engine.VpnEngine
 import com.simorgh.vpn.data.PerAppMode
+import com.simorgh.vpn.data.SettingsMirror
 import com.simorgh.vpn.data.SimorghSettings
 import com.simorgh.vpn.data.TunnelMode
 import com.simorgh.vpn.util.Fmt
@@ -33,12 +42,19 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.CopyOnWriteArrayList
 
+/**
+ * The VPN daemon. Runs in the separate :daemon process (v0.2.1) so an engine
+ * crash or a UI kill can never silently take the tunnel down; the UI talks
+ * to it through start/stop intents + Messenger IPC (DaemonIpc).
+ */
 class SimorghVpnService : VpnService() {
 
     companion object {
         const val ACTION_START = "com.simorgh.vpn.action.START"
         const val ACTION_STOP = "com.simorgh.vpn.action.STOP"
+        const val ACTION_IPC = "com.simorgh.vpn.action.IPC"
         const val EXTRA_PROFILE_ID = "profileId"
         const val CHANNEL_ID = "simorgh_vpn_channel"
         const val NOTIFICATION_ID = 1001
@@ -48,11 +64,13 @@ class SimorghVpnService : VpnService() {
                 .setAction(ACTION_START)
                 .putExtra(EXTRA_PROFILE_ID, profileId)
             ContextCompat.startForegroundService(context, i)
+            DaemonIpc.bind(context) // mirror daemon state into the UI process
         }
 
         fun stop(context: Context) {
             val i = Intent(context, SimorghVpnService::class.java).setAction(ACTION_STOP)
             ContextCompat.startForegroundService(context, i)
+            DaemonIpc.bind(context)
         }
     }
 
@@ -66,9 +84,72 @@ class SimorghVpnService : VpnService() {
     private var lastDown = 0L
     private var wasConnected = false
 
+    // ------------------------------------------------------------------ IPC server
+
+    private val clients = CopyOnWriteArrayList<Messenger>()
+
+    private val serverMessenger = Messenger(Handler(Looper.getMainLooper()) { msg ->
+        when (msg.what) {
+            DaemonIpc.MSG_REGISTER -> {
+                msg.replyTo?.let { c ->
+                    clients.add(c)
+                    // late binders catch up instantly with a full snapshot
+                    val snap = Message.obtain(null, DaemonIpc.MSG_STATE)
+                        .apply { data = VpnBus.toBundle() }
+                    runCatching { c.send(snap) }
+                }
+                true
+            }
+            DaemonIpc.MSG_UNREGISTER -> {
+                msg.replyTo?.let { clients.remove(it) }
+                true
+            }
+            else -> false
+        }
+    })
+
+    override fun onBind(intent: Intent?): IBinder? =
+        if (intent?.action == ACTION_IPC) serverMessenger.binder else super.onBind(intent)
+
+    private fun broadcastState(st: VpnUiState) {
+        if (clients.isEmpty()) return
+        val dead = mutableListOf<Messenger>()
+        clients.forEach { c ->
+            val m = Message.obtain(null, DaemonIpc.MSG_STATE).apply { data = VpnBus.toBundle(st) }
+            try {
+                c.send(m)
+            } catch (e: RemoteException) {
+                dead.add(c)
+            }
+        }
+        if (dead.isNotEmpty()) clients.removeAll(dead)
+    }
+
+    private fun broadcastLog(line: String) {
+        if (clients.isEmpty()) return
+        val dead = mutableListOf<Messenger>()
+        clients.forEach { c ->
+            val m = Message.obtain(null, DaemonIpc.MSG_LOG).apply {
+                data = Bundle().apply { putString("line", line) }
+            }
+            try {
+                c.send(m)
+            } catch (e: RemoteException) {
+                dead.add(c)
+            }
+        }
+        if (dead.isNotEmpty()) clients.removeAll(dead)
+    }
+
+    /** Settings snapshot for this daemon: mirror file (fresh) → cached flow. */
+    private fun currentSettings(): SimorghSettings =
+        SettingsMirror.read(this) ?: ServiceLocator.settings.value
+
     override fun onCreate() {
         super.onCreate()
         createChannel()
+        VpnBus.onState = { broadcastState(it) }
+        LogBuffer.onLine = { broadcastLog(it) }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -78,6 +159,9 @@ class SimorghVpnService : VpnService() {
                 scope.launch { opsMutex.withLock { stopVpnLocked() } }
             }
             else -> {
+                if (intent?.action == VpnService.SERVICE_INTERFACE) {
+                    LogBuffer.i("Vpn", "Always-On: system requested the VPN")
+                }
                 enterForeground(getString(R.string.notif_connecting), "")
                 val pid = intent?.getStringExtra(EXTRA_PROFILE_ID)
                 scope.launch { opsMutex.withLock { startVpnLocked(pid) } }
@@ -94,7 +178,8 @@ class SimorghVpnService : VpnService() {
             stopEngineLocked()
             wasConnected = false
 
-            val settings = ServiceLocator.settings.value
+            val settings = currentSettings()
+            runCatching { ServiceLocator.profileRepo.load() } // fresh read (long-lived daemon)
             val all = ServiceLocator.profileRepo.profiles.value
             val profile = all.firstOrNull { it.id == profileId }
                 ?: all.firstOrNull { it.id == settings.activeProfileId }
@@ -140,7 +225,7 @@ class SimorghVpnService : VpnService() {
 
     /** Engine failure: kill-switch hold if enabled+connected, else normal error teardown. */
     private suspend fun failLocked(t: Throwable) {
-        val settings = ServiceLocator.settings.value
+        val settings = currentSettings() // fresh kill-switch decision
         val hold = wasConnected && settings.killSwitch && tun != null
         if (hold) {
             holdBlackholeLocked(t)
@@ -330,6 +415,8 @@ class SimorghVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        VpnBus.onState = null
+        LogBuffer.onLine = null
         engine?.stop()
         engine = null
         runCatching { tun?.close() }

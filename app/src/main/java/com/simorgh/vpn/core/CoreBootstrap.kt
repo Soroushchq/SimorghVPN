@@ -36,8 +36,15 @@ object CoreBootstrap {
         listOf("geoip.dat", "geosite.dat").forEach { name ->
             val out = File(app.filesDir, name)
             if (!out.exists()) {
+                // atomic tmp+rename: the main process and :daemon may warm up
+                // concurrently on first boot (BootReceiver auto-start)
+                val tmp = File(app.filesDir, "$name.tmp")
                 app.assets.open(name).use { input ->
-                    out.outputStream().use { input.copyTo(it) }
+                    tmp.outputStream().use { input.copyTo(it) }
+                }
+                if (!tmp.renameTo(out)) {
+                    out.delete()
+                    tmp.renameTo(out)
                 }
                 LogBuffer.i("Core", "extracted $name (${out.length()} bytes)")
             }

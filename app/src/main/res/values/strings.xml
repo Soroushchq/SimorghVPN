@@ -213,4 +213,21 @@
     <string name="flux_routing_desc">تونل به یاد می‌آورد کدام مسیر روی این شبکه جواب داده، قبل از اتصال مسیرها را مسابقه می‌دهد و بهترین را برمی‌گزیند</string>
     <string name="flux_failover">اتصال مجدد خودکار</string>
     <string name="flux_failover_desc">اگر هسته وسط کار بمیرد، بدون دخالت تو از مسیر بعدیِ سالم دوباره وصل می‌شود (حداکثر ۲ بار)</string>
+
+    <!-- v0.4: MAE per-service adaptive routing -->
+    <string name="mae_section">مسیریابی تطبیقی سرویس‌ها (MAE)</string>
+    <string name="mae_routing">مسیریابی تطبیقی هر-سرویس</string>
+    <string name="mae_routing_desc">سرویس‌هایی که بدون تونل هم باز می‌شوند مستقیم وصل می‌شوند — سریع‌تر و بدون مصرف ظرفیت تونل</string>
+    <string name="mae_services">سرویس‌ها و وضعیت آن‌ها</string>
+    <string name="mae_row_desc">دیدن و تغییر مسیر هر سرویس (تست خودکار، قابل دستکاری)</string>
+    <string name="mae_title">مسیریابی تطبیقی سرویس‌ها</string>
+    <string name="mae_subtitle">با یک درخواست کوچک، مستقیم‌بودن هر سرویس آزمایش می‌شود</string>
+    <string name="mae_hint">روی هر سرویس بزن تا مسیرش عوض شود: خودکار ← تونل ← مستقیم</string>
+    <string name="mae_retest">تست مجدد همه</string>
+    <string name="mae_direct_ok">مستقیم</string>
+    <string name="mae_blocked">نیاز به تونل</string>
+    <string name="mae_unknown">آزمایش‌نشده</string>
+    <string name="mae_pinned_proxy">تونل (دستی)</string>
+    <string name="mae_pinned_direct">مستقیم (دستی)</string>
+    <string name="mae_apply_note">تغییرات از اتصال بعدی اعمال می‌شوند؛ آزمایش‌ها هم پس از هر اتصال موفق در پس‌زمینه تازه می‌شوند.</string>
 </resources>

@@ -159,4 +159,21 @@
     <string name="flux_routing_desc">The tunnel remembers which routes worked on this network, races them before connecting and picks the best</string>
     <string name="flux_failover">Automatic failover</string>
     <string name="flux_failover_desc">If the engine dies mid-session, reconnect through the next healthy route automatically (up to 2 rounds)</string>
+
+    <!-- v0.4: MAE per-service adaptive routing -->
+    <string name="mae_section">Adaptive service routing (MAE)</string>
+    <string name="mae_routing">Per-service adaptive routing</string>
+    <string name="mae_routing_desc">Services that open without the tunnel go direct — faster, no tunnel quota spent</string>
+    <string name="mae_services">Services and their status</string>
+    <string name="mae_row_desc">View and change each service route (auto-tested, overridable)</string>
+    <string name="mae_title">Adaptive service routing</string>
+    <string name="mae_subtitle">Each service is probed with one tiny request to learn if it works directly</string>
+    <string name="mae_hint">Tap a service to change its route: auto → tunnel → direct</string>
+    <string name="mae_retest">Retest all</string>
+    <string name="mae_direct_ok">Direct</string>
+    <string name="mae_blocked">Needs tunnel</string>
+    <string name="mae_unknown">Untested</string>
+    <string name="mae_pinned_proxy">Tunnel (pinned)</string>
+    <string name="mae_pinned_direct">Direct (pinned)</string>
+    <string name="mae_apply_note">Changes apply from the next connect; probes refresh in the background after every successful connect.</string>
 </resources>

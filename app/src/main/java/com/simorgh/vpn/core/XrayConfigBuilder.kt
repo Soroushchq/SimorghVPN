@@ -1,6 +1,7 @@
 package com.simorgh.vpn.core
 
 import com.simorgh.vpn.core.anticensor.TlsFragmentProfile
+import com.simorgh.vpn.core.mae.MaeRules
 import com.simorgh.vpn.data.Profile
 import com.simorgh.vpn.data.RoutingMode
 import com.simorgh.vpn.data.SimorghSettings
@@ -20,7 +21,12 @@ import kotlinx.serialization.json.putJsonObject
  */
 object XrayConfigBuilder {
 
-    fun build(profile: Profile, s: SimorghSettings, logPath: String): String {
+    fun build(
+        profile: Profile,
+        s: SimorghSettings,
+        logPath: String,
+        maeRoutes: List<MaeRules.ServiceRoute> = emptyList()
+    ): String {
         val inbounds = mutableListOf<JsonObject>()
         inbounds.add(socksInbound(s))
         if (s.tunnelMode == TunnelMode.XRAY_TUN) inbounds.add(tunInbound(s))
@@ -55,7 +61,7 @@ object XrayConfigBuilder {
             put("outbounds", JsonArray(outbounds))
             putJsonObject("routing") {
                 put("domainStrategy", "AsIs")
-                put("rules", JsonArray(routingRules(s)))
+                put("rules", JsonArray(routingRules(s, maeRoutes)))
             }
             put("dns", dnsSection(s))
         }.toString()
@@ -284,7 +290,10 @@ object XrayConfigBuilder {
             block()
         }
 
-    internal fun routingRules(s: SimorghSettings): List<JsonObject> = buildList {
+    internal fun routingRules(
+        s: SimorghSettings,
+        maeRoutes: List<MaeRules.ServiceRoute> = emptyList()
+    ): List<JsonObject> = buildList {
         // DNS server traffic: Iranian domains direct, the rest through proxy
         add(rule {
             put("inboundTag", JsonArray(listOf(JsonPrimitive("dns-ir"))))
@@ -299,6 +308,16 @@ object XrayConfigBuilder {
             put("port", "53")
             put("outboundTag", "dns-out")
         })
+        // v0.4 MAE: per-service adaptive decisions beat the generic geo lists
+        // (mlmvpn RouteProvider order — most specific rule first)
+        if (s.maeEnabled) {
+            maeRoutes.forEach { r ->
+                add(rule {
+                    put("domain", JsonArray(r.domains.map { JsonPrimitive(it) }))
+                    put("outboundTag", r.outboundTag)
+                })
+            }
+        }
         if (s.routingMode == RoutingMode.IR_BYPASS) {
             add(rule {
                 put("ip", JsonArray(listOf(JsonPrimitive("geoip:private"), JsonPrimitive("geoip:ir"))))

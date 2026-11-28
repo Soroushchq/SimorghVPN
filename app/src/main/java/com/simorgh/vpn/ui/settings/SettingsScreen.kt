@@ -75,6 +75,7 @@ fun SettingsScreen() {
     val snackbar = remember { SnackbarHostState() }
 
     var showPerApp by remember { mutableStateOf(false) }
+    var showMae by remember { mutableStateOf(false) }
     var checkingUpdate by remember { mutableStateOf(false) }
     var updateInfo by remember { mutableStateOf<UpdateChecker.UpdateInfo?>(null) }
     var updateFailed by remember { mutableStateOf(false) }
@@ -375,6 +376,17 @@ fun SettingsScreen() {
                 PerAppRow(onClick = { showPerApp = true })
             }
 
+            // v0.4 MAE: per-service adaptive routing
+            SectionCard(stringResource(R.string.mae_section)) {
+                SwitchRow(
+                    title = stringResource(R.string.mae_routing),
+                    desc = stringResource(R.string.mae_routing_desc),
+                    checked = settings.maeEnabled
+                ) { scope.launch { SettingsStore.setMaeEnabled(context, it) } }
+                HorizontalDivider(Modifier.padding(vertical = 6.dp))
+                MaeRow(onClick = { showMae = true })
+            }
+
             // v0.3: anti-censorship (fragmentation, uTLS rotation, fallback chain)
             SectionCard(stringResource(R.string.section_anticensor)) {
                 SwitchRow(
@@ -628,6 +640,11 @@ fun SettingsScreen() {
     if (showPerApp) {
         PerAppProxyDialog(onDismiss = { showPerApp = false })
     }
+
+    // v0.4: per-service adaptive routing (fullscreen dialog)
+    if (showMae) {
+        MaeDialog(onDismiss = { showMae = false })
+    }
 }
 
 // ---------------------------------------------------------------------- rows
@@ -648,6 +665,34 @@ private fun PerAppRow(onClick: () -> Unit) {
             )
             Text(
                 stringResource(R.string.per_app_row_desc),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        Icon(
+            Icons.AutoMirrored.Outlined.KeyboardArrowRight,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+}
+
+@Composable
+private fun MaeRow(onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(
+                stringResource(R.string.mae_services),
+                style = MaterialTheme.typography.titleSmall
+            )
+            Text(
+                stringResource(R.string.mae_row_desc),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )

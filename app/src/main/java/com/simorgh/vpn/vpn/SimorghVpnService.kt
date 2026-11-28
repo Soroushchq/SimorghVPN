@@ -34,6 +34,7 @@ import com.simorgh.vpn.core.flux.FluxFailReason
 import com.simorgh.vpn.core.flux.FluxNet
 import com.simorgh.vpn.core.flux.FluxPlanner
 import com.simorgh.vpn.core.flux.FluxStore
+import com.simorgh.vpn.core.mae.MaeLearner
 import com.simorgh.vpn.core.warp.WarpPlanner
 import com.simorgh.vpn.data.PerAppMode
 import com.simorgh.vpn.data.SettingsMirror
@@ -91,6 +92,7 @@ class SimorghVpnService : VpnService() {
     private var tun: ParcelFileDescriptor? = null
     private var engine: VpnEngine? = null
     private var statsJob: Job? = null
+    private var maeJob: Job? = null
     private var lastUp = 0L
     private var lastDown = 0L
     private var wasConnected = false
@@ -343,6 +345,15 @@ class SimorghVpnService : VpnService() {
             )
 
             statsJob = scope.launch { statsLoop() }
+
+            // v0.4 MAE: refresh direct-reachability evidence in the background;
+            // verdicts apply from the next connect (logged, never disruptive).
+            if (settings.maeEnabled && !isWarp) {
+                maeJob?.cancel()
+                maeJob = scope.launch {
+                    runCatching { MaeLearner.learn(this@SimorghVpnService) }
+                }
+            }
         } catch (t: Throwable) {
             LogBuffer.e("Vpn", "start failed", t)
             failLocked(t)
@@ -430,6 +441,8 @@ class SimorghVpnService : VpnService() {
     private suspend fun stopEngineLocked() {
         statsJob?.cancel()
         statsJob = null
+        maeJob?.cancel()
+        maeJob = null
         engine?.stopAwait()
         engine = null
         runCatching { tun?.close() }

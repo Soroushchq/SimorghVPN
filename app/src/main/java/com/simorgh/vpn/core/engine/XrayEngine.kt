@@ -5,6 +5,8 @@ import android.os.ParcelFileDescriptor
 import com.simorgh.vpn.core.CoreBootstrap
 import com.simorgh.vpn.core.XrayConfigBuilder
 import com.simorgh.vpn.core.XrayRunner
+import com.simorgh.vpn.core.mae.MaeRules
+import com.simorgh.vpn.core.mae.MaeStore
 import com.simorgh.vpn.data.Profile
 import com.simorgh.vpn.data.SimorghSettings
 import com.simorgh.vpn.data.TunnelMode
@@ -37,8 +39,13 @@ class XrayEngine : VpnEngine {
         CoreBootstrap.ensureInit(app)
 
         val logPath = File(app.filesDir, "simorgh-xray.log").absolutePath
-        val config = XrayConfigBuilder.build(profile, settings, logPath)
-        LogBuffer.d("Vpn", "config generated (${config.length} chars) mode=${settings.tunnelMode}")
+        // v0.4 MAE: per-service adaptive routing rules (fresh file read — the
+        // daemon and the UI both mutate the store)
+        val maeRoutes = if (settings.maeEnabled) {
+            MaeRules.build(MaeStore.load(app))
+        } else emptyList()
+        val config = XrayConfigBuilder.build(profile, settings, logPath, maeRoutes)
+        LogBuffer.d("Vpn", "config generated (${config.length} chars) mode=${settings.tunnelMode} mae=${maeRoutes.size}")
 
         val r = XrayRunner()
         val fd = if (settings.tunnelMode == TunnelMode.XRAY_TUN) (tun?.fd ?: 0) else 0

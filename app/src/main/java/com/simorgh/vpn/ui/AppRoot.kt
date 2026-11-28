@@ -81,7 +81,12 @@ fun AppRoot() {
             startDestination = "home",
             modifier = Modifier.padding(padding)
         ) {
-            composable("home") { HomeScreen(onOpenProfiles = { nav.navigate("profiles") }) }
+            composable("home") {
+                HomeScreen(
+                    onOpenProfiles = { nav.navigate("profiles") },
+                    onOpenSettings = { nav.navigate("settings") }
+                )
+            }
             composable("profiles") { ProfilesScreen() }
             composable("settings") { SettingsScreen() }
             composable("logs") { LogsScreen() }

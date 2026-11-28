@@ -68,5 +68,9 @@ object BackupManager {
         SettingsStore.setTlsFragmentProfile(context, st.tlsFragmentProfile)
         SettingsStore.setUtlsRotation(context, st.utlsRotation)
         SettingsStore.setFallbackChain(context, st.fallbackChain)
+        // v0.3.1 WARP (endpoint overrides are transient — never restored;
+        // identities live in the Keystore-sealed vault, never in backups)
+        SettingsStore.setWarpPort(context, st.warpPort)
+        SettingsStore.setWarpPortRotation(context, st.warpPortRotation)
     }
 }

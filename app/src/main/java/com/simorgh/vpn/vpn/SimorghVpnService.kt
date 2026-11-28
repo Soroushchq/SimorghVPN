@@ -30,6 +30,7 @@ import com.simorgh.vpn.core.anticensor.FallbackPlanner
 import com.simorgh.vpn.core.anticensor.FingerprintRotator
 import com.simorgh.vpn.core.engine.EngineRegistry
 import com.simorgh.vpn.core.engine.VpnEngine
+import com.simorgh.vpn.core.warp.WarpPlanner
 import com.simorgh.vpn.data.PerAppMode
 import com.simorgh.vpn.data.SettingsMirror
 import com.simorgh.vpn.data.SimorghSettings
@@ -184,10 +185,16 @@ class SimorghVpnService : VpnService() {
             val settings = currentSettings()
             runCatching { ServiceLocator.profileRepo.load() } // fresh read (long-lived daemon)
             val all = ServiceLocator.profileRepo.profiles.value
-            val primary = all.firstOrNull { it.id == profileId }
-                ?: all.firstOrNull { it.id == settings.activeProfileId }
-                ?: all.firstOrNull()
-                ?: error("no profile configured")
+            val engineId = settings.engineId.ifBlank { EngineRegistry.defaultId() }
+            val isWarp = engineId == EngineRegistry.WARP
+
+            // WARP is serverless — no user profile needed, only a vault identity
+            val warpPlan = if (isWarp) WarpPlanner.plan(settings) else null
+            val primary = warpPlan?.first()?.profile
+                ?: all.firstOrNull { it.id == profileId }
+                    ?: all.firstOrNull { it.id == settings.activeProfileId }
+                    ?: all.firstOrNull()
+                    ?: error("no profile configured")
 
             VpnBus.update {
                 it.copy(
@@ -202,10 +209,11 @@ class SimorghVpnService : VpnService() {
 
             val needsTun = settings.tunnelMode != TunnelMode.PROXY_ONLY
 
-            // v0.3 anti-censor: attempt plan (nova/msn-guard fallback chain).
-            // Degenerates to a single attempt with both switches off — exact v0.2 path.
-            val plan = FallbackPlanner.plan(primary, all, settings)
-            val probe = settings.utlsRotation || settings.fallbackChain
+            // v0.3 anti-censor: attempt plan (nova/msn-guard fallback chain);
+            // v0.3.1: WARP gets its own plan — anycast IP × port rotation with
+            // a real data-plane probe after every attempt.
+            val plan = warpPlan ?: FallbackPlanner.plan(primary, all, settings)
+            val probe = isWarp || settings.utlsRotation || settings.fallbackChain
             if (plan.size > 1) {
                 LogBuffer.i("Vpn", "anti-censor plan: ${plan.size} attempts (rotation=${settings.utlsRotation} chain=${settings.fallbackChain})")
             }
@@ -225,12 +233,13 @@ class SimorghVpnService : VpnService() {
                 runCatching { tun?.close() }
                 tun = if (needsTun) establishTun(settings) else null
 
-                val attemptSettings =
-                    if (attempt.fingerprint.isBlank()) settings
-                    else settings.copy(fingerprintOverride = attempt.fingerprint)
+                val attemptSettings = settings.copy(
+                    fingerprintOverride = attempt.fingerprint,
+                    warpIpOverride = attempt.warpIp,
+                    warpPortOverride = attempt.warpPort
+                )
 
                 // engine registry (mlmvpn pattern): instantiate per attempt
-                val engineId = settings.engineId.ifBlank { EngineRegistry.defaultId() }
                 val eng = EngineRegistry.create(engineId) ?: error("engine '$engineId' not registered")
                 var started = false
                 try {

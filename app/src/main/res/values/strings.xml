@@ -181,4 +181,29 @@
     <string name="utls_rotation_desc">اگر دست‌دادن TLS شکست خورد، دوباره با فینگرپرینت مرورگر دیگری تلاش می‌شود تا معلوم شود اسم مسدود است یا فینگرپرینت</string>
     <string name="fallback_chain">زنجیره‌ی جایگزین خودکار</string>
     <string name="fallback_chain_desc">بعد از هر تلاش، یک درخواست واقعی از داخل تونل آزمایش می‌شود؛ اگر جواب نیامد خودکار به سرور بعدی می‌رود</string>
+
+    <!-- v0.3.1: WARP serverless engine + Identity Vault -->
+    <string name="engine_section">موتور تونل</string>
+    <string name="engine_xray">Xray (سرورهای شخصی)</string>
+    <string name="engine_xray_desc">اتصال با کانفیگ‌های VLESS/REALITY، VMess، تروجان و شادوساکس</string>
+    <string name="engine_warp">WARP کلادفلر (بدون سرور)</string>
+    <string name="engine_warp_desc">تونل رایگان و بدون نیاز به هیچ سروری — فقط با یک ضربه روی دکمه‌ی اتصال</string>
+    <string name="warp_section">هویت‌های WARP (گاوصندوق)</string>
+    <string name="warp_section_desc">هویت‌های WARP شما داخل کلید سخت‌افزاری گوشی رمزنگاری شده و هرگز از گوشی خارج نمی‌شوند</string>
+    <string name="warp_no_identity">هنوز هویتی ندارید — با دکمه‌ی زیر یک هویت رایگان بسازید (اینترنت لازم است)</string>
+    <string name="warp_register">ساخت هویت رایگان WARP</string>
+    <string name="warp_register_new">هویت جدید</string>
+    <string name="warp_register_ok">هویت WARP ساخته شد — آماده‌ی اتصال</string>
+    <string name="warp_register_failed">ساخت هویت ناموفق بود: %1$s</string>
+    <string name="warp_delete">حذف</string>
+    <string name="warp_need_identity">اول از تنظیمات یک هویت WARP بسازید</string>
+    <string name="warp_need_identity_short">بدون هویت</string>
+    <string name="warp_port">پورت WARP</string>
+    <string name="warp_port_hint">پورت پیش‌فرض %1$d است؛ اگر مسدود شد پورت دیگری را امتحان کنید</string>
+    <string name="warp_port_rotation">چرخش نقطه‌ی اتصال</string>
+    <string name="warp_port_rotation_desc">در صورت برخورد، خودکار از IP و پورت‌های جایگزین کلادفلر تلاش می‌کند (حداکثر ۶ تلاش)</string>
+    <string name="warp_identity_fmt">هویت %1$s…</string>
+    <string name="warp_created_fmt">ساخته‌شده: %1$s</string>
+    <string name="warp_home_title">موتور بدون سرور</string>
+    <string name="warp_home_name">Cloudflare WARP</string>
 </resources>

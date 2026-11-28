@@ -35,7 +35,8 @@ com.simorgh.vpn
 │   └── engine/            رجیستری موتور (الگوی mlmvpn) — ۰.۲.۱
 │       ├── VpnEngine.kt      رابط موتور (start/stop/stopAwait/stats)
 │       ├── EngineRegistry.kt ثبت id → factory؛ انتخاب با settings.engineId
-│       └── XrayEngine.kt     هسته Xray + پل hev به‌عنوان اولین موتور
+│       ├── XrayEngine.kt     هسته Xray + پل hev به‌عنوان اولین موتور
+│       └── WarpEngine.kt     تونل رایگان کلادفلر (۰.۳.۱) — wireguard outbound بومی Xray
 ├── vpn/
 │   ├── SimorghVpnService.kt  VpnService (در پردازه :daemon) + TUN + IPC سرور
 │   ├── DaemonIpc.kt      پل Messenger سمت UI — آینه‌ی وضعیت/لاگ در پردازه اصلی
@@ -95,6 +96,16 @@ interface VpnEngine {
 - **TlsFragmentProfile** — فرگمنت‌سازی ClientHello روی `streamSettings.sockopt.fragment` بومی هسته (الگوی msn-guard): سه پروفایل ایران «ملایم/متوسط/شدید» با بازه‌های تصادفی طول/فاصله. فقط برای اتصال‌های TLS/REALITY اعمال می‌شود.
 - **FingerprintRotator** (الگوی nova) — چرخش uTLS بین `chrome/firefox/safari/edge/ios/android/randomized`؛ فینگرپرینتی که probe واقعی را رد کرد «چسبنده» می‌شود و اتصال بعدی از همان‌جا ادامه می‌دهد. فینگرپرینت‌های فقط-TLS1.3 (android/qq/360) طبق سازگاری nova از چرخش حذف شده‌اند — به‌علاوه فینگرپرینت ثابت پروفایل با `settings.fingerprintOverride` (فیلد گذرا، هرگز ذخیره نمی‌شود) در هر تلاش بازنویسی می‌شود.
 - **FallbackPlanner + DataPlaneProbe** (الگوی nova/msn-guard) — هر «وصل» = حداکثر ۳ پروفایل × ۳ فینگرپرینت. بعد از هر روشن‌شدن موتور، یک درخواست HTTP واقعی از داخل تونل (SOCKS محلی، resolve در سمت سرور) فرستاده می‌شود؛ فقط جواب 2xx یعنی تونل زنده است. با هر دو سوییچ خاموش، پلن دقیقاً به یک تلاش ساده‌ی v0.2 فرو می‌ریزد. برای هر تلاش TUN تازه establish می‌شود (هسته‌ی Go مالک fd می‌شود — الگوی v2rayNG).
+
+## ۶ب. موتور WARP بدون سرور + گاوصندوق هویت (از ۰.۳.۱ فعال)
+
+در `core/warp/` — الگوی Aether/msn-guard با شاسیِ بدون کد بومی:
+
+- **Curve25519** (`core/crypto/`) — پیاده‌سازی اختصاصی RFC 7748 (نردان مونتگومری روی میدان TweetNaCl ۱۶-لَمبی، ثابت-زمان) برای ساخت کلید X25519 روی خود گوشی؛ فقط کلید عمومی هرگز از گوشی خارج می‌شود. با تمام بردارهای تستی RFC صحت‌سنجی شده است.
+- **WarpApi** — ثبت‌نام ناشناس رایگان در api.cloudflareclient.com (جریان wgcf/warp-plus): اول مستقیم، در صورت شکست از داخل SOCKS تونلِ روشن.
+- **WarpIdentityVault** — گاوصندوق هویت: JSON هویت‌ها (تا ۳ عدد، با هویت فعال) با AES-256/GCM زیر کلید غیرقابل‌خروج Android Keystore (`simorgh_warp_vault`) مهر می‌شود؛ فایل اتمیک است تا UI و :daemon همزمان بخوانند. هویت‌ها هرگز وارد بکاپ نمی‌شوند.
+- **WarpEngine + WarpConfigBuilder** — موتور دوم در `EngineRegistry`: همان شاخه‌ی SOCKS/hev، اما outbound = پروتکل `wireguard` بومی Xray با کلید خصوصی گاوصندوق، آدرس‌های تخصیص‌یافته، `reserved` سه‌بایتی WARP و MTU ۱۲۸۰. اندپوینت‌ها مستقیم IP شماره می‌شوند تا حلقه‌ی مرغ‌و‌تخم‌مرغ DNS پیش نیاید؛ دامنه‌های cloudflareclient.com در مسیریابی direct می‌مانند.
+- **WarpPlanner** — پلن تلاش مخصوص WARP با همان ارزِ `FallbackPlanner.Attempt`: حداکثر ۶ تلاش روی ترکیب IP آنیکست × پورت‌های جایگزین WireGuard (۲۴۰۸/۸۹۴/۹۴۳/۵۰۰/…) با probe دیتا-پلن بعد از هر تلاش؛ فیلدهای گذرا `warpIpOverride/warpPortOverride` از دیمون مقدار می‌گیرند.
 
 ## ۷. سازگاری لایسنس
 

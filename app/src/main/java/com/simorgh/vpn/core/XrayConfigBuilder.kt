@@ -72,12 +72,12 @@ object XrayConfigBuilder {
 
     // ------------------------------------------------------------------ inbounds
 
-    private fun sniffing() = buildJsonObject {
+    internal fun sniffing() = buildJsonObject {
         put("enabled", true)
         put("destOverride", JsonArray(listOf("http", "tls", "quic").map { JsonPrimitive(it) }))
     }
 
-    private fun socksInbound(s: SimorghSettings) = buildJsonObject {
+    internal fun socksInbound(s: SimorghSettings) = buildJsonObject {
         put("tag", "socks")
         put("listen", "127.0.0.1")
         put("port", s.socksPort)
@@ -90,7 +90,7 @@ object XrayConfigBuilder {
         put("sniffing", sniffing())
     }
 
-    private fun tunInbound(s: SimorghSettings) = buildJsonObject {
+    internal fun tunInbound(s: SimorghSettings) = buildJsonObject {
         put("tag", "tun")
         put("protocol", "tun")
         putJsonObject("settings") {
@@ -258,7 +258,7 @@ object XrayConfigBuilder {
         }
     }
 
-    private fun directOutbound() = buildJsonObject {
+    internal fun directOutbound() = buildJsonObject {
         put("protocol", "freedom")
         put("tag", "direct")
         putJsonObject("streamSettings") {
@@ -266,12 +266,12 @@ object XrayConfigBuilder {
         }
     }
 
-    private fun dnsOutbound() = buildJsonObject {
+    internal fun dnsOutbound() = buildJsonObject {
         put("protocol", "dns")
         put("tag", "dns-out")
     }
 
-    private fun blockOutbound() = buildJsonObject {
+    internal fun blockOutbound() = buildJsonObject {
         put("protocol", "blackhole")
         put("tag", "block")
     }
@@ -284,7 +284,7 @@ object XrayConfigBuilder {
             block()
         }
 
-    private fun routingRules(s: SimorghSettings): List<JsonObject> = buildList {
+    internal fun routingRules(s: SimorghSettings): List<JsonObject> = buildList {
         // DNS server traffic: Iranian domains direct, the rest through proxy
         add(rule {
             put("inboundTag", JsonArray(listOf(JsonPrimitive("dns-ir"))))
@@ -316,7 +316,7 @@ object XrayConfigBuilder {
         }
     }
 
-    private fun dnsSection(s: SimorghSettings) = buildJsonObject {
+    internal fun dnsSection(s: SimorghSettings) = buildJsonObject {
         putJsonObject("hosts") {
             put("dns.google", JsonArray(listOf(JsonPrimitive("8.8.8.8"), JsonPrimitive("8.8.4.4"))))
             put("dns.quad9.net", JsonArray(listOf(JsonPrimitive("9.9.9.9"), JsonPrimitive("149.112.112.112"))))

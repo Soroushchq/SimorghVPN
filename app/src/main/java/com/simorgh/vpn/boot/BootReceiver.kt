@@ -33,6 +33,18 @@ class BootReceiver : BroadcastReceiver() {
 
                 runCatching { ServiceLocator.profileRepo.load() }
                 val profiles = ServiceLocator.profileRepo.profiles.value
+
+                if (settings.engineId == com.simorgh.vpn.core.engine.EngineRegistry.WARP) {
+                    // serverless engine — no profile needed, only a vault identity
+                    if (VpnService.prepare(app) == null) {
+                        LogBuffer.i("Boot", "auto-start (warp) after $action")
+                        SimorghVpnService.start(app, "")
+                    } else {
+                        LogBuffer.w("Boot", "VPN permission not granted; skipping auto-start")
+                    }
+                    return@launch
+                }
+
                 if (profiles.isEmpty()) return@launch
 
                 val pid = settings.activeProfileId.ifBlank { profiles.first().id }

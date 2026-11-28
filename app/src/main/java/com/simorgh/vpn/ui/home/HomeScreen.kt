@@ -45,6 +45,8 @@ import com.simorgh.vpn.R
 import com.simorgh.vpn.ServiceLocator
 import com.simorgh.vpn.core.VpnBus
 import com.simorgh.vpn.core.VpnStatus
+import com.simorgh.vpn.core.engine.EngineRegistry
+import com.simorgh.vpn.core.warp.WarpIdentityVault
 import com.simorgh.vpn.data.SettingsStore
 import com.simorgh.vpn.ui.components.LatencyText
 import com.simorgh.vpn.ui.components.PhoenixConnectButton
@@ -56,13 +58,19 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 @Composable
-fun HomeScreen(onOpenProfiles: () -> Unit) {
+fun HomeScreen(onOpenProfiles: () -> Unit, onOpenSettings: () -> Unit = {}) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val vpnState by VpnBus.state.collectAsState()
     val settings by ServiceLocator.settings.collectAsState()
     val profiles by ServiceLocator.profileRepo.profiles.collectAsState()
     val snackbar = remember { SnackbarHostState() }
+
+    val isWarp = settings.engineId == EngineRegistry.WARP
+    var warpIdentity by remember { mutableStateOf<com.simorgh.vpn.core.warp.WarpIdentity?>(null) }
+    LaunchedEffect(isWarp) {
+        if (isWarp) warpIdentity = WarpIdentityVault.active(context)
+    }
 
     val activeProfile = remember(vpnState.profileId, settings.activeProfileId, profiles) {
         profiles.firstOrNull { it.id == vpnState.profileId }
@@ -74,13 +82,35 @@ fun HomeScreen(onOpenProfiles: () -> Unit) {
         ActivityResultContracts.StartActivityForResult()
     ) { res ->
         if (res.resultCode == Activity.RESULT_OK) {
-            activeProfile?.let { SimorghVpnService.start(context, it.id) }
+            if (isWarp) {
+                SimorghVpnService.start(context, "")
+            } else {
+                activeProfile?.let { SimorghVpnService.start(context, it.id) }
+            }
         } else {
             scope.launch { snackbar.showSnackbar(context.getString(R.string.vpn_permission_needed)) }
         }
     }
 
     fun connect() {
+        if (isWarp) {
+            // serverless engine — needs a vault identity, not a server profile
+            scope.launch {
+                val identity = WarpIdentityVault.active(context)
+                if (identity == null) {
+                    snackbar.showSnackbar(context.getString(R.string.warp_need_identity))
+                    onOpenSettings()
+                    return@launch
+                }
+                val prep = VpnService.prepare(context)
+                if (prep != null) {
+                    vpnPermission.launch(prep)
+                } else {
+                    SimorghVpnService.start(context, "")
+                }
+            }
+            return
+        }
         val p = activeProfile
         if (p == null) {
             onOpenProfiles()
@@ -111,6 +141,15 @@ fun HomeScreen(onOpenProfiles: () -> Unit) {
         ) {
             delay(1200) // give profiles a moment to load
             val st = ServiceLocator.settings.value
+            if (st.engineId == EngineRegistry.WARP) {
+                if (VpnBus.state.value.status == VpnStatus.DISCONNECTED &&
+                    VpnService.prepare(context) == null &&
+                    WarpIdentityVault.active(context) != null
+                ) {
+                    SimorghVpnService.start(context, "")
+                }
+                return@LaunchedEffect
+            }
             val profiles = ServiceLocator.profileRepo.profiles.value
             val pid = st.activeProfileId.ifBlank { profiles.firstOrNull()?.id }
             if (pid != null &&
@@ -216,7 +255,52 @@ fun HomeScreen(onOpenProfiles: () -> Unit) {
 
             Spacer(Modifier.height(24.dp))
 
-            if (activeProfile == null) {
+            if (isWarp) {
+                // v0.3.1: serverless WARP card — identity from the vault,
+                // live endpoint from the daemon state
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable(onClick = onOpenSettings),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant
+                    )
+                ) {
+                    Column(Modifier.padding(16.dp)) {
+                        Text(
+                            stringResource(R.string.warp_home_title),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            stringResource(R.string.warp_home_name),
+                            style = MaterialTheme.typography.titleLarge
+                        )
+                        Text(
+                            vpnState.profileName.ifBlank {
+                                warpIdentity?.let { "WARP · ${it.v4}" } ?: ""
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(Modifier.height(10.dp))
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            ProtocolChip("warp")
+                            if (warpIdentity == null) {
+                                Text(
+                                    stringResource(R.string.warp_need_identity_short),
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.error
+                                )
+                            }
+                        }
+                    }
+                }
+            } else if (activeProfile == null) {
                 Card(
                     colors = CardDefaults.cardColors(
                         containerColor = MaterialTheme.colorScheme.surfaceVariant

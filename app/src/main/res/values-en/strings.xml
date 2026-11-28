@@ -127,4 +127,29 @@
     <string name="utls_rotation_desc">If the TLS handshake dies, retry with a different browser fingerprint — reveals whether the name or the fingerprint is blocked</string>
     <string name="fallback_chain">Automatic fallback chain</string>
     <string name="fallback_chain_desc">After each attempt a real request is sent through the tunnel; if nothing comes back, the next server is tried automatically</string>
+
+    <!-- v0.3.1: WARP serverless engine + Identity Vault -->
+    <string name="engine_section">Tunnel engine</string>
+    <string name="engine_xray">Xray (your servers)</string>
+    <string name="engine_xray_desc">Connect with VLESS/REALITY, VMess, Trojan and Shadowsocks configs</string>
+    <string name="engine_warp">Cloudflare WARP (serverless)</string>
+    <string name="engine_warp_desc">A free tunnel with no server of your own — just press connect</string>
+    <string name="warp_section">WARP identities (vault)</string>
+    <string name="warp_section_desc">Your WARP identities are sealed inside the device hardware keystore and never leave the phone</string>
+    <string name="warp_no_identity">No identity yet — mint a free one below (needs internet)</string>
+    <string name="warp_register">Mint free WARP identity</string>
+    <string name="warp_register_new">New identity</string>
+    <string name="warp_register_ok">WARP identity minted — ready to connect</string>
+    <string name="warp_register_failed">Minting failed: %1$s</string>
+    <string name="warp_delete">Delete</string>
+    <string name="warp_need_identity">Mint a WARP identity first (Settings)</string>
+    <string name="warp_need_identity_short">no identity</string>
+    <string name="warp_port">WARP port</string>
+    <string name="warp_port_hint">Default is %1$d; try another port if it gets blocked</string>
+    <string name="warp_port_rotation">Endpoint rotation</string>
+    <string name="warp_port_rotation_desc">On failure, automatically tries alternate Cloudflare IPs and ports (up to 6 attempts)</string>
+    <string name="warp_identity_fmt">Identity %1$s…</string>
+    <string name="warp_created_fmt">Created: %1$s</string>
+    <string name="warp_home_title">Serverless engine</string>
+    <string name="warp_home_name">Cloudflare WARP</string>
 </resources>

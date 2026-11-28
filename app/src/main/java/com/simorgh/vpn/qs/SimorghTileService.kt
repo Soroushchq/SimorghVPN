@@ -60,8 +60,12 @@ class SimorghTileService : TileService() {
                     withTimeoutOrNull(2500) {
                         runCatching { ServiceLocator.profileRepo.load() }
                         val settings = SettingsStore.snapshot(this@SimorghTileService)
-                        val profiles = ServiceLocator.profileRepo.profiles.value
-                        settings.activeProfileId.ifBlank { profiles.firstOrNull()?.id }
+                        if (settings.engineId == com.simorgh.vpn.core.engine.EngineRegistry.WARP) {
+                            "" // serverless — daemon resolves the identity itself
+                        } else {
+                            val profiles = ServiceLocator.profileRepo.profiles.value
+                            settings.activeProfileId.ifBlank { profiles.firstOrNull()?.id }
+                        }
                     }
                 }
                 if (pid != null) {

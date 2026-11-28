@@ -35,6 +35,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -51,6 +52,10 @@ import com.simorgh.vpn.R
 import com.simorgh.vpn.ServiceLocator
 import com.simorgh.vpn.core.CoreBootstrap
 import com.simorgh.vpn.core.anticensor.TlsFragmentProfile
+import com.simorgh.vpn.core.engine.EngineRegistry
+import com.simorgh.vpn.core.warp.WarpEndpoints
+import com.simorgh.vpn.core.warp.WarpIdentity
+import com.simorgh.vpn.core.warp.WarpIdentityVault
 import com.simorgh.vpn.data.BackupManager
 import com.simorgh.vpn.data.RoutingMode
 import com.simorgh.vpn.data.SettingsStore
@@ -73,6 +78,38 @@ fun SettingsScreen() {
     var checkingUpdate by remember { mutableStateOf(false) }
     var updateInfo by remember { mutableStateOf<UpdateChecker.UpdateInfo?>(null) }
     var updateFailed by remember { mutableStateOf(false) }
+
+    // v0.3.1: WARP identity vault state
+    var warpIdentities by remember { mutableStateOf<List<WarpIdentity>>(emptyList()) }
+    var warpActive by remember { mutableStateOf<WarpIdentity?>(null) }
+    var warpRegistering by remember { mutableStateOf(false) }
+
+    fun reloadVault() {
+        scope.launch {
+            val (list, active) = WarpIdentityVault.snapshot(context)
+            warpIdentities = list
+            warpActive = active
+        }
+    }
+    LaunchedEffect(Unit) { reloadVault() }
+
+    fun registerWarp() {
+        if (warpRegistering) return
+        warpRegistering = true
+        scope.launch {
+            val socksPort = ServiceLocator.settings.value.socksPort
+            WarpIdentityVault.register(context, socksPort)
+                .onSuccess {
+                    reloadVault()
+                    snackbar.showSnackbar(context.getString(R.string.warp_register_ok))
+                }
+                .onFailure {
+                    snackbar.showSnackbar(
+                        context.getString(R.string.warp_register_failed, it.message ?: ""))
+                }
+            warpRegistering = false
+        }
+    }
 
     // -------------------------------------------------- backup (SAF) launchers
 
@@ -168,6 +205,151 @@ fun SettingsScreen() {
                     desc = stringResource(R.string.tunnel_proxy_desc),
                     selected = settings.tunnelMode == TunnelMode.PROXY_ONLY
                 ) { scope.launch { SettingsStore.setTunnelMode(context, TunnelMode.PROXY_ONLY) } }
+            }
+
+            // v0.3.1: tunnel engine picker — Xray profiles vs serverless WARP
+            SectionCard(stringResource(R.string.engine_section)) {
+                RadioRow(
+                    title = stringResource(R.string.engine_xray),
+                    desc = stringResource(R.string.engine_xray_desc),
+                    selected = settings.engineId == EngineRegistry.XRAY
+                ) { scope.launch { SettingsStore.setEngineId(context, EngineRegistry.XRAY) } }
+                RadioRow(
+                    title = stringResource(R.string.engine_warp),
+                    desc = stringResource(R.string.engine_warp_desc),
+                    selected = settings.engineId == EngineRegistry.WARP
+                ) { scope.launch { SettingsStore.setEngineId(context, EngineRegistry.WARP) } }
+            }
+
+            // v0.3.1: WARP Identity Vault (Aether pattern) — free Cloudflare
+            // tunnel identities, sealed inside the Android Keystore
+            if (settings.engineId == EngineRegistry.WARP) {
+                SectionCard(stringResource(R.string.warp_section)) {
+                    Text(
+                        stringResource(R.string.warp_section_desc),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(10.dp))
+
+                    if (warpIdentities.isEmpty()) {
+                        Text(
+                            stringResource(R.string.warp_no_identity),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedButton(enabled = !warpRegistering, onClick = { registerWarp() }) {
+                            if (warpRegistering) {
+                                CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+                            } else {
+                                Icon(Icons.Outlined.SystemUpdate, contentDescription = null)
+                            }
+                            Spacer(Modifier.width(6.dp))
+                            Text(stringResource(R.string.warp_register))
+                        }
+                    } else {
+                        warpIdentities.forEach { identity ->
+                            val isActive = identity.id == warpActive?.id
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        scope.launch {
+                                            WarpIdentityVault.setActive(context, identity.id)
+                                            reloadVault()
+                                        }
+                                    }
+                                    .padding(vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                RadioButton(
+                                    selected = isActive,
+                                    onClick = {
+                                        scope.launch {
+                                            WarpIdentityVault.setActive(context, identity.id)
+                                            reloadVault()
+                                        }
+                                    }
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        stringResource(
+                                            R.string.warp_identity_fmt,
+                                            identity.shortId
+                                        ),
+                                        style = MaterialTheme.typography.titleSmall
+                                    )
+                                    Text(
+                                        identity.v4 + if (identity.v6.isNotBlank()) " · ${identity.v6}" else "",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    Text(
+                                        stringResource(
+                                            R.string.warp_created_fmt,
+                                            java.text.SimpleDateFormat(
+                                                "yyyy/MM/dd HH:mm",
+                                                java.util.Locale.getDefault()
+                                            ).format(java.util.Date(identity.createdAt))
+                                        ),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                TextButton(onClick = {
+                                    scope.launch {
+                                        WarpIdentityVault.delete(context, identity.id)
+                                        reloadVault()
+                                    }
+                                }) { Text(stringResource(R.string.warp_delete)) }
+                            }
+                        }
+
+                        Spacer(Modifier.height(6.dp))
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            OutlinedButton(
+                                enabled = !warpRegistering,
+                                onClick = { registerWarp() },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                if (warpRegistering) {
+                                    CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+                                } else {
+                                    Text(stringResource(R.string.warp_register_new))
+                                }
+                            }
+                        }
+
+                        HorizontalDivider(Modifier.padding(vertical = 6.dp))
+                        SwitchRow(
+                            title = stringResource(R.string.warp_port_rotation),
+                            desc = stringResource(R.string.warp_port_rotation_desc),
+                            checked = settings.warpPortRotation
+                        ) { scope.launch { SettingsStore.setWarpPortRotation(context, it) } }
+                        HorizontalDivider(Modifier.padding(vertical = 6.dp))
+                        TextFieldRow(
+                            label = stringResource(R.string.warp_port),
+                            value = settings.warpPort.toString(),
+                            numeric = true
+                        ) { v ->
+                            v.toIntOrNull()?.let {
+                                if (it in 1..65535) {
+                                    scope.launch { SettingsStore.setWarpPort(context, it) }
+                                }
+                            }
+                        }
+                        Text(
+                            stringResource(R.string.warp_port_hint, WarpEndpoints.DEFAULT_PORT),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
             }
 
             // v0.2: behavior & safety (kill-switch, auto-connect, per-app proxy)

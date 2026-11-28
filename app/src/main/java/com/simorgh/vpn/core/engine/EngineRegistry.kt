@@ -9,6 +9,7 @@ package com.simorgh.vpn.core.engine
 object EngineRegistry {
 
     const val XRAY = "xray"
+    const val WARP = "warp"
 
     data class EngineInfo(val id: String, val label: String, val create: () -> VpnEngine)
 
@@ -22,6 +23,7 @@ object EngineRegistry {
     fun registerDefaults() {
         if (engines.isNotEmpty()) return
         register(XRAY, "Xray (VLESS/REALITY · VMess · Trojan · Shadowsocks)") { XrayEngine() }
+        register(WARP, "WARP (رایگان کلادفلر · بدون سرور)") { WarpEngine() }
     }
 
     fun ids(): List<String> = engines.keys.toList()

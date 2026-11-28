@@ -29,12 +29,17 @@ object FallbackPlanner {
         /** blank = keep the profile's own fingerprint */
         val fingerprint: String,
         val fingerprintIndex: Int = -1,
+        /** WARP engine only: anycast IP of this attempt (blank = not a WARP attempt). */
+        val warpIp: String = "",
+        /** WARP engine only: WireGuard port of this attempt (0 = not a WARP attempt). */
+        val warpPort: Int = 0,
         val isFallback: Boolean
     ) {
         val label: String
             get() {
                 val fp = fingerprint.ifBlank { "profile-default" }
-                return "${profile.name} · fp=$fp" + if (isFallback) " (fallback)" else ""
+                val warp = if (warpIp.isNotBlank()) " warp=$warpIp:$warpPort" else ""
+                return "${profile.name} · fp=$fp$warp" + if (isFallback) " (fallback)" else ""
             }
     }
 

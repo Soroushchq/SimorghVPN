@@ -60,7 +60,19 @@ data class SimorghSettings(
      * Transient per-attempt uTLS override — set by the daemon from
      * [com.simorgh.vpn.core.anticensor.FallbackPlanner]; never persisted.
      */
-    val fingerprintOverride: String = ""
+    val fingerprintOverride: String = "",
+
+    // ------------------------------------------------ v0.3.1 WARP (serverless)
+    /** Preferred WARP WireGuard port (2408 default; alternates when rotating). */
+    val warpPort: Int = 2408,
+    /** Rotate anycast IP + port across connect attempts (warp-plus pattern). */
+    val warpPortRotation: Boolean = true,
+    /**
+     * Transient per-attempt WARP endpoint — set by the daemon from
+     * [com.simorgh.vpn.core.warp.WarpPlanner]; never persisted.
+     */
+    val warpIpOverride: String = "",
+    val warpPortOverride: Int = 0
 )
 
 object SettingsStore {
@@ -86,6 +98,8 @@ object SettingsStore {
         val TLS_FRAGMENT_PROFILE = stringPreferencesKey("tls_fragment_profile")
         val UTLS_ROTATION = booleanPreferencesKey("utls_rotation")
         val FALLBACK_CHAIN = booleanPreferencesKey("fallback_chain")
+        val WARP_PORT = intPreferencesKey("warp_port")
+        val WARP_PORT_ROTATION = booleanPreferencesKey("warp_port_rotation")
     }
 
     fun flow(context: Context): Flow<SimorghSettings> {
@@ -112,7 +126,9 @@ object SettingsStore {
                 tlsFragmentProfile = p[Keys.TLS_FRAGMENT_PROFILE]?.trim().takeUnless { it.isNullOrBlank() }
                     ?: "IRAN_LIGHT",
                 utlsRotation = p[Keys.UTLS_ROTATION] ?: false,
-                fallbackChain = p[Keys.FALLBACK_CHAIN] ?: false
+                fallbackChain = p[Keys.FALLBACK_CHAIN] ?: false,
+                warpPort = (p[Keys.WARP_PORT] ?: 2408).coerceIn(1, 65535),
+                warpPortRotation = p[Keys.WARP_PORT_ROTATION] ?: true
             )
         }
     }
@@ -153,4 +169,8 @@ object SettingsStore {
         edit(context) { it[Keys.TLS_FRAGMENT_PROFILE] = v.trim().ifBlank { "IRAN_LIGHT" } }
     suspend fun setUtlsRotation(context: Context, v: Boolean) = edit(context) { it[Keys.UTLS_ROTATION] = v }
     suspend fun setFallbackChain(context: Context, v: Boolean) = edit(context) { it[Keys.FALLBACK_CHAIN] = v }
+    suspend fun setWarpPort(context: Context, v: Int) =
+        edit(context) { it[Keys.WARP_PORT] = v.coerceIn(1, 65535) }
+    suspend fun setWarpPortRotation(context: Context, v: Boolean) =
+        edit(context) { it[Keys.WARP_PORT_ROTATION] = v }
 }

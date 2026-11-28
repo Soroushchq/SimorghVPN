@@ -17,6 +17,7 @@
     <string name="status_connected">متصل</string>
     <string name="status_disconnected">قطع</string>
     <string name="status_error">خطا در اتصال</string>
+    <string name="status_blocked">مسدود (کیل‌سوییچ)</string>
     <string name="no_server_title">هنوز سروری نداری</string>
     <string name="no_server_hint">کانفیگ‌های رایگان سیمرغ به‌طور خودکار اضافه می‌شوند؛ اگر خالی ماند، از تب «سرورها» منبع را عوض کن یا لینک خودت را اضافه کن.</string>
     <string name="add_server_now">افزودن سرور</string>
@@ -52,6 +53,15 @@
     <string name="server_deleted">سرور حذف شد</string>
     <string name="no_servers_yet">لیست خالی است</string>
     <string name="servers_count">%1$d سرور</string>
+
+    <!-- v0.2: QR scan / clipboard import / sorting -->
+    <string name="scan_qr">اسکن QR</string>
+    <string name="sort_default">ترتیب پیش‌فرض</string>
+    <string name="sort_latency">مرتب بر اساس پینگ</string>
+    <string name="clipboard_found_title">لینک در کلیپ‌بورد پیدا شد</string>
+    <string name="clipboard_found_hint">به‌نظر می‌رسد کانفیگ کپی کرده‌ای؛ اضافهاش می‌کنم؟</string>
+    <string name="clipboard_import">اضافه کن</string>
+    <string name="ignore">نادیده بگیر</string>
 
     <!-- builtin free configs -->
     <string name="source_name">سیمرغ %1$d</string>
@@ -91,17 +101,61 @@
     <string name="licenses_note">سیمرغ پروژه‌ای آزاد تحت GPL-3.0 است؛ اجزای همراه در فایل NOTICE ریپو آمده‌اند.</string>
     <string name="open_github">مشاهده در گیت‌هاب</string>
 
+    <!-- v0.2: behavior & safety -->
+    <string name="section_behavior">رفتار و ایمنی</string>
+    <string name="kill_switch">کیل‌سوییچ (قطع امن)</string>
+    <string name="kill_switch_desc">اگر هسته به‌طور غیرمنتظره متوقف شود، ترافیک همان‌جا مسدود می‌شود تا مستقیم نشت نکند</string>
+    <string name="auto_connect">اتصال خودکار هنگام باز کردن برنامه</string>
+    <string name="auto_connect_desc">با باز شدن سیمرغ، آخرین سرور فعال وصل شود</string>
+    <string name="auto_start_boot">اتصال خودکار پس از روشن شدن گوشی</string>
+    <string name="auto_start_boot_desc">بعد از ری‌بوت یا به‌روزرسانی برنامه، VPN خودکار وصل شود (در صورت داشتن اجازه)</string>
+
+    <!-- v0.2: per-app proxy -->
+    <string name="close">بستن</string>
+    <string name="per_app_proxy">پروکسی برنامه‌محور</string>
+    <string name="per_app_none">حالت خاموش — همه برنامه‌ها از تونل عبور می‌کنند</string>
+    <string name="per_app_selected_n">%1$d برنامه انتخاب شده</string>
+    <string name="clear_selection">پاک‌کردن انتخاب</string>
+    <string name="per_app_all">همه برنامه‌ها</string>
+    <string name="per_app_allow">حالت اجازه</string>
+    <string name="per_app_mode_allow">فقط برنامه‌های انتخاب‌شده از VPN استفاده می‌کنند</string>
+    <string name="per_app_deny">حالت استثنا</string>
+    <string name="per_app_mode_deny">برنامه‌های انتخاب‌شده مستقیم وصل می‌شوند</string>
+    <string name="per_app_hint">برای اعمال تغییرات، اتصال را قطع و دوباره برقرار کن.</string>
+    <string name="per_app_search">جستجوی برنامه…</string>
+    <string name="loading_apps">در حال بارگذاری فهرست برنامه‌ها…</string>
+    <string name="per_app_row_desc">تعیین کن کدام برنامه‌ها از تونل عبور کنند</string>
+
+    <!-- v0.2: backup -->
+    <string name="backup">پشتیبان‌گیری</string>
+    <string name="backup_desc">خروجی و بازیابی سرورها و تنظیمات در قالب فایل JSON</string>
+    <string name="export_backup">تهیه پشتیبان</string>
+    <string name="restore_backup">بازیابی از فایل</string>
+    <string name="backup_saved">فایل پشتیبان ذخیره شد</string>
+    <string name="backup_failed">ذخیره پشتیبان ناموفق بود</string>
+    <string name="restore_done">بازیابی شد: %1$d سرور، %2$d اشتراک</string>
+    <string name="restore_failed">این فایل پشتیبان معتبر سیمرغ نیست</string>
+
+    <!-- v0.2: update check -->
+    <string name="check_update">بررسی به‌روزرسانی</string>
+    <string name="update_checking">در حال بررسی…</string>
+    <string name="up_to_date">آخرین نسخه را داری</string>
+    <string name="update_available_fmt">نسخه %1$s منتشر شده است</string>
+    <string name="download_update">دریافت نسخه جدید</string>
+    <string name="update_check_failed">بررسی به‌روزرسانی ناموفق بود</string>
+
     <!-- logs -->
     <string name="logs_title">گزارش رویدادها</string>
     <string name="auto_scroll">پیمایش خودکار</string>
     <string name="clear">پاک کردن</string>
     <string name="share_logs">اشتراک‌گذاری لاگ</string>
-    <string name="empty_logs">هنوز رویدادی ثبت نشده</string>
+    <string name="empty_logs">هنوز رویدادی ثبت نشده است</string>
 
     <!-- service notification -->
     <string name="notif_channel_name">سرویس VPN سیمرغ</string>
     <string name="notif_connecting">در حال اتصال…</string>
     <string name="notif_connected">متصل — لمس برای باز کردن</string>
+    <string name="notif_blocked">اتصال قطع شد — ترافیک مسدود است</string>
     <string name="notif_stopped">قطع شد</string>
     <string name="stop">توقف</string>
 

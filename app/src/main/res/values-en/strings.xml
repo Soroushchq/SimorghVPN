@@ -106,4 +106,9 @@
     <string name="stop">Stop</string>
 
     <string name="copied">Copied</string>
+
+    <!-- v0.2.1: offline APK share (openrung pattern) -->
+    <string name="share_apk">Share APK (offline)</string>
+    <string name="share_apk_desc">Send the installer to friends with no internet at all</string>
+    <string name="share_apk_failed">Sharing the APK failed</string>
 </resources>

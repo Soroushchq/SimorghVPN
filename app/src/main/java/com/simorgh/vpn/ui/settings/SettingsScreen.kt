@@ -20,6 +20,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowRight
+import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.SystemUpdate
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
@@ -55,6 +56,7 @@ import com.simorgh.vpn.data.SettingsStore
 import com.simorgh.vpn.data.TunnelMode
 import com.simorgh.vpn.data.UpdateChecker
 import com.simorgh.vpn.ui.components.SectionCard
+import com.simorgh.vpn.util.ApkSharer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -312,6 +314,26 @@ fun SettingsScreen() {
                 }
 
                 Spacer(Modifier.height(8.dp))
+
+                // v0.2.1: offline APK share (openrung pattern)
+                OutlinedButton(onClick = {
+                    scope.launch(Dispatchers.IO) {
+                        val ok = ApkSharer.share(
+                            context, context.getString(R.string.share_apk)
+                        )
+                        if (!ok) snackbar.showSnackbar(context.getString(R.string.share_apk_failed))
+                    }
+                }) {
+                    Icon(Icons.Outlined.Share, contentDescription = null)
+                    Spacer(Modifier.width(6.dp))
+                    Text(stringResource(R.string.share_apk))
+                }
+                Text(
+                    stringResource(R.string.share_apk_desc),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
                 Text(
                     stringResource(R.string.licenses_note),
                     style = MaterialTheme.typography.bodySmall,

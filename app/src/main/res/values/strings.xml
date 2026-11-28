@@ -160,4 +160,9 @@
     <string name="stop">توقف</string>
 
     <string name="copied">کپی شد</string>
+
+    <!-- v0.2.1: offline APK share (openrung pattern) -->
+    <string name="share_apk">اشتراک‌گذاری APK (آفلاین)</string>
+    <string name="share_apk_desc">فایل نصبی برنامه را بدون اینترنت برای دوستان بفرست</string>
+    <string name="share_apk_failed">ارسال APK ناموفق بود</string>
 </resources>

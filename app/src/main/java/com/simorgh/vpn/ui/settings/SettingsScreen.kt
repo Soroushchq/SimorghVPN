@@ -2,7 +2,11 @@ package com.simorgh.vpn.ui.settings
 
 import android.content.Intent
 import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -10,16 +14,25 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowRight
+import androidx.compose.material.icons.outlined.SystemUpdate
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -36,129 +49,332 @@ import com.simorgh.vpn.BuildConfig
 import com.simorgh.vpn.R
 import com.simorgh.vpn.ServiceLocator
 import com.simorgh.vpn.core.CoreBootstrap
+import com.simorgh.vpn.data.BackupManager
 import com.simorgh.vpn.data.RoutingMode
 import com.simorgh.vpn.data.SettingsStore
 import com.simorgh.vpn.data.TunnelMode
+import com.simorgh.vpn.data.UpdateChecker
 import com.simorgh.vpn.ui.components.SectionCard
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @Composable
 fun SettingsScreen() {
     val context = LocalContext.current
     val settings by ServiceLocator.settings.collectAsState()
     val scope = rememberCoroutineScope()
+    val snackbar = remember { SnackbarHostState() }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 16.dp)
-    ) {
-        Text(
-            stringResource(R.string.nav_settings),
-            style = MaterialTheme.typography.headlineSmall,
-            modifier = Modifier.padding(vertical = 12.dp)
-        )
+    var showPerApp by remember { mutableStateOf(false) }
+    var checkingUpdate by remember { mutableStateOf(false) }
+    var updateInfo by remember { mutableStateOf<UpdateChecker.UpdateInfo?>(null) }
+    var updateFailed by remember { mutableStateOf(false) }
 
-        SectionCard(stringResource(R.string.routing)) {
-            RadioRow(
-                title = stringResource(R.string.routing_ir),
-                desc = stringResource(R.string.routing_ir_desc),
-                selected = settings.routingMode == RoutingMode.IR_BYPASS
-            ) { scope.launch { SettingsStore.setRoutingMode(context, RoutingMode.IR_BYPASS) } }
-            RadioRow(
-                title = stringResource(R.string.routing_global),
-                desc = stringResource(R.string.routing_global_desc),
-                selected = settings.routingMode == RoutingMode.GLOBAL
-            ) { scope.launch { SettingsStore.setRoutingMode(context, RoutingMode.GLOBAL) } }
-        }
+    // -------------------------------------------------- backup (SAF) launchers
 
-        SectionCard(stringResource(R.string.tunnel_mode)) {
-            RadioRow(
-                title = stringResource(R.string.tunnel_hev),
-                desc = stringResource(R.string.tunnel_hev_desc),
-                selected = settings.tunnelMode == TunnelMode.HEV
-            ) { scope.launch { SettingsStore.setTunnelMode(context, TunnelMode.HEV) } }
-            RadioRow(
-                title = stringResource(R.string.tunnel_xray),
-                desc = stringResource(R.string.tunnel_xray_desc),
-                selected = settings.tunnelMode == TunnelMode.XRAY_TUN
-            ) { scope.launch { SettingsStore.setTunnelMode(context, TunnelMode.XRAY_TUN) } }
-            RadioRow(
-                title = stringResource(R.string.tunnel_proxy),
-                desc = stringResource(R.string.tunnel_proxy_desc),
-                selected = settings.tunnelMode == TunnelMode.PROXY_ONLY
-            ) { scope.launch { SettingsStore.setTunnelMode(context, TunnelMode.PROXY_ONLY) } }
-        }
-
-        SectionCard(stringResource(R.string.advanced)) {
-            SwitchRow(
-                title = stringResource(R.string.ipv6),
-                checked = settings.ipv6
-            ) { scope.launch { SettingsStore.setIpv6(context, it) } }
-            HorizontalDivider(Modifier.padding(vertical = 6.dp))
-            SwitchRow(
-                title = stringResource(R.string.allow_insecure),
-                desc = stringResource(R.string.allow_insecure_desc),
-                checked = settings.allowInsecure
-            ) { scope.launch { SettingsStore.setAllowInsecure(context, it) } }
-            HorizontalDivider(Modifier.padding(vertical = 6.dp))
-            TextFieldRow(
-                label = stringResource(R.string.socks_port),
-                value = settings.socksPort.toString(),
-                numeric = true
-            ) { v -> v.toIntOrNull()?.let { scope.launch { SettingsStore.setSocksPort(context, it) } } }
-            TextFieldRow(
-                label = stringResource(R.string.mtu),
-                value = settings.mtu.toString(),
-                numeric = true
-            ) { v -> v.toIntOrNull()?.let { scope.launch { SettingsStore.setMtu(context, it) } } }
-            TextFieldRow(
-                label = stringResource(R.string.remote_dns),
-                value = settings.remoteDns,
-                numeric = false
-            ) { scope.launch { SettingsStore.setRemoteDns(context, it) } }
-            TextFieldRow(
-                label = stringResource(R.string.domestic_dns),
-                value = settings.domesticDns,
-                numeric = false
-            ) { scope.launch { SettingsStore.setDomesticDns(context, it) } }
-        }
-
-        SectionCard(stringResource(R.string.about)) {
-            RowLabelValue(
-                stringResource(R.string.version),
-                BuildConfig.VERSION_NAME
+    val exportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json")
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch(Dispatchers.IO) {
+            val ok = runCatching {
+                val os = context.contentResolver.openOutputStream(uri, "wt")
+                    ?: error("cannot open output stream")
+                os.use { it.write(BackupManager.export().toByteArray(Charsets.UTF_8)) }
+            }.isSuccess
+            snackbar.showSnackbar(
+                context.getString(if (ok) R.string.backup_saved else R.string.backup_failed)
             )
-            RowLabelValue(
-                stringResource(R.string.core_version),
-                if (CoreBootstrap.isInitialized) CoreBootstrap.version() else "…"
-            )
-            Spacer(Modifier.height(8.dp))
-            Text(
-                stringResource(R.string.licenses_note),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Spacer(Modifier.height(10.dp))
-            OutlinedButton(
-                onClick = {
-                    runCatching {
-                        context.startActivity(
-                            Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/Soroushchq/SimorghVPN"))
-                        )
+        }
+    }
+
+    val restoreLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            runCatching {
+                val text = withContext(Dispatchers.IO) {
+                    context.contentResolver.openInputStream(uri)?.use {
+                        it.readBytes().toString(Charsets.UTF_8)
                     }
-                }
-            ) {
-                Text(stringResource(R.string.open_github))
+                } ?: error("cannot read file")
+                BackupManager.restore(context, text)
+            }.onSuccess { r ->
+                snackbar.showSnackbar(
+                    context.getString(R.string.restore_done, r.profilesAdded, r.subscriptionsAdded)
+                )
+            }.onFailure {
+                snackbar.showSnackbar(context.getString(R.string.restore_failed))
             }
         }
+    }
 
-        Spacer(Modifier.height(28.dp))
+    fun checkUpdate() {
+        checkingUpdate = true
+        updateFailed = false
+        updateInfo = null
+        scope.launch {
+            runCatching { UpdateChecker.check(BuildConfig.VERSION_NAME) }
+                .onSuccess { updateInfo = it }
+                .onFailure { updateFailed = true }
+            checkingUpdate = false
+        }
+    }
+
+    Box(Modifier.fillMaxSize()) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp)
+        ) {
+            Text(
+                stringResource(R.string.nav_settings),
+                style = MaterialTheme.typography.headlineSmall,
+                modifier = Modifier.padding(vertical = 12.dp)
+            )
+
+            SectionCard(stringResource(R.string.routing)) {
+                RadioRow(
+                    title = stringResource(R.string.routing_ir),
+                    desc = stringResource(R.string.routing_ir_desc),
+                    selected = settings.routingMode == RoutingMode.IR_BYPASS
+                ) { scope.launch { SettingsStore.setRoutingMode(context, RoutingMode.IR_BYPASS) } }
+                RadioRow(
+                    title = stringResource(R.string.routing_global),
+                    desc = stringResource(R.string.routing_global_desc),
+                    selected = settings.routingMode == RoutingMode.GLOBAL
+                ) { scope.launch { SettingsStore.setRoutingMode(context, RoutingMode.GLOBAL) } }
+            }
+
+            SectionCard(stringResource(R.string.tunnel_mode)) {
+                RadioRow(
+                    title = stringResource(R.string.tunnel_hev),
+                    desc = stringResource(R.string.tunnel_hev_desc),
+                    selected = settings.tunnelMode == TunnelMode.HEV
+                ) { scope.launch { SettingsStore.setTunnelMode(context, TunnelMode.HEV) } }
+                RadioRow(
+                    title = stringResource(R.string.tunnel_xray),
+                    desc = stringResource(R.string.tunnel_xray_desc),
+                    selected = settings.tunnelMode == TunnelMode.XRAY_TUN
+                ) { scope.launch { SettingsStore.setTunnelMode(context, TunnelMode.XRAY_TUN) } }
+                RadioRow(
+                    title = stringResource(R.string.tunnel_proxy),
+                    desc = stringResource(R.string.tunnel_proxy_desc),
+                    selected = settings.tunnelMode == TunnelMode.PROXY_ONLY
+                ) { scope.launch { SettingsStore.setTunnelMode(context, TunnelMode.PROXY_ONLY) } }
+            }
+
+            // v0.2: behavior & safety (kill-switch, auto-connect, per-app proxy)
+            SectionCard(stringResource(R.string.section_behavior)) {
+                SwitchRow(
+                    title = stringResource(R.string.kill_switch),
+                    desc = stringResource(R.string.kill_switch_desc),
+                    checked = settings.killSwitch
+                ) { scope.launch { SettingsStore.setKillSwitch(context, it) } }
+                HorizontalDivider(Modifier.padding(vertical = 6.dp))
+                SwitchRow(
+                    title = stringResource(R.string.auto_connect),
+                    desc = stringResource(R.string.auto_connect_desc),
+                    checked = settings.autoConnect
+                ) { scope.launch { SettingsStore.setAutoConnect(context, it) } }
+                HorizontalDivider(Modifier.padding(vertical = 6.dp))
+                SwitchRow(
+                    title = stringResource(R.string.auto_start_boot),
+                    desc = stringResource(R.string.auto_start_boot_desc),
+                    checked = settings.autoStartBoot
+                ) { scope.launch { SettingsStore.setAutoStartBoot(context, it) } }
+                HorizontalDivider(Modifier.padding(vertical = 6.dp))
+                PerAppRow(onClick = { showPerApp = true })
+            }
+
+            // v0.2: JSON backup/restore via SAF
+            SectionCard(stringResource(R.string.backup)) {
+                Text(
+                    stringResource(R.string.backup_desc),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(10.dp))
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = { exportLauncher.launch("simorgh-backup.json") },
+                        modifier = Modifier.weight(1f)
+                    ) { Text(stringResource(R.string.export_backup)) }
+                    OutlinedButton(
+                        onClick = {
+                            restoreLauncher.launch(
+                                arrayOf("application/json", "application/octet-stream", "text/plain")
+                            )
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) { Text(stringResource(R.string.restore_backup)) }
+                }
+            }
+
+            SectionCard(stringResource(R.string.advanced)) {
+                SwitchRow(
+                    title = stringResource(R.string.ipv6),
+                    checked = settings.ipv6
+                ) { scope.launch { SettingsStore.setIpv6(context, it) } }
+                HorizontalDivider(Modifier.padding(vertical = 6.dp))
+                SwitchRow(
+                    title = stringResource(R.string.allow_insecure),
+                    desc = stringResource(R.string.allow_insecure_desc),
+                    checked = settings.allowInsecure
+                ) { scope.launch { SettingsStore.setAllowInsecure(context, it) } }
+                HorizontalDivider(Modifier.padding(vertical = 6.dp))
+                TextFieldRow(
+                    label = stringResource(R.string.socks_port),
+                    value = settings.socksPort.toString(),
+                    numeric = true
+                ) { v -> v.toIntOrNull()?.let { scope.launch { SettingsStore.setSocksPort(context, it) } } }
+                TextFieldRow(
+                    label = stringResource(R.string.mtu),
+                    value = settings.mtu.toString(),
+                    numeric = true
+                ) { v -> v.toIntOrNull()?.let { scope.launch { SettingsStore.setMtu(context, it) } } }
+                TextFieldRow(
+                    label = stringResource(R.string.remote_dns),
+                    value = settings.remoteDns,
+                    numeric = false
+                ) { scope.launch { SettingsStore.setRemoteDns(context, it) } }
+                TextFieldRow(
+                    label = stringResource(R.string.domestic_dns),
+                    value = settings.domesticDns,
+                    numeric = false
+                ) { scope.launch { SettingsStore.setDomesticDns(context, it) } }
+            }
+
+            SectionCard(stringResource(R.string.about)) {
+                RowLabelValue(
+                    stringResource(R.string.version),
+                    BuildConfig.VERSION_NAME
+                )
+                RowLabelValue(
+                    stringResource(R.string.core_version),
+                    if (CoreBootstrap.isInitialized) CoreBootstrap.version() else "…"
+                )
+
+                // v0.2: GitHub release update check
+                Spacer(Modifier.height(8.dp))
+                OutlinedButton(enabled = !checkingUpdate, onClick = { checkUpdate() }) {
+                    if (checkingUpdate) {
+                        CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+                    } else {
+                        Icon(Icons.Outlined.SystemUpdate, contentDescription = null)
+                    }
+                    Spacer(Modifier.width(6.dp))
+                    Text(stringResource(R.string.check_update))
+                }
+                when {
+                    checkingUpdate -> Text(
+                        stringResource(R.string.update_checking),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    updateFailed -> Text(
+                        stringResource(R.string.update_check_failed),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                    else -> updateInfo?.let { info ->
+                        if (info.hasUpdate) {
+                            Text(
+                                stringResource(R.string.update_available_fmt, info.latestTag),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            TextButton(onClick = {
+                                runCatching {
+                                    context.startActivity(
+                                        Intent(
+                                            Intent.ACTION_VIEW,
+                                            Uri.parse(info.apkUrl ?: info.releaseUrl)
+                                        )
+                                    )
+                                }
+                            }) { Text(stringResource(R.string.download_update)) }
+                        } else {
+                            Text(
+                                stringResource(R.string.up_to_date),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    stringResource(R.string.licenses_note),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(10.dp))
+                OutlinedButton(
+                    onClick = {
+                        runCatching {
+                            context.startActivity(
+                                Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/Soroushchq/SimorghVPN"))
+                            )
+                        }
+                    }
+                ) {
+                    Text(stringResource(R.string.open_github))
+                }
+            }
+
+            Spacer(Modifier.height(28.dp))
+        }
+
+        SnackbarHost(
+            hostState = snackbar,
+            modifier = Modifier.align(Alignment.BottomCenter)
+        )
+    }
+
+    // v0.2: per-app proxy picker (fullscreen dialog)
+    if (showPerApp) {
+        PerAppProxyDialog(onDismiss = { showPerApp = false })
     }
 }
 
 // ---------------------------------------------------------------------- rows
+
+@Composable
+private fun PerAppRow(onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(
+                stringResource(R.string.per_app_proxy),
+                style = MaterialTheme.typography.titleSmall
+            )
+            Text(
+                stringResource(R.string.per_app_row_desc),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        Icon(
+            Icons.AutoMirrored.Outlined.KeyboardArrowRight,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+}
 
 @Composable
 private fun RadioRow(title: String, desc: String, selected: Boolean, onClick: () -> Unit) {

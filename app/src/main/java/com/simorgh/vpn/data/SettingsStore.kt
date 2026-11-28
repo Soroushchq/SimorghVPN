@@ -72,7 +72,17 @@ data class SimorghSettings(
      * [com.simorgh.vpn.core.warp.WarpPlanner]; never persisted.
      */
     val warpIpOverride: String = "",
-    val warpPortOverride: Int = 0
+    val warpPortOverride: Int = 0,
+
+    // ------------------------------------------------ v0.4 FLUX (adaptive routing)
+    /** FLUX smart routing: network memory + TCP route race before connecting. */
+    val fluxEnabled: Boolean = false,
+    /** Mid-session failover: when the engine dies, reconnect via the next-best route automatically. */
+    val fluxFailover: Boolean = true,
+
+    // ------------------------------------------------ v0.4 MAE (per-service adaptive routing)
+    /** Adaptive per-service routing: probe services directly, route the reachable ones direct. */
+    val maeEnabled: Boolean = false
 )
 
 object SettingsStore {
@@ -100,6 +110,9 @@ object SettingsStore {
         val FALLBACK_CHAIN = booleanPreferencesKey("fallback_chain")
         val WARP_PORT = intPreferencesKey("warp_port")
         val WARP_PORT_ROTATION = booleanPreferencesKey("warp_port_rotation")
+        val FLUX_ENABLED = booleanPreferencesKey("flux_enabled")
+        val FLUX_FAILOVER = booleanPreferencesKey("flux_failover")
+        val MAE_ENABLED = booleanPreferencesKey("mae_enabled")
     }
 
     fun flow(context: Context): Flow<SimorghSettings> {
@@ -128,7 +141,10 @@ object SettingsStore {
                 utlsRotation = p[Keys.UTLS_ROTATION] ?: false,
                 fallbackChain = p[Keys.FALLBACK_CHAIN] ?: false,
                 warpPort = (p[Keys.WARP_PORT] ?: 2408).coerceIn(1, 65535),
-                warpPortRotation = p[Keys.WARP_PORT_ROTATION] ?: true
+                warpPortRotation = p[Keys.WARP_PORT_ROTATION] ?: true,
+                fluxEnabled = p[Keys.FLUX_ENABLED] ?: false,
+                fluxFailover = p[Keys.FLUX_FAILOVER] ?: true,
+                maeEnabled = p[Keys.MAE_ENABLED] ?: false
             )
         }
     }
@@ -173,4 +189,10 @@ object SettingsStore {
         edit(context) { it[Keys.WARP_PORT] = v.coerceIn(1, 65535) }
     suspend fun setWarpPortRotation(context: Context, v: Boolean) =
         edit(context) { it[Keys.WARP_PORT_ROTATION] = v }
+    suspend fun setFluxEnabled(context: Context, v: Boolean) =
+        edit(context) { it[Keys.FLUX_ENABLED] = v }
+    suspend fun setFluxFailover(context: Context, v: Boolean) =
+        edit(context) { it[Keys.FLUX_FAILOVER] = v }
+    suspend fun setMaeEnabled(context: Context, v: Boolean) =
+        edit(context) { it[Keys.MAE_ENABLED] = v }
 }

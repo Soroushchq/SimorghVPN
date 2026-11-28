@@ -437,6 +437,23 @@ fun SettingsScreen() {
                 ) { scope.launch { SettingsStore.setFallbackChain(context, it) } }
             }
 
+            // v0.4: FLUX smart routing (network memory + race + failover)
+            SectionCard(stringResource(R.string.section_flux)) {
+                SwitchRow(
+                    title = stringResource(R.string.flux_routing),
+                    desc = stringResource(R.string.flux_routing_desc),
+                    checked = settings.fluxEnabled
+                ) { scope.launch { SettingsStore.setFluxEnabled(context, it) } }
+                if (settings.fluxEnabled) {
+                    HorizontalDivider(Modifier.padding(vertical = 6.dp))
+                    SwitchRow(
+                        title = stringResource(R.string.flux_failover),
+                        desc = stringResource(R.string.flux_failover_desc),
+                        checked = settings.fluxFailover
+                    ) { scope.launch { SettingsStore.setFluxFailover(context, it) } }
+                }
+            }
+
             // v0.2: JSON backup/restore via SAF
             SectionCard(stringResource(R.string.backup)) {
                 Text(

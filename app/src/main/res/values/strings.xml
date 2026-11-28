@@ -206,4 +206,11 @@
     <string name="warp_created_fmt">ساخته‌شده: %1$s</string>
     <string name="warp_home_title">موتور بدون سرور</string>
     <string name="warp_home_name">Cloudflare WARP</string>
+
+    <!-- v0.4: FLUX smart routing -->
+    <string name="section_flux">هوش‌مندی مسیر (FLUX)</string>
+    <string name="flux_routing">مسیریابی هوشمند FLUX</string>
+    <string name="flux_routing_desc">تونل به یاد می‌آورد کدام مسیر روی این شبکه جواب داده، قبل از اتصال مسیرها را مسابقه می‌دهد و بهترین را برمی‌گزیند</string>
+    <string name="flux_failover">اتصال مجدد خودکار</string>
+    <string name="flux_failover_desc">اگر هسته وسط کار بمیرد، بدون دخالت تو از مسیر بعدیِ سالم دوباره وصل می‌شود (حداکثر ۲ بار)</string>
 </resources>

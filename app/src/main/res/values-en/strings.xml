@@ -152,4 +152,11 @@
     <string name="warp_created_fmt">Created: %1$s</string>
     <string name="warp_home_title">Serverless engine</string>
     <string name="warp_home_name">Cloudflare WARP</string>
+
+    <!-- v0.4: FLUX smart routing -->
+    <string name="section_flux">Smart routing (FLUX)</string>
+    <string name="flux_routing">FLUX smart routing</string>
+    <string name="flux_routing_desc">The tunnel remembers which routes worked on this network, races them before connecting and picks the best</string>
+    <string name="flux_failover">Automatic failover</string>
+    <string name="flux_failover_desc">If the engine dies mid-session, reconnect through the next healthy route automatically (up to 2 rounds)</string>
 </resources>

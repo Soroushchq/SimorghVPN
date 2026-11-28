@@ -30,6 +30,10 @@ import com.simorgh.vpn.core.anticensor.FallbackPlanner
 import com.simorgh.vpn.core.anticensor.FingerprintRotator
 import com.simorgh.vpn.core.engine.EngineRegistry
 import com.simorgh.vpn.core.engine.VpnEngine
+import com.simorgh.vpn.core.flux.FluxFailReason
+import com.simorgh.vpn.core.flux.FluxNet
+import com.simorgh.vpn.core.flux.FluxPlanner
+import com.simorgh.vpn.core.flux.FluxStore
 import com.simorgh.vpn.core.warp.WarpPlanner
 import com.simorgh.vpn.data.PerAppMode
 import com.simorgh.vpn.data.SettingsMirror
@@ -63,6 +67,9 @@ class SimorghVpnService : VpnService() {
         const val CHANNEL_ID = "simorgh_vpn_channel"
         const val NOTIFICATION_ID = 1001
 
+        /** FLUX mid-session failover: max automatic reconnect rounds per manual connect. */
+        const val MAX_FAILOVER_ROUNDS = 2
+
         fun start(context: Context, profileId: String) {
             val i = Intent(context, SimorghVpnService::class.java)
                 .setAction(ACTION_START)
@@ -87,6 +94,12 @@ class SimorghVpnService : VpnService() {
     private var lastUp = 0L
     private var lastDown = 0L
     private var wasConnected = false
+
+    // v0.4 FLUX: session route bookkeeping + failover rounds
+    private var failoverRounds = 0
+    private var lastProfileId: String? = null
+    private var currentRouteKey = ""
+    private var currentNetKey = "unknown"
 
     // ------------------------------------------------------------------ IPC server
 
@@ -177,6 +190,12 @@ class SimorghVpnService : VpnService() {
     // ------------------------------------------------------------------ start/stop
 
     private suspend fun startVpnLocked(profileId: String?) {
+        if (profileId != null) lastProfileId = profileId
+        failoverRounds = 0 // a manual connect resets the failover budget
+        connectLocked()
+    }
+
+    private suspend fun connectLocked() {
         try {
             // full cleanup of any previous state (also clears a kill-switch hold)
             stopEngineLocked()
@@ -191,7 +210,7 @@ class SimorghVpnService : VpnService() {
             // WARP is serverless — no user profile needed, only a vault identity
             val warpPlan = if (isWarp) WarpPlanner.plan(settings) else null
             val primary = warpPlan?.first()?.profile
-                ?: all.firstOrNull { it.id == profileId }
+                ?: all.firstOrNull { it.id == lastProfileId }
                     ?: all.firstOrNull { it.id == settings.activeProfileId }
                     ?: all.firstOrNull()
                     ?: error("no profile configured")
@@ -211,9 +230,14 @@ class SimorghVpnService : VpnService() {
 
             // v0.3 anti-censor: attempt plan (nova/msn-guard fallback chain);
             // v0.3.1: WARP gets its own plan — anycast IP × port rotation with
-            // a real data-plane probe after every attempt.
-            val plan = warpPlan ?: FallbackPlanner.plan(primary, all, settings)
-            val probe = isWarp || settings.utlsRotation || settings.fallbackChain
+            // a real data-plane probe after every attempt;
+            // v0.4 FLUX: reorder the plan with network memory + a live TCP race.
+            val netKey = FluxNet.currentKey(this)
+            val basePlan = warpPlan ?: FallbackPlanner.plan(primary, all, settings)
+            val plan = if (settings.fluxEnabled && basePlan.size > 1) {
+                FluxPlanner.order(this, basePlan)
+            } else basePlan
+            val probe = isWarp || settings.utlsRotation || settings.fallbackChain || settings.fluxEnabled
             if (plan.size > 1) {
                 LogBuffer.i("Vpn", "anti-censor plan: ${plan.size} attempts (rotation=${settings.utlsRotation} chain=${settings.fallbackChain})")
             }
@@ -249,7 +273,9 @@ class SimorghVpnService : VpnService() {
                 }
 
                 if (started) {
+                    val t0 = android.os.SystemClock.elapsedRealtime()
                     val alive = !probe || DataPlaneProbe.ok(settings.socksPort)
+                    val probeMs = android.os.SystemClock.elapsedRealtime() - t0
                     if (alive) {
                         engine = eng
                         winner = attempt
@@ -257,11 +283,28 @@ class SimorghVpnService : VpnService() {
                             // this fingerprint survived a real data-plane request
                             FingerprintRotator.rememberGood(attempt.fingerprintIndex)
                         }
+                        if (settings.fluxEnabled) {
+                            FluxStore.recordSuccess(
+                                this, netKey, FluxPlanner.routeKey(attempt), probeMs
+                            )
+                        }
                         break
                     }
                     LogBuffer.w("Vpn", "data-plane probe failed for ${attempt.label} — rotating")
+                    if (settings.fluxEnabled) {
+                        FluxStore.recordFailure(
+                            this, netKey, FluxPlanner.routeKey(attempt),
+                            FluxFailReason.DATA_PLANE
+                        )
+                    }
                 } else {
                     LogBuffer.w("Vpn", "engine failed to start for ${attempt.label}")
+                    if (settings.fluxEnabled) {
+                        FluxStore.recordFailure(
+                            this, netKey, FluxPlanner.routeKey(attempt),
+                            FluxFailReason.ENGINE_START
+                        )
+                    }
                 }
                 // teardown this attempt only (tun stays up for the next one)
                 runCatching { eng.stopAwait(3000) }
@@ -270,6 +313,11 @@ class SimorghVpnService : VpnService() {
             val win = winner ?: error("all ${plan.size} connect attempts failed")
             val profile = win.profile
             engine ?: error("engine lost after successful attempt")
+
+            // FLUX bookkeeping for the mid-session failover path
+            currentRouteKey = FluxPlanner.routeKey(win)
+            currentNetKey = netKey
+            failoverRounds = 0 // a successful connect re-arms the failover budget
 
             if (win.isFallback) {
                 // the user should see which profile actually carries the tunnel
@@ -299,6 +347,36 @@ class SimorghVpnService : VpnService() {
             LogBuffer.e("Vpn", "start failed", t)
             failLocked(t)
         }
+    }
+
+    /**
+     * v0.4 FLUX failover: when the engine dies mid-session, record the failure
+     * in network memory and reconnect through the next-best route right away
+     * (bounded by [MAX_FAILOVER_ROUNDS]). When the budget is spent — or FLUX
+     * is off — fall back to the v0.2 behavior (kill-switch hold or error).
+     */
+    private suspend fun onEngineDeathLocked(cause: Throwable) {
+        val settings = currentSettings() // fresh failover decision
+        if (settings.fluxEnabled && currentRouteKey.isNotBlank()) {
+            FluxStore.recordFailure(this, currentNetKey, currentRouteKey, FluxFailReason.OTHER)
+        }
+        val canFailover = settings.fluxEnabled && settings.fluxFailover &&
+            failoverRounds < MAX_FAILOVER_ROUNDS
+        if (!canFailover) {
+            failLocked(cause)
+            return
+        }
+        failoverRounds++
+        LogBuffer.w(
+            "Vpn",
+            "engine died — FLUX failover round $failoverRounds/$MAX_FAILOVER_ROUNDS: ${cause.message}"
+        )
+        statsJob?.cancel()
+        statsJob = null
+        currentRouteKey = ""
+        VpnBus.update { it.copy(status = VpnStatus.CONNECTING, error = "", sinceMs = 0) }
+        enterForeground(getString(R.string.notif_connecting), "")
+        connectLocked() // swallows its own errors → failLocked
     }
 
     /** Engine failure: kill-switch hold if enabled+connected, else normal error teardown. */
@@ -411,10 +489,10 @@ class SimorghVpnService : VpnService() {
             delay(1000)
             val e = engine
             if (e != null && !e.isRunning) {
-                // engine died unexpectedly → kill-switch hold or honest error
+                // engine died unexpectedly → FLUX failover, kill-switch hold, or honest error
                 scope.launch {
                     opsMutex.withLock {
-                        if (engine === e) failLocked(RuntimeException("core exited unexpectedly"))
+                        if (engine === e) onEngineDeathLocked(RuntimeException("core exited unexpectedly"))
                     }
                 }
                 return

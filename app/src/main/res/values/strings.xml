@@ -165,4 +165,20 @@
     <string name="share_apk">اشتراک‌گذاری APK (آفلاین)</string>
     <string name="share_apk_desc">فایل نصبی برنامه را بدون اینترنت برای دوستان بفرست</string>
     <string name="share_apk_failed">ارسال APK ناموفق بود</string>
+
+    <!-- v0.3: anti-censorship -->
+    <string name="section_anticensor">ضدسانسور (آزمایشی)</string>
+    <string name="tls_fragment">فرگمنت‌سازی TLS</string>
+    <string name="tls_fragment_profile">پروفایل فرگمنت</string>
+    <string name="tls_fragment_desc">تکه‌تکه‌کردن دست‌دادن TLS تا DPI نتواند SNI و فینگرپرینت را در یک پکت بخواند (فقط اتصال‌های TLS/REALITY)</string>
+    <string name="tls_fragment_light">ملایم (۴۰ تا ۱۰۰ بایت)</string>
+    <string name="tls_fragment_light_desc">تقریباً بدون تأثیر روی سرعت — برای دورزدن اکثر سنجش‌گرهای SNI</string>
+    <string name="tls_fragment_medium">متوسط (۱۰ تا ۵۰ بایت)</string>
+    <string name="tls_fragment_medium_desc">گیج‌سازی قوی‌تر، هنوز مناسب ۳G/۴G</string>
+    <string name="tls_fragment_aggressive">شدید (۱ تا ۱۰ بایت)</string>
+    <string name="tls_fragment_aggressive_desc">ریزتکه‌های msn-guard برای شبکه‌های خصمانه — هزینهٔ شبکه بالاتر</string>
+    <string name="utls_rotation">چرخش فینگرپرینت uTLS</string>
+    <string name="utls_rotation_desc">اگر دست‌دادن TLS شکست خورد، دوباره با فینگرپرینت مرورگر دیگری تلاش می‌شود تا معلوم شود اسم مسدود است یا فینگرپرینت</string>
+    <string name="fallback_chain">زنجیره‌ی جایگزین خودکار</string>
+    <string name="fallback_chain_desc">بعد از هر تلاش، یک درخواست واقعی از داخل تونل آزمایش می‌شود؛ اگر جواب نیامد خودکار به سرور بعدی می‌رود</string>
 </resources>

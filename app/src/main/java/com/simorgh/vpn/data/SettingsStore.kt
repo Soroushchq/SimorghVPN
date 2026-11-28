@@ -46,7 +46,21 @@ data class SimorghSettings(
     val perAppMode: PerAppMode = PerAppMode.OFF,
     val perAppPackages: Set<String> = emptySet(),
     /** Tunnel engine id (EngineRegistry). v0.2.1 ships only "xray"; v0.3 adds more. */
-    val engineId: String = "xray"
+    val engineId: String = "xray",
+
+    // ------------------------------------------------ v0.3 anti-censor
+    /** TLS ClientHello fragmentation (Xray sockopt.fragment). TLS/REALITY only. */
+    val tlsFragment: Boolean = false,
+    val tlsFragmentProfile: String = "IRAN_LIGHT",
+    /** uTLS fingerprint rotation across connect attempts (nova pattern). */
+    val utlsRotation: Boolean = false,
+    /** Automatic fallback chain: real data-plane probe, then next profile (nova/msn-guard). */
+    val fallbackChain: Boolean = false,
+    /**
+     * Transient per-attempt uTLS override — set by the daemon from
+     * [com.simorgh.vpn.core.anticensor.FallbackPlanner]; never persisted.
+     */
+    val fingerprintOverride: String = ""
 )
 
 object SettingsStore {
@@ -68,6 +82,10 @@ object SettingsStore {
         val PER_APP_MODE = stringPreferencesKey("per_app_mode")
         val PER_APP_PACKAGES = stringSetPreferencesKey("per_app_packages")
         val ENGINE_ID = stringPreferencesKey("engine_id")
+        val TLS_FRAGMENT = booleanPreferencesKey("tls_fragment")
+        val TLS_FRAGMENT_PROFILE = stringPreferencesKey("tls_fragment_profile")
+        val UTLS_ROTATION = booleanPreferencesKey("utls_rotation")
+        val FALLBACK_CHAIN = booleanPreferencesKey("fallback_chain")
     }
 
     fun flow(context: Context): Flow<SimorghSettings> {
@@ -89,7 +107,12 @@ object SettingsStore {
                 autoStartBoot = p[Keys.AUTO_START_BOOT] ?: false,
                 perAppMode = enumOf(p[Keys.PER_APP_MODE], PerAppMode.OFF),
                 perAppPackages = p[Keys.PER_APP_PACKAGES] ?: emptySet(),
-                engineId = p[Keys.ENGINE_ID]?.trim().takeUnless { it.isNullOrBlank() } ?: "xray"
+                engineId = p[Keys.ENGINE_ID]?.trim().takeUnless { it.isNullOrBlank() } ?: "xray",
+                tlsFragment = p[Keys.TLS_FRAGMENT] ?: false,
+                tlsFragmentProfile = p[Keys.TLS_FRAGMENT_PROFILE]?.trim().takeUnless { it.isNullOrBlank() }
+                    ?: "IRAN_LIGHT",
+                utlsRotation = p[Keys.UTLS_ROTATION] ?: false,
+                fallbackChain = p[Keys.FALLBACK_CHAIN] ?: false
             )
         }
     }
@@ -125,4 +148,9 @@ object SettingsStore {
         edit(context) { it[Keys.PER_APP_PACKAGES] = pkgs }
     suspend fun setEngineId(context: Context, v: String) =
         edit(context) { it[Keys.ENGINE_ID] = v.trim().ifBlank { "xray" } }
+    suspend fun setTlsFragment(context: Context, v: Boolean) = edit(context) { it[Keys.TLS_FRAGMENT] = v }
+    suspend fun setTlsFragmentProfile(context: Context, v: String) =
+        edit(context) { it[Keys.TLS_FRAGMENT_PROFILE] = v.trim().ifBlank { "IRAN_LIGHT" } }
+    suspend fun setUtlsRotation(context: Context, v: Boolean) = edit(context) { it[Keys.UTLS_ROTATION] = v }
+    suspend fun setFallbackChain(context: Context, v: Boolean) = edit(context) { it[Keys.FALLBACK_CHAIN] = v }
 }

@@ -1,6 +1,6 @@
 <div dir="rtl">
 
-# معماری سیمرغ — نسخه ۰.۲.۱
+# معماری سیمرغ — نسخه ۰.۳.۰
 
 این سند نقشه ادغام ۷ پروژه مرجع (`elham/`) در یک اپ واحد را توضیح می‌دهد.
 
@@ -88,7 +88,15 @@ interface VpnEngine {
 
 موارد نامزد (به‌ترتیب نقشه راه): Aether/MASQUE (msn-guard)، desync ضد-DPI (shroudly)، uTLS rotation (nova)، FLUX racing (mlmvpn)، شبکه رله openrung.
 
-## ۶. سازگاری لایسنس
+## ۶. لایه ضدسانسور (از ۰.۳.۰ فعال)
+
+سه مکانیزم در `core/anticensor/`، همگی در پردازه‌ی `:daemon`:
+
+- **TlsFragmentProfile** — فرگمنت‌سازی ClientHello روی `streamSettings.sockopt.fragment` بومی هسته (الگوی msn-guard): سه پروفایل ایران «ملایم/متوسط/شدید» با بازه‌های تصادفی طول/فاصله. فقط برای اتصال‌های TLS/REALITY اعمال می‌شود.
+- **FingerprintRotator** (الگوی nova) — چرخش uTLS بین `chrome/firefox/safari/edge/ios/android/randomized`؛ فینگرپرینتی که probe واقعی را رد کرد «چسبنده» می‌شود و اتصال بعدی از همان‌جا ادامه می‌دهد. فینگرپرینت‌های فقط-TLS1.3 (android/qq/360) طبق سازگاری nova از چرخش حذف شده‌اند — به‌علاوه فینگرپرینت ثابت پروفایل با `settings.fingerprintOverride` (فیلد گذرا، هرگز ذخیره نمی‌شود) در هر تلاش بازنویسی می‌شود.
+- **FallbackPlanner + DataPlaneProbe** (الگوی nova/msn-guard) — هر «وصل» = حداکثر ۳ پروفایل × ۳ فینگرپرینت. بعد از هر روشن‌شدن موتور، یک درخواست HTTP واقعی از داخل تونل (SOCKS محلی، resolve در سمت سرور) فرستاده می‌شود؛ فقط جواب 2xx یعنی تونل زنده است. با هر دو سوییچ خاموش، پلن دقیقاً به یک تلاش ساده‌ی v0.2 فرو می‌ریزد. برای هر تلاش TUN تازه establish می‌شود (هسته‌ی Go مالک fd می‌شود — الگوی v2rayNG).
+
+## ۷. سازگاری لایسنس
 
 - کد سیمرغ: GPL-3.0
 - `libv2ray.aar` (AndroidLibXrayLite / Xray-core): LGPL-3.0 — سازگار

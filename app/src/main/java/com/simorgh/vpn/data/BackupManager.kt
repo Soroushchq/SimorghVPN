@@ -63,5 +63,10 @@ object BackupManager {
         SettingsStore.setPerAppMode(context, st.perAppMode)
         SettingsStore.setPerAppPackages(context, st.perAppPackages)
         if (st.engineId.isNotBlank()) SettingsStore.setEngineId(context, st.engineId)
+        // v0.3 anti-censor (fingerprintOverride is transient — never restored)
+        SettingsStore.setTlsFragment(context, st.tlsFragment)
+        SettingsStore.setTlsFragmentProfile(context, st.tlsFragmentProfile)
+        SettingsStore.setUtlsRotation(context, st.utlsRotation)
+        SettingsStore.setFallbackChain(context, st.fallbackChain)
     }
 }

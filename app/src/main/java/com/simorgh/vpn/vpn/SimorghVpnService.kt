@@ -25,6 +25,9 @@ import com.simorgh.vpn.ServiceLocator
 import com.simorgh.vpn.core.VpnBus
 import com.simorgh.vpn.core.VpnStatus
 import com.simorgh.vpn.core.VpnUiState
+import com.simorgh.vpn.core.anticensor.DataPlaneProbe
+import com.simorgh.vpn.core.anticensor.FallbackPlanner
+import com.simorgh.vpn.core.anticensor.FingerprintRotator
 import com.simorgh.vpn.core.engine.EngineRegistry
 import com.simorgh.vpn.core.engine.VpnEngine
 import com.simorgh.vpn.data.PerAppMode
@@ -181,7 +184,7 @@ class SimorghVpnService : VpnService() {
             val settings = currentSettings()
             runCatching { ServiceLocator.profileRepo.load() } // fresh read (long-lived daemon)
             val all = ServiceLocator.profileRepo.profiles.value
-            val profile = all.firstOrNull { it.id == profileId }
+            val primary = all.firstOrNull { it.id == profileId }
                 ?: all.firstOrNull { it.id == settings.activeProfileId }
                 ?: all.firstOrNull()
                 ?: error("no profile configured")
@@ -189,31 +192,97 @@ class SimorghVpnService : VpnService() {
             VpnBus.update {
                 it.copy(
                     status = VpnStatus.CONNECTING,
-                    profileId = profile.id,
-                    profileName = profile.name,
+                    profileId = primary.id,
+                    profileName = primary.name,
                     sinceMs = 0,
                     error = ""
                 )
             }
-            enterForeground(getString(R.string.notif_connecting), profile.name)
+            enterForeground(getString(R.string.notif_connecting), primary.name)
 
             val needsTun = settings.tunnelMode != TunnelMode.PROXY_ONLY
-            tun = if (needsTun) establishTun(settings) else null
 
-            // engine registry (mlmvpn pattern): instantiate the selected engine
-            val engineId = settings.engineId.ifBlank { EngineRegistry.defaultId() }
-            val eng = EngineRegistry.create(engineId) ?: error("engine '$engineId' not registered")
-            if (!eng.start(this, profile, settings, tun)) error("engine '$engineId' failed to start")
-            engine = eng
+            // v0.3 anti-censor: attempt plan (nova/msn-guard fallback chain).
+            // Degenerates to a single attempt with both switches off — exact v0.2 path.
+            val plan = FallbackPlanner.plan(primary, all, settings)
+            val probe = settings.utlsRotation || settings.fallbackChain
+            if (plan.size > 1) {
+                LogBuffer.i("Vpn", "anti-censor plan: ${plan.size} attempts (rotation=${settings.utlsRotation} chain=${settings.fallbackChain})")
+            }
+
+            var winner: FallbackPlanner.Attempt? = null
+            for ((i, attempt) in plan.withIndex()) {
+                if (i > 0) {
+                    LogBuffer.w("Vpn", "attempt ${i + 1}/${plan.size}: ${attempt.label}")
+                    VpnBus.update { it.copy(profileId = attempt.profile.id, profileName = attempt.profile.name) }
+                } else {
+                    LogBuffer.i("Vpn", "connecting: ${attempt.label}")
+                }
+
+                // fresh TUN per attempt (v2rayNG pattern): the Go core takes fd
+                // ownership in TUN mode and hev may close it on stop — a reused
+                // fd would be a silent EBADF on the next attempt.
+                runCatching { tun?.close() }
+                tun = if (needsTun) establishTun(settings) else null
+
+                val attemptSettings =
+                    if (attempt.fingerprint.isBlank()) settings
+                    else settings.copy(fingerprintOverride = attempt.fingerprint)
+
+                // engine registry (mlmvpn pattern): instantiate per attempt
+                val engineId = settings.engineId.ifBlank { EngineRegistry.defaultId() }
+                val eng = EngineRegistry.create(engineId) ?: error("engine '$engineId' not registered")
+                var started = false
+                try {
+                    started = eng.start(this, attempt.profile, attemptSettings, tun)
+                } catch (t: Throwable) {
+                    LogBuffer.w("Vpn", "engine start threw: ${t.message}")
+                }
+
+                if (started) {
+                    val alive = !probe || DataPlaneProbe.ok(settings.socksPort)
+                    if (alive) {
+                        engine = eng
+                        winner = attempt
+                        if (attempt.fingerprintIndex >= 0) {
+                            // this fingerprint survived a real data-plane request
+                            FingerprintRotator.rememberGood(attempt.fingerprintIndex)
+                        }
+                        break
+                    }
+                    LogBuffer.w("Vpn", "data-plane probe failed for ${attempt.label} — rotating")
+                } else {
+                    LogBuffer.w("Vpn", "engine failed to start for ${attempt.label}")
+                }
+                // teardown this attempt only (tun stays up for the next one)
+                runCatching { eng.stopAwait(3000) }
+            }
+
+            val win = winner ?: error("all ${plan.size} connect attempts failed")
+            val profile = win.profile
+            engine ?: error("engine lost after successful attempt")
+
+            if (win.isFallback) {
+                // the user should see which profile actually carries the tunnel
+                LogBuffer.i("Vpn", "fallback connected via: ${profile.name}")
+            }
 
             lastUp = 0L
             lastDown = 0L
             wasConnected = true
-            VpnBus.update { it.copy(status = VpnStatus.CONNECTED, sinceMs = System.currentTimeMillis()) }
+            VpnBus.update {
+                it.copy(
+                    status = VpnStatus.CONNECTED,
+                    profileId = profile.id,
+                    profileName = profile.name,
+                    sinceMs = System.currentTimeMillis()
+                )
+            }
             enterForeground(getString(R.string.notif_connected), profile.name)
             LogBuffer.i(
                 "Vpn",
-                "connected: ${profile.name} [${profile.protocol}/${profile.network}/${profile.security}] mode=${settings.tunnelMode}"
+                "connected: ${profile.name} [${profile.protocol}/${profile.network}/${profile.security}] mode=${settings.tunnelMode}" +
+                    if (win.fingerprint.isNotBlank()) " fp=${win.fingerprint}" else ""
             )
 
             statsJob = scope.launch { statsLoop() }

@@ -50,6 +50,7 @@ import com.simorgh.vpn.BuildConfig
 import com.simorgh.vpn.R
 import com.simorgh.vpn.ServiceLocator
 import com.simorgh.vpn.core.CoreBootstrap
+import com.simorgh.vpn.core.anticensor.TlsFragmentProfile
 import com.simorgh.vpn.data.BackupManager
 import com.simorgh.vpn.data.RoutingMode
 import com.simorgh.vpn.data.SettingsStore
@@ -190,6 +191,68 @@ fun SettingsScreen() {
                 ) { scope.launch { SettingsStore.setAutoStartBoot(context, it) } }
                 HorizontalDivider(Modifier.padding(vertical = 6.dp))
                 PerAppRow(onClick = { showPerApp = true })
+            }
+
+            // v0.3: anti-censorship (fragmentation, uTLS rotation, fallback chain)
+            SectionCard(stringResource(R.string.section_anticensor)) {
+                SwitchRow(
+                    title = stringResource(R.string.tls_fragment),
+                    desc = stringResource(R.string.tls_fragment_desc),
+                    checked = settings.tlsFragment
+                ) { scope.launch { SettingsStore.setTlsFragment(context, it) } }
+                if (settings.tlsFragment) {
+                    HorizontalDivider(Modifier.padding(vertical = 6.dp))
+                    Text(
+                        stringResource(R.string.tls_fragment_profile),
+                        style = MaterialTheme.typography.titleSmall,
+                        modifier = Modifier.padding(top = 4.dp, bottom = 2.dp)
+                    )
+                    RadioRow(
+                        title = stringResource(R.string.tls_fragment_light),
+                        desc = stringResource(R.string.tls_fragment_light_desc),
+                        selected = settings.tlsFragmentProfile == TlsFragmentProfile.IRAN_LIGHT.name
+                    ) {
+                        scope.launch {
+                            SettingsStore.setTlsFragmentProfile(
+                                context, TlsFragmentProfile.IRAN_LIGHT.name
+                            )
+                        }
+                    }
+                    RadioRow(
+                        title = stringResource(R.string.tls_fragment_medium),
+                        desc = stringResource(R.string.tls_fragment_medium_desc),
+                        selected = settings.tlsFragmentProfile == TlsFragmentProfile.IRAN_MEDIUM.name
+                    ) {
+                        scope.launch {
+                            SettingsStore.setTlsFragmentProfile(
+                                context, TlsFragmentProfile.IRAN_MEDIUM.name
+                            )
+                        }
+                    }
+                    RadioRow(
+                        title = stringResource(R.string.tls_fragment_aggressive),
+                        desc = stringResource(R.string.tls_fragment_aggressive_desc),
+                        selected = settings.tlsFragmentProfile == TlsFragmentProfile.IRAN_AGGRESSIVE.name
+                    ) {
+                        scope.launch {
+                            SettingsStore.setTlsFragmentProfile(
+                                context, TlsFragmentProfile.IRAN_AGGRESSIVE.name
+                            )
+                        }
+                    }
+                }
+                HorizontalDivider(Modifier.padding(vertical = 6.dp))
+                SwitchRow(
+                    title = stringResource(R.string.utls_rotation),
+                    desc = stringResource(R.string.utls_rotation_desc),
+                    checked = settings.utlsRotation
+                ) { scope.launch { SettingsStore.setUtlsRotation(context, it) } }
+                HorizontalDivider(Modifier.padding(vertical = 6.dp))
+                SwitchRow(
+                    title = stringResource(R.string.fallback_chain),
+                    desc = stringResource(R.string.fallback_chain_desc),
+                    checked = settings.fallbackChain
+                ) { scope.launch { SettingsStore.setFallbackChain(context, it) } }
             }
 
             // v0.2: JSON backup/restore via SAF

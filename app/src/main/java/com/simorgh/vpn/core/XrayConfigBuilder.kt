@@ -1,5 +1,6 @@
 package com.simorgh.vpn.core
 
+import com.simorgh.vpn.core.anticensor.TlsFragmentProfile
 import com.simorgh.vpn.data.Profile
 import com.simorgh.vpn.data.RoutingMode
 import com.simorgh.vpn.data.SimorghSettings
@@ -186,11 +187,14 @@ object XrayConfigBuilder {
         }
         put("security", security)
 
+        // v0.3 anti-censor: per-attempt uTLS override (FingerprintRotator)
+        val fp = s.fingerprintOverride.trim().ifBlank { p.fingerprint }
+
         if (security == "tls") {
             putJsonObject("tlsSettings") {
                 put("serverName", p.sni.ifBlank { p.host })
                 put("allowInsecure", p.allowInsecure || s.allowInsecure)
-                if (p.fingerprint.isNotBlank()) put("fingerprint", p.fingerprint)
+                if (fp.isNotBlank()) put("fingerprint", fp)
                 if (p.alpn.isNotBlank()) {
                     put("alpn", JsonArray(p.alpn.split(',').map { JsonPrimitive(it.trim()) }))
                 }
@@ -199,10 +203,24 @@ object XrayConfigBuilder {
         if (security == "reality") {
             putJsonObject("realitySettings") {
                 put("serverName", p.sni.ifBlank { p.host })
-                put("fingerprint", p.fingerprint.ifBlank { "chrome" })
+                put("fingerprint", fp.ifBlank { "chrome" })
                 if (p.publicKey.isNotBlank()) put("publicKey", p.publicKey)
                 if (p.shortId.isNotBlank()) put("shortId", p.shortId)
                 put("spiderX", "/")
+            }
+        }
+
+        // v0.3 anti-censor: TLS ClientHello fragmentation (msn-guard pattern)
+        // via the core's native sockopt.fragment — applies to every TLS/REALITY
+        // handshake dialed by this outbound.
+        if (s.tlsFragment && security != "none") {
+            val profile = TlsFragmentProfile.of(s.tlsFragmentProfile)
+            putJsonObject("sockopt") {
+                putJsonObject("fragment") {
+                    put("packets", "tlshello")
+                    put("length", profile.lengthSpec)
+                    put("interval", profile.intervalSpec)
+                }
             }
         }
 

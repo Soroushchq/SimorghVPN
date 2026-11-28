@@ -111,4 +111,20 @@
     <string name="share_apk">Share APK (offline)</string>
     <string name="share_apk_desc">Send the installer to friends with no internet at all</string>
     <string name="share_apk_failed">Sharing the APK failed</string>
+
+    <!-- v0.3: anti-censorship -->
+    <string name="section_anticensor">Anti-censorship (experimental)</string>
+    <string name="tls_fragment">TLS fragmentation</string>
+    <string name="tls_fragment_profile">Fragmentation profile</string>
+    <string name="tls_fragment_desc">Splits the TLS handshake so the DPI never sees SNI/fingerprint in one packet (TLS/REALITY connections only)</string>
+    <string name="tls_fragment_light">Light (40–100 bytes)</string>
+    <string name="tls_fragment_light_desc">Near-zero overhead — beats most SNI sniffers</string>
+    <string name="tls_fragment_medium">Medium (10–50 bytes)</string>
+    <string name="tls_fragment_medium_desc">Stronger confusion, still fine on 3G/4G</string>
+    <string name="tls_fragment_aggressive">Aggressive (1–10 bytes)</string>
+    <string name="tls_fragment_aggressive_desc">msn-guard micro-chunks for hostile networks — higher overhead</string>
+    <string name="utls_rotation">uTLS fingerprint rotation</string>
+    <string name="utls_rotation_desc">If the TLS handshake dies, retry with a different browser fingerprint — reveals whether the name or the fingerprint is blocked</string>
+    <string name="fallback_chain">Automatic fallback chain</string>
+    <string name="fallback_chain_desc">After each attempt a real request is sent through the tunnel; if nothing comes back, the next server is tried automatically</string>
 </resources>

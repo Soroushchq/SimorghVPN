@@ -1,6 +1,9 @@
 package com.simorgh.vpn.ui.profiles
 
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -18,9 +21,12 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Bolt
 import androidx.compose.material.icons.outlined.CloudDownload
+import androidx.compose.material.icons.outlined.ContentPaste
 import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.QrCodeScanner
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Share
+import androidx.compose.material.icons.outlined.Sort
 import androidx.compose.material.icons.outlined.SwapHoriz
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
@@ -45,6 +51,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -52,6 +59,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import com.simorgh.vpn.ImportBus
 import com.simorgh.vpn.R
 import com.simorgh.vpn.ServiceLocator
@@ -91,6 +100,13 @@ fun ProfilesScreen() {
     var showSourcePicker by remember { mutableStateOf(false) }
     var switching by remember { mutableStateOf(false) }
 
+    // v0.2: QR import / smart clipboard / latency sorting
+    var addPrefill by rememberSaveable { mutableStateOf("") }
+    var subPrefill by rememberSaveable { mutableStateOf("") }
+    var sortByLatency by rememberSaveable { mutableStateOf(false) }
+    var clipboardCandidate by remember { mutableStateOf<String?>(null) }
+    var ignoredClipboard by rememberSaveable { mutableStateOf("") }
+
     val connected = vpnState.status == VpnStatus.CONNECTED || vpnState.status == VpnStatus.CONNECTING
 
     fun testOne(p: Profile) {
@@ -101,6 +117,64 @@ fun ProfilesScreen() {
                 XrayRunner.measureDelay(cfg)
             }.getOrDefault(-1L)
             ServiceLocator.profileRepo.updateLatency(p.id, ms)
+        }
+    }
+
+    /**
+     * v0.2: shared import path for QR results and clipboard banners —
+     * link sets import directly, http(s) URLs prefill the subscription
+     * dialog, anything else lands in the add-server dialog for review.
+     */
+    fun importExternalText(raw: String) {
+        val text = raw.trim()
+        if (text.isEmpty()) return
+        val isLinkSet =
+            Regex("(vless|vmess|trojan|ss)://", RegexOption.IGNORE_CASE).containsMatchIn(text)
+        when {
+            isLinkSet -> scope.launch {
+                val n = ServiceLocator.profileRepo.addFromLinks(text)
+                snackbar.showSnackbar(
+                    context.getString(if (n > 0) R.string.imported_n else R.string.import_failed, n)
+                )
+            }
+            text.startsWith("http://", true) || text.startsWith("https://", true) -> {
+                subPrefill = text
+                showSubDialog = true
+            }
+            else -> {
+                addPrefill = text
+                showAddDialog = true
+            }
+        }
+    }
+
+    val qrLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
+        result.contents?.let { importExternalText(it) }
+    }
+
+    fun launchQr() {
+        qrLauncher.launch(
+            ScanOptions().apply {
+                setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                setPrompt(context.getString(R.string.scan_qr))
+                setBeepEnabled(false)
+                setOrientationLocked(true)
+            }
+        )
+    }
+
+    // v0.2: smart clipboard banner (Derafsh pattern) — offer to import a VPN
+    // link found in the clipboard when the screen opens; dismissed/ignored
+    // content is remembered so it doesn't nag again until it changes.
+    LaunchedEffect(Unit) {
+        runCatching {
+            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val clip = cm.primaryClip ?: return@LaunchedEffect
+            if (clip.itemCount == 0) return@LaunchedEffect
+            val text = clip.getItemAt(0).coerceToText(context)?.toString()?.trim().orEmpty()
+            val looksLikeConfig =
+                Regex("(vless|vmess|trojan|ss)://", RegexOption.IGNORE_CASE).containsMatchIn(text)
+            if (looksLikeConfig && text != ignoredClipboard) clipboardCandidate = text
         }
     }
 
@@ -116,6 +190,12 @@ fun ProfilesScreen() {
             }
             delay(400)
         }
+    }
+
+    val displayProfiles = remember(profiles, sortByLatency) {
+        if (sortByLatency) profiles.sortedWith(
+            compareBy({ it.lastLatencyMs < 0 }, { if (it.lastLatencyMs < 0) 0L else it.lastLatencyMs })
+        ) else profiles
     }
 
     Scaffold(
@@ -141,6 +221,51 @@ fun ProfilesScreen() {
                 modifier = Modifier.padding(vertical = 12.dp)
             )
 
+            // v0.2: smart clipboard import banner
+            clipboardCandidate?.let { clipText ->
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.tertiaryContainer
+                    )
+                ) {
+                    Column(Modifier.padding(12.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                Icons.Outlined.ContentPaste,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onTertiaryContainer
+                            )
+                            Spacer(Modifier.width(10.dp))
+                            Column {
+                                Text(
+                                    stringResource(R.string.clipboard_found_title),
+                                    style = MaterialTheme.typography.titleSmall
+                                )
+                                Text(
+                                    stringResource(R.string.clipboard_found_hint),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onTertiaryContainer
+                                )
+                            }
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            TextButton(onClick = {
+                                ignoredClipboard = clipText
+                                clipboardCandidate = null
+                                importExternalText(clipText)
+                            }) { Text(stringResource(R.string.clipboard_import)) }
+                            TextButton(onClick = {
+                                ignoredClipboard = clipText
+                                clipboardCandidate = null
+                            }) { Text(stringResource(R.string.ignore)) }
+                        }
+                    }
+                }
+            }
+
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -150,7 +275,19 @@ fun ProfilesScreen() {
                     Spacer(Modifier.width(6.dp))
                     Text(stringResource(R.string.subscription))
                 }
-                if (profiles.isNotEmpty()) {
+                OutlinedButton(onClick = { launchQr() }) {
+                    Icon(Icons.Outlined.QrCodeScanner, contentDescription = null)
+                    Spacer(Modifier.width(6.dp))
+                    Text(stringResource(R.string.scan_qr))
+                }
+            }
+
+            if (profiles.isNotEmpty()) {
+                Spacer(Modifier.height(8.dp))
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
                     OutlinedButton(
                         enabled = !connected && !testingAll,
                         onClick = {
@@ -177,6 +314,16 @@ fun ProfilesScreen() {
                         }
                         Spacer(Modifier.width(6.dp))
                         Text(stringResource(R.string.test_all))
+                    }
+                    // v0.2: sort by latency toggle
+                    OutlinedButton(onClick = { sortByLatency = !sortByLatency }) {
+                        Icon(Icons.Outlined.Sort, contentDescription = null)
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            stringResource(
+                                if (sortByLatency) R.string.sort_latency else R.string.sort_default
+                            )
+                        )
                     }
                 }
             }
@@ -227,7 +374,7 @@ fun ProfilesScreen() {
             if (profiles.isEmpty()) {
                 EmptyHint(stringResource(R.string.no_servers_yet))
             } else {
-                profiles.forEach { p ->
+                displayProfiles.forEach { p ->
                     val selected = p.id == settings.activeProfileId || p.id == vpnState.profileId
                     ProfileRow(
                         profile = p,
@@ -257,9 +404,9 @@ fun ProfilesScreen() {
     // ------------------------------------------------------------------ dialogs
 
     if (showAddDialog) {
-        var text by remember { mutableStateOf("") }
+        var text by remember { mutableStateOf(addPrefill) }
         AlertDialog(
-            onDismissRequest = { showAddDialog = false },
+            onDismissRequest = { showAddDialog = false; addPrefill = "" },
             title = { Text(stringResource(R.string.add_server)) },
             text = {
                 OutlinedTextField(
@@ -277,6 +424,7 @@ fun ProfilesScreen() {
                         scope.launch {
                             val n = ServiceLocator.profileRepo.addFromLinks(text)
                             showAddDialog = false
+                            addPrefill = ""
                             snackbar.showSnackbar(
                                 context.getString(
                                     if (n > 0) R.string.imported_n else R.string.import_failed,
@@ -288,7 +436,7 @@ fun ProfilesScreen() {
                 ) { Text(stringResource(R.string.import_links)) }
             },
             dismissButton = {
-                TextButton(onClick = { showAddDialog = false }) {
+                TextButton(onClick = { showAddDialog = false; addPrefill = "" }) {
                     Text(stringResource(R.string.cancel))
                 }
             }
@@ -297,9 +445,9 @@ fun ProfilesScreen() {
 
     if (showSubDialog) {
         var name by remember { mutableStateOf("") }
-        var url by remember { mutableStateOf("") }
+        var url by remember { mutableStateOf(subPrefill) }
         AlertDialog(
-            onDismissRequest = { showSubDialog = false },
+            onDismissRequest = { showSubDialog = false; subPrefill = "" },
             title = { Text(stringResource(R.string.subscription)) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -324,8 +472,9 @@ fun ProfilesScreen() {
                     onClick = {
                         if (url.isNotBlank()) {
                             scope.launch {
-                                val sub = ServiceLocator.subscriptionRepo.add(name, url)
+                                val sub = ServiceLocator.profileRepo.addSubscription(name, url)
                                 showSubDialog = false
+                                subPrefill = ""
                                 runCatching {
                                     val n = ServiceLocator.subscriptionRepo.refresh(sub)
                                     snackbar.showSnackbar(context.getString(R.string.sub_updated_n, n))
@@ -338,7 +487,7 @@ fun ProfilesScreen() {
                 ) { Text(stringResource(R.string.add)) }
             },
             dismissButton = {
-                TextButton(onClick = { showSubDialog = false }) {
+                TextButton(onClick = { showSubDialog = false; subPrefill = "" }) {
                     Text(stringResource(R.string.cancel))
                 }
             }

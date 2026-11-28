@@ -44,7 +44,9 @@ data class SimorghSettings(
     /** Auto-connect after device boot / app update (needs the BootReceiver toggle). */
     val autoStartBoot: Boolean = false,
     val perAppMode: PerAppMode = PerAppMode.OFF,
-    val perAppPackages: Set<String> = emptySet()
+    val perAppPackages: Set<String> = emptySet(),
+    /** Tunnel engine id (EngineRegistry). v0.2.1 ships only "xray"; v0.3 adds more. */
+    val engineId: String = "xray"
 )
 
 object SettingsStore {
@@ -65,6 +67,7 @@ object SettingsStore {
         val AUTO_START_BOOT = booleanPreferencesKey("auto_start_boot")
         val PER_APP_MODE = stringPreferencesKey("per_app_mode")
         val PER_APP_PACKAGES = stringSetPreferencesKey("per_app_packages")
+        val ENGINE_ID = stringPreferencesKey("engine_id")
     }
 
     fun flow(context: Context): Flow<SimorghSettings> {
@@ -85,7 +88,8 @@ object SettingsStore {
                 autoConnect = p[Keys.AUTO_CONNECT] ?: false,
                 autoStartBoot = p[Keys.AUTO_START_BOOT] ?: false,
                 perAppMode = enumOf(p[Keys.PER_APP_MODE], PerAppMode.OFF),
-                perAppPackages = p[Keys.PER_APP_PACKAGES] ?: emptySet()
+                perAppPackages = p[Keys.PER_APP_PACKAGES] ?: emptySet(),
+                engineId = p[Keys.ENGINE_ID]?.trim().takeUnless { it.isNullOrBlank() } ?: "xray"
             )
         }
     }
@@ -119,4 +123,6 @@ object SettingsStore {
     suspend fun setPerAppMode(context: Context, v: PerAppMode) = edit(context) { it[Keys.PER_APP_MODE] = v.name }
     suspend fun setPerAppPackages(context: Context, pkgs: Set<String>) =
         edit(context) { it[Keys.PER_APP_PACKAGES] = pkgs }
+    suspend fun setEngineId(context: Context, v: String) =
+        edit(context) { it[Keys.ENGINE_ID] = v.trim().ifBlank { "xray" } }
 }

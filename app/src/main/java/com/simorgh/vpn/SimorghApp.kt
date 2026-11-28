@@ -2,6 +2,7 @@ package com.simorgh.vpn
 
 import android.app.Application
 import com.simorgh.vpn.core.CoreBootstrap
+import com.simorgh.vpn.core.engine.EngineRegistry
 import com.simorgh.vpn.data.BuiltinConfigManager
 import com.simorgh.vpn.data.SettingsStore
 import com.simorgh.vpn.util.LogBuffer
@@ -16,6 +17,7 @@ class SimorghApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        EngineRegistry.registerDefaults()
         ServiceLocator.init(this)
 
         appScope.launch {

@@ -15,11 +15,10 @@ import androidx.core.content.ContextCompat
 import com.simorgh.vpn.MainActivity
 import com.simorgh.vpn.R
 import com.simorgh.vpn.ServiceLocator
-import com.simorgh.vpn.core.CoreBootstrap
 import com.simorgh.vpn.core.VpnBus
 import com.simorgh.vpn.core.VpnStatus
-import com.simorgh.vpn.core.XrayConfigBuilder
-import com.simorgh.vpn.core.XrayRunner
+import com.simorgh.vpn.core.engine.EngineRegistry
+import com.simorgh.vpn.core.engine.VpnEngine
 import com.simorgh.vpn.data.PerAppMode
 import com.simorgh.vpn.data.SimorghSettings
 import com.simorgh.vpn.data.TunnelMode
@@ -34,7 +33,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import java.io.File
 
 class SimorghVpnService : VpnService() {
 
@@ -62,7 +60,7 @@ class SimorghVpnService : VpnService() {
     private val opsMutex = Mutex()
 
     private var tun: ParcelFileDescriptor? = null
-    private var runner: XrayRunner? = null
+    private var engine: VpnEngine? = null
     private var statsJob: Job? = null
     private var lastUp = 0L
     private var lastDown = 0L
@@ -114,24 +112,14 @@ class SimorghVpnService : VpnService() {
             }
             enterForeground(getString(R.string.notif_connecting), profile.name)
 
-            CoreBootstrap.ensureInit(this)
-
             val needsTun = settings.tunnelMode != TunnelMode.PROXY_ONLY
             tun = if (needsTun) establishTun(settings) else null
 
-            val logPath = File(filesDir, "simorgh-xray.log").absolutePath
-            val config = XrayConfigBuilder.build(profile, settings, logPath)
-            LogBuffer.d("Vpn", "config generated (${config.length} chars) mode=${settings.tunnelMode}")
-
-            val r = XrayRunner()
-            val xrayFd = if (settings.tunnelMode == TunnelMode.XRAY_TUN) (tun?.fd ?: 0) else 0
-            if (!r.start(config, xrayFd)) error("xray core failed to start")
-            runner = r
-
-            if (settings.tunnelMode == TunnelMode.HEV && tun != null) {
-                HevTunnel.start(this, tun!!, settings)
-                if (!HevTunnel.running) error("hev-socks5-tunnel failed to start")
-            }
+            // engine registry (mlmvpn pattern): instantiate the selected engine
+            val engineId = settings.engineId.ifBlank { EngineRegistry.defaultId() }
+            val eng = EngineRegistry.create(engineId) ?: error("engine '$engineId' not registered")
+            if (!eng.start(this, profile, settings, tun)) error("engine '$engineId' failed to start")
+            engine = eng
 
             lastUp = 0L
             lastDown = 0L
@@ -178,18 +166,8 @@ class SimorghVpnService : VpnService() {
         LogBuffer.w("Vpn", "kill-switch engaged — holding TUN black-hole: ${cause.message}")
         statsJob?.cancel()
         statsJob = null
-        HevTunnel.stop()
-        val r = runner
-        if (r != null) {
-            r.stop()
-            var waited = 0
-            while (r.isRunning && waited < 3000) {
-                delay(150)
-                waited += 150
-            }
-            r.release()
-        }
-        runner = null
+        engine?.stopAwait()
+        engine = null
         // tun stays open on purpose — that is the whole point
         wasConnected = false
         VpnBus.update {
@@ -211,18 +189,8 @@ class SimorghVpnService : VpnService() {
     private suspend fun stopEngineLocked() {
         statsJob?.cancel()
         statsJob = null
-        HevTunnel.stop()
-        val r = runner
-        if (r != null) {
-            r.stop()
-            var waited = 0
-            while (r.isRunning && waited < 3000) {
-                delay(150)
-                waited += 150
-            }
-            r.release()
-        }
-        runner = null
+        engine?.stopAwait()
+        engine = null
         runCatching { tun?.close() }
         tun = null
     }
@@ -278,17 +246,17 @@ class SimorghVpnService : VpnService() {
         var notifAcc = 0
         while (true) {
             delay(1000)
-            val r = runner
-            if (r != null && !r.isRunning) {
+            val e = engine
+            if (e != null && !e.isRunning) {
                 // engine died unexpectedly → kill-switch hold or honest error
                 scope.launch {
                     opsMutex.withLock {
-                        if (runner === r) failLocked(RuntimeException("core exited unexpectedly"))
+                        if (engine === e) failLocked(RuntimeException("core exited unexpectedly"))
                     }
                 }
                 return
             }
-            val (up, down) = XrayRunner.parseStats(r?.statsRaw())
+            val (up, down) = e?.stats() ?: (0L to 0L)
             val dUp = (up - lastUp).coerceAtLeast(0)
             val dDown = (down - lastDown).coerceAtLeast(0)
             lastUp = up
@@ -362,9 +330,8 @@ class SimorghVpnService : VpnService() {
     }
 
     override fun onDestroy() {
-        HevTunnel.stop()
-        runner?.stop()
-        runner = null
+        engine?.stop()
+        engine = null
         runCatching { tun?.close() }
         tun = null
         scope.cancel()

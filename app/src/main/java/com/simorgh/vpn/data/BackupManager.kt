@@ -62,5 +62,6 @@ object BackupManager {
         SettingsStore.setAutoStartBoot(context, st.autoStartBoot)
         SettingsStore.setPerAppMode(context, st.perAppMode)
         SettingsStore.setPerAppPackages(context, st.perAppPackages)
+        if (st.engineId.isNotBlank()) SettingsStore.setEngineId(context, st.engineId)
     }
 }

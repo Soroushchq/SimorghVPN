@@ -1,5 +1,6 @@
 package com.simorgh.vpn.core.anticensor
 
+import com.simorgh.vpn.core.config.RemoteOverrides
 import com.simorgh.vpn.util.LogBuffer
 
 /**
@@ -13,10 +14,13 @@ import com.simorgh.vpn.util.LogBuffer
  *
  * TLS1.3-only fingerprints (android/qq/360 per nova's compatibility list)
  * are excluded — REALITY needs TLS1.2-compatible hello layers.
+ *
+ * v0.4: the candidate list consults the signed remote-config channel, so the
+ * rotation pool can be reshaped without a release.
  */
 object FingerprintRotator {
 
-    val CANDIDATES = listOf(
+    val DEFAULT_CANDIDATES = listOf(
         "chrome",     // the safe default everywhere
         "firefox",
         "safari",
@@ -26,6 +30,10 @@ object FingerprintRotator {
         "randomized"  // Xray's own per-connection random pick
     )
 
+    /** Live candidate list: remote override → built-ins. */
+    fun candidates(): List<String> =
+        RemoteOverrides.fingerprints ?: DEFAULT_CANDIDATES
+
     /**
      * Ordered candidate list for this connect, starting after [lastIndex].
      * Rotation survives within the daemon process across reconnects, so the
@@ -34,11 +42,12 @@ object FingerprintRotator {
     @Volatile
     private var lastGoodIndex: Int = 0
 
-    fun nextIndex(): Int = (lastGoodIndex + 1).mod(CANDIDATES.size)
+    fun nextIndex(): Int = (lastGoodIndex + 1).mod(candidates().size)
 
     fun rememberGood(index: Int) {
-        lastGoodIndex = index.mod(CANDIDATES.size)
-        LogBuffer.i("AntiCensor", "uTLS fingerprint '${CANDIDATES[lastGoodIndex]}' worked — sticky for next connects")
+        val list = candidates()
+        lastGoodIndex = index.mod(list.size)
+        LogBuffer.i("AntiCensor", "uTLS fingerprint '${list[lastGoodIndex]}' worked — sticky for next connects")
     }
 
     /**
@@ -46,11 +55,12 @@ object FingerprintRotator {
      * held the slot → [firefox, safari, edge, ios, android, randomized, chrome].
      */
     fun cycle(count: Int): List<Pair<String, Int>> {
-        val n = CANDIDATES.size
+        val list = candidates()
+        val n = list.size
         val start = nextIndex()
         return (0 until count.coerceAtMost(n)).map { i ->
             val idx = (start + i).mod(n)
-            CANDIDATES[idx] to idx
+            list[idx] to idx
         }
     }
 }

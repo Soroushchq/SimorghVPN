@@ -93,7 +93,13 @@ data class SimorghSettings(
     val gatewayDirectWhenDown: Boolean = false,
     /** Gateway credentials (generated on first enable; shown in app + portal). */
     val gatewayUser: String = "",
-    val gatewayPass: String = ""
+    val gatewayPass: String = "",
+
+    // ------------------------------------------------ v0.4 signed remote-config channel
+    /** Fetch + apply the signed remote config (anti-censor parameters). */
+    val remoteConfigEnabled: Boolean = true,
+    /** Channel URL (serves <url> + <url>.sig). */
+    val remoteConfigUrl: String = ""
 )
 
 object SettingsStore {
@@ -129,6 +135,8 @@ object SettingsStore {
         val GATEWAY_DIRECT_WHEN_DOWN = booleanPreferencesKey("gateway_direct_when_down")
         val GATEWAY_USER = stringPreferencesKey("gateway_user")
         val GATEWAY_PASS = stringPreferencesKey("gateway_pass")
+        val REMOTE_CONFIG_ENABLED = booleanPreferencesKey("remote_config_enabled")
+        val REMOTE_CONFIG_URL = stringPreferencesKey("remote_config_url")
     }
 
     fun flow(context: Context): Flow<SimorghSettings> {
@@ -165,7 +173,9 @@ object SettingsStore {
                 gatewayNoAuth = p[Keys.GATEWAY_NO_AUTH] ?: false,
                 gatewayDirectWhenDown = p[Keys.GATEWAY_DIRECT_WHEN_DOWN] ?: false,
                 gatewayUser = p[Keys.GATEWAY_USER] ?: "",
-                gatewayPass = p[Keys.GATEWAY_PASS] ?: ""
+                gatewayPass = p[Keys.GATEWAY_PASS] ?: "",
+                remoteConfigEnabled = p[Keys.REMOTE_CONFIG_ENABLED] ?: true,
+                remoteConfigUrl = p[Keys.REMOTE_CONFIG_URL]?.trim() ?: ""
             )
         }
     }
@@ -227,4 +237,8 @@ object SettingsStore {
             it[Keys.GATEWAY_USER] = user
             it[Keys.GATEWAY_PASS] = pass
         }
+    suspend fun setRemoteConfigEnabled(context: Context, v: Boolean) =
+        edit(context) { it[Keys.REMOTE_CONFIG_ENABLED] = v }
+    suspend fun setRemoteConfigUrl(context: Context, v: String) =
+        edit(context) { it[Keys.REMOTE_CONFIG_URL] = v.trim() }
 }

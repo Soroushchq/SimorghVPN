@@ -17,8 +17,8 @@ android {
         applicationId = "com.simorgh.vpn"
         minSdk = 26
         targetSdk = 35
-        versionCode = 8
-        versionName = "0.3.1"
+        versionCode = 9
+        versionName = "0.4.0"
     }
 
     splits {
@@ -71,7 +71,8 @@ dependencies {
     implementation(libs.androidx.datastore.preferences)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.serialization.json)
-    implementation(libs.zxing.embedded) // QR scanner (Derafsh/V2rayNG pattern)
+    implementation(libs.zxing.embedded)
+    implementation(libs.eddsa) // Ed25519 verification for the signed remote-config channel // QR scanner (Derafsh/V2rayNG pattern)
     debugImplementation(libs.androidx.ui.tooling)
 }
 

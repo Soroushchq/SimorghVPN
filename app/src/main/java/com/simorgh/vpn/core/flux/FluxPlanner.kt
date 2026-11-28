@@ -82,7 +82,6 @@ object FluxPlanner {
         if (out.size != attempts.size) return attempts
 
         val cooled = rankedRoutes.count { FluxMemory.coolingDown(state, net, it, now) }
-        val raced = reach.count { it.value.ok }
         LogBuffer.i(
             "Flux",
             "plan ordered: ${attempts.size} attempts, ${raceWinners.size} raced-ok, $cooled cooling (net=$net)"

@@ -28,6 +28,7 @@ import com.simorgh.vpn.core.VpnUiState
 import com.simorgh.vpn.core.anticensor.DataPlaneProbe
 import com.simorgh.vpn.core.anticensor.FallbackPlanner
 import com.simorgh.vpn.core.anticensor.FingerprintRotator
+import com.simorgh.vpn.core.config.RemoteConfigChannel
 import com.simorgh.vpn.core.engine.EngineRegistry
 import com.simorgh.vpn.core.engine.VpnEngine
 import com.simorgh.vpn.core.flux.FluxFailReason
@@ -391,6 +392,16 @@ class SimorghVpnService : VpnService() {
             )
 
             statsJob = scope.launch { statsLoop() }
+
+            // v0.4: signed remote-config check in the background — new
+            // anti-censor parameters apply from the next connect
+            if (settings.remoteConfigEnabled) {
+                scope.launch {
+                    runCatching {
+                        RemoteConfigChannel.checkAndApply(this@SimorghVpnService, currentSettings())
+                    }
+                }
+            }
 
             // v0.4 MAE: refresh direct-reachability evidence in the background;
             // verdicts apply from the next connect (logged, never disruptive).

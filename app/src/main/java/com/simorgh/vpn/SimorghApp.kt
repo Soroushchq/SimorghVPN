@@ -2,6 +2,7 @@ package com.simorgh.vpn
 
 import android.app.Application
 import com.simorgh.vpn.core.CoreBootstrap
+import com.simorgh.vpn.core.config.RemoteConfigChannel
 import com.simorgh.vpn.core.engine.EngineRegistry
 import com.simorgh.vpn.data.BuiltinConfigManager
 import com.simorgh.vpn.data.SettingsMirror
@@ -22,6 +23,12 @@ class SimorghApp : Application() {
         super.onCreate()
         EngineRegistry.registerDefaults()
         ServiceLocator.init(this)
+
+        // v0.4: the last VERIFIED remote config applies on every process start,
+        // so anti-censor parameters survive offline restarts
+        appScope.launch(Dispatchers.IO) {
+            runCatching { RemoteConfigChannel.loadPersisted(this@SimorghApp) }
+        }
 
         if (Processes.isDaemon) {
             // :daemon — the VPN service process. Jetpack DataStore is

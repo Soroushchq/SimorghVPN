@@ -30,7 +30,7 @@ object WarpPlanner {
 
     fun plan(s: SimorghSettings): List<FallbackPlanner.Attempt> {
         val port = if (s.warpPort in 1..65535) s.warpPort else WarpEndpoints.DEFAULT_PORT
-        val primaryIp = WarpEndpoints.ANYCAST_IPS.first()
+        val primaryIp = WarpEndpoints.anycastIps().first()
 
         if (!s.warpPortRotation) {
             return listOf(
@@ -56,8 +56,8 @@ object WarpPlanner {
 
         // rotate: fresh IP first, then fresh port — so attempt #2 differs from
         // #1 in both coordinates as early as possible
-        val altPorts = WarpEndpoints.PORTS.filter { it != port }
-        val altIps = WarpEndpoints.ANYCAST_IPS.drop(1)
+        val altPorts = WarpEndpoints.ports().filter { it != port }
+        val altIps = WarpEndpoints.anycastIps().drop(1)
         var i = 0
         while (attempts.size < MAX_ATTEMPTS) {
             val ip = altIps[i % altIps.size]

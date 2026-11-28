@@ -52,6 +52,9 @@ import com.simorgh.vpn.R
 import com.simorgh.vpn.ServiceLocator
 import com.simorgh.vpn.core.CoreBootstrap
 import com.simorgh.vpn.core.anticensor.TlsFragmentProfile
+import com.simorgh.vpn.core.anticensor.TlsFragmentProfiles
+import com.simorgh.vpn.core.config.RemoteConfigChannel
+import com.simorgh.vpn.core.config.RemoteOverrides
 import com.simorgh.vpn.core.engine.EngineRegistry
 import com.simorgh.vpn.core.warp.WarpEndpoints
 import com.simorgh.vpn.core.warp.WarpIdentity
@@ -468,6 +471,72 @@ fun SettingsScreen() {
                 }
             }
 
+            // v0.4: signed remote-config channel (msn-guard/shroudly pattern)
+            SectionCard(stringResource(R.string.remote_config_section)) {
+                SwitchRow(
+                    title = stringResource(R.string.remote_config),
+                    desc = stringResource(R.string.remote_config_desc),
+                    checked = settings.remoteConfigEnabled
+                ) { scope.launch { SettingsStore.setRemoteConfigEnabled(context, it) } }
+                if (settings.remoteConfigEnabled) {
+                    HorizontalDivider(Modifier.padding(vertical = 6.dp))
+                    var rcChecking by remember { mutableStateOf(false) }
+                    var rcStatus by remember { mutableStateOf("") }
+                    TextFieldRow(
+                        label = stringResource(R.string.remote_config_url),
+                        value = settings.remoteConfigUrl.ifBlank { RemoteConfigChannel.DEFAULT_URL },
+                        numeric = false
+                    ) { v ->
+                        if (v.startsWith("http")) {
+                            scope.launch { SettingsStore.setRemoteConfigUrl(context, v) }
+                        }
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    OutlinedButton(enabled = !rcChecking, onClick = {
+                        rcChecking = true
+                        rcStatus = ""
+                        scope.launch {
+                            val r = RemoteConfigChannel.checkAndApply(context, settings)
+                            rcStatus = when {
+                                r.applied -> context.getString(
+                                    if (r.notes.isBlank()) R.string.remote_config_applied
+                                    else R.string.remote_config_applied_notes, r.notes
+                                )
+                                else -> context.getString(R.string.remote_config_failed, r.reason)
+                            }
+                            rcChecking = false
+                        }
+                    }) {
+                        if (rcChecking) {
+                            CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+                        } else {
+                            Icon(Icons.Outlined.SystemUpdate, contentDescription = null)
+                        }
+                        Spacer(Modifier.width(6.dp))
+                        Text(stringResource(R.string.remote_config_check))
+                    }
+                    if (rcStatus.isBlank() && RemoteOverrides.appliedAt > 0L) {
+                        Text(
+                            stringResource(
+                                R.string.remote_config_last_fmt,
+                                java.text.SimpleDateFormat(
+                                    "yyyy/MM/dd HH:mm",
+                                    java.util.Locale.getDefault()
+                                ).format(java.util.Date(RemoteOverrides.appliedAt))
+                            ),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    } else if (rcStatus.isNotBlank()) {
+                        Text(
+                            rcStatus,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+
             // v0.3: anti-censorship (fragmentation, uTLS rotation, fallback chain)
             SectionCard(stringResource(R.string.section_anticensor)) {
                 SwitchRow(
@@ -482,37 +551,24 @@ fun SettingsScreen() {
                         style = MaterialTheme.typography.titleSmall,
                         modifier = Modifier.padding(top = 4.dp, bottom = 2.dp)
                     )
-                    RadioRow(
-                        title = stringResource(R.string.tls_fragment_light),
-                        desc = stringResource(R.string.tls_fragment_light_desc),
-                        selected = settings.tlsFragmentProfile == TlsFragmentProfile.IRAN_LIGHT.name
-                    ) {
-                        scope.launch {
-                            SettingsStore.setTlsFragmentProfile(
-                                context, TlsFragmentProfile.IRAN_LIGHT.name
-                            )
-                        }
-                    }
-                    RadioRow(
-                        title = stringResource(R.string.tls_fragment_medium),
-                        desc = stringResource(R.string.tls_fragment_medium_desc),
-                        selected = settings.tlsFragmentProfile == TlsFragmentProfile.IRAN_MEDIUM.name
-                    ) {
-                        scope.launch {
-                            SettingsStore.setTlsFragmentProfile(
-                                context, TlsFragmentProfile.IRAN_MEDIUM.name
-                            )
-                        }
-                    }
-                    RadioRow(
-                        title = stringResource(R.string.tls_fragment_aggressive),
-                        desc = stringResource(R.string.tls_fragment_aggressive_desc),
-                        selected = settings.tlsFragmentProfile == TlsFragmentProfile.IRAN_AGGRESSIVE.name
-                    ) {
-                        scope.launch {
-                            SettingsStore.setTlsFragmentProfile(
-                                context, TlsFragmentProfile.IRAN_AGGRESSIVE.name
-                            )
+                    // v0.4: built-ins + any remote-config profiles, dynamic list
+                    val builtinTitles = mapOf(
+                        TlsFragmentProfile.IRAN_LIGHT.name to stringResource(R.string.tls_fragment_light),
+                        TlsFragmentProfile.IRAN_MEDIUM.name to stringResource(R.string.tls_fragment_medium),
+                        TlsFragmentProfile.IRAN_AGGRESSIVE.name to stringResource(R.string.tls_fragment_aggressive)
+                    )
+                    val builtinDescs = mapOf(
+                        TlsFragmentProfile.IRAN_LIGHT.name to stringResource(R.string.tls_fragment_light_desc),
+                        TlsFragmentProfile.IRAN_MEDIUM.name to stringResource(R.string.tls_fragment_medium_desc),
+                        TlsFragmentProfile.IRAN_AGGRESSIVE.name to stringResource(R.string.tls_fragment_aggressive_desc)
+                    )
+                    TlsFragmentProfiles.profileNames().forEach { name ->
+                        RadioRow(
+                            title = builtinTitles[name] ?: name,
+                            desc = builtinDescs[name] ?: TlsFragmentProfiles.describe(name),
+                            selected = settings.tlsFragmentProfile == name
+                        ) {
+                            scope.launch { SettingsStore.setTlsFragmentProfile(context, name) }
                         }
                     }
                 }

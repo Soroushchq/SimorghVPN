@@ -218,14 +218,15 @@ object XrayConfigBuilder {
 
         // v0.3 anti-censor: TLS ClientHello fragmentation (msn-guard pattern)
         // via the core's native sockopt.fragment — applies to every TLS/REALITY
-        // handshake dialed by this outbound.
+        // handshake dialed by this outbound. v0.4: specs may come from the
+        // signed remote-config channel (TlsFragmentProfiles.specOf).
         if (s.tlsFragment && security != "none") {
-            val profile = TlsFragmentProfile.of(s.tlsFragmentProfile)
+            val spec = TlsFragmentProfiles.specOf(s.tlsFragmentProfile)
             putJsonObject("sockopt") {
                 putJsonObject("fragment") {
                     put("packets", "tlshello")
-                    put("length", profile.lengthSpec)
-                    put("interval", profile.intervalSpec)
+                    put("length", spec.lengthSpec)
+                    put("interval", spec.intervalSpec)
                 }
             }
         }

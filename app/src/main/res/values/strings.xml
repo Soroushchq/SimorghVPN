@@ -245,4 +245,15 @@
     <string name="gateway_no_auth_desc">برای تلویزیون و دستگاه‌هایی که فیلد نام کاربری ندارند — فقط روی شبکه‌ی خود هات‌اسپات</string>
     <string name="gateway_direct_when_down">عبور مستقیم وقتی VPN قطع است</string>
     <string name="gateway_direct_when_down_desc">پیش‌فرض خاموش است تا چیزی بدون تونل نشت نکند؛ با روشن‌کردن، کلاینت‌ها هنگام قطعی از شبکه مستقیم بیرون می‌روند</string>
+
+    <!-- v0.4: signed remote-config channel -->
+    <string name="remote_config_section">کانال پیکربندی امضاشده</string>
+    <string name="remote_config">به‌روزرسانی امضاشده پارامترهای ضدسانسور</string>
+    <string name="remote_config_desc">پروفایل‌های فرگمنت، فینگرپرینت‌ها و نقاط WARP بدون نیاز به نسخه‌ی جدید اپ به‌روز می‌شوند؛ فقط فایل با امضای معتبر پذیرفته می‌شود</string>
+    <string name="remote_config_url">آدرس کانال</string>
+    <string name="remote_config_check">بررسی به‌روزرسانی</string>
+    <string name="remote_config_applied">پیکربندی جدید تأیید و اعمال شد — از اتصال بعدی فعال است</string>
+    <string name="remote_config_applied_notes">اعمال شد: %1$s — از اتصال بعدی فعال است</string>
+    <string name="remote_config_failed">دریافت ناموفق بود (%1$s) — تنظیمات فعلی حفظ شد</string>
+    <string name="remote_config_last_fmt">آخرین پیکربندی معتبر: %1$s</string>
 </resources>

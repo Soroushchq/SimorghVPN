@@ -26,7 +26,13 @@ This product includes the following third-party components:
    Source: v2fly community databases, shipped as assets inside libv2ray.aar
    Projects: https://github.com/v2fly/geoip / https://github.com/v2fly/domain-list-community
 
-5. Reference projects (ideas & architecture inspiration) live under elham/
+5. eddsa (net.i2p.crypto:eddsa) — pure-Java Ed25519 signatures
+   Project: https://github.com/str4d/ed25519-java
+   License: MIT (with CC0 / public-domain code portions as noted upstream)
+   Note: fetched from Maven Central at build time; used only to verify the
+   signed remote-config channel (verification, never signing).
+
+6. Reference projects (ideas & architecture inspiration) live under elham/
    and are NOT linked into the app binary. Their licenses are listed in
    elham/README.md.
 

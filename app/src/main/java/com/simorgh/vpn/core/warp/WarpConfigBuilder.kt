@@ -20,7 +20,7 @@ import kotlinx.serialization.json.putJsonObject
 object WarpConfigBuilder {
 
     fun build(identity: WarpIdentity, s: SimorghSettings, logPath: String): String {
-        val ip = s.warpIpOverride.ifBlank { WarpEndpoints.ANYCAST_IPS.first() }
+        val ip = s.warpIpOverride.ifBlank { WarpEndpoints.anycastIps().first() }
         val port = if (s.warpPortOverride in 1..65535) s.warpPortOverride
         else if (s.warpPort in 1..65535) s.warpPort else WarpEndpoints.DEFAULT_PORT
 

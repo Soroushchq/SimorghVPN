@@ -1,0 +1,48 @@
+name: Remote config
+
+# Signs remote-config/remote-config.json with the Ed25519 key stored in the
+# REMOTE_CONFIG_SIGNING_KEY secret (base64 PEM) and publishes the pair as a
+# rolling `remote-config` release. The app verifies every download against the
+# public key pinned in RemoteConfigChannel.PUBLIC_KEY_B64.
+#
+# Without the secret the workflow exits successfully with a notice, so forks
+# keep building.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "remote-config/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sign-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sign remote config
+        env:
+          REMOTE_CONFIG_SIGNING_KEY: ${{ secrets.REMOTE_CONFIG_SIGNING_KEY }}
+        run: |
+          if [[ -z "$REMOTE_CONFIG_SIGNING_KEY" ]]; then
+            echo "::notice::REMOTE_CONFIG_SIGNING_KEY secret is not set — skipping signing."
+            echo "SKIP=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          ./tools/sign-remote-config.sh
+
+      - name: Publish rolling release
+        if: env.SKIP != '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete remote-config --yes --cleanup-tag 2>/dev/null || true
+          gh release create remote-config \
+            --title "remote-config" \
+            --notes "کانال پیکربندی امضاشده سیمرغ — rolling release. آخرین پارامترهای ضدسانسور." \
+            --prerelease \
+            remote-config/remote-config.json remote-config/remote-config.json.sig

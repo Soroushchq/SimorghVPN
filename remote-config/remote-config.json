@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "fragmentProfiles": [
+    { "name": "IRAN_LIGHT", "length": "40-100", "interval": "10-20" },
+    { "name": "IRAN_MEDIUM", "length": "10-50", "interval": "5-15" },
+    { "name": "IRAN_AGGRESSIVE", "length": "1-10", "interval": "5-10" }
+  ],
+  "fingerprints": [],
+  "warpEndpoints": [],
+  "configSources": [],
+  "notes": "کانال رسمی سیمرغ — مقدارهای پیش‌فرض نسخه ۰.۴.۰. با تغییر رفتار DPI، پروفایل‌ها همین‌جا به‌روز می‌شوند."
+}

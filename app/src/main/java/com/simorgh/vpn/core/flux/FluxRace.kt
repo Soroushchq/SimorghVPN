@@ -78,9 +78,11 @@ object FluxRace {
                 received++
                 done[next.first] = next.second
             }
-            // late / never-answered endpoints (deadline hit) count as failures
+            // late / never-answered endpoints (deadline hit) count as failures.
+            // The channel is deliberately NOT closed: late probes may still send
+            // into the unbounded buffer — a closed channel would throw in their
+            // coroutine and fail the whole race scope.
             distinct.forEach { if (it.id !in done) done[it.id] = Reach(false) }
-            results.close()
 
             // survivors first (by ms), then failures — insertion order does it
             done.entries.sortedWith(

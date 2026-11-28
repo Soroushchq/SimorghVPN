@@ -1,6 +1,7 @@
 package com.simorgh.vpn.core
 
 import com.simorgh.vpn.core.anticensor.TlsFragmentProfile
+import com.simorgh.vpn.core.anticensor.TlsFragmentProfiles
 import com.simorgh.vpn.core.mae.MaeRules
 import com.simorgh.vpn.data.Profile
 import com.simorgh.vpn.data.RoutingMode

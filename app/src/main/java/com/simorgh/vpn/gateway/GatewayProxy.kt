@@ -168,7 +168,7 @@ class GatewayProxy(
                 host = target
                 port = 443
             }
-            val up = openUpstream(host, port, outs, "http") ?: return
+            val up = openUpstream(host, port, outs) ?: return
             outs.write("HTTP/1.1 200 Connection established\r\n\r\n".toByteArray(Charsets.ISO_8859_1))
             outs.flush()
             relay(sock, up)
@@ -192,7 +192,7 @@ class GatewayProxy(
         val host = if (hci > 0) authority.substring(0, hci) else authority
         val port = if (hci > 0) authority.substring(hci + 1).toIntOrNull() ?: 80 else 80
 
-        val up = openUpstream(host, port, outs, "http") ?: return
+        val up = openUpstream(host, port, outs) ?: return
         val head = StringBuilder()
             .append(method).append(' ').append(pathAndQuery).append(" HTTP/1.1\r\n")
         headers.forEach { (k, v) ->
@@ -336,7 +336,7 @@ class GatewayProxy(
      * when the tunnel is alive; direct when down AND the user opted in;
      * otherwise a clear 503 and null.
      */
-    private fun openUpstream(host: String, port: Int, outs: OutputStream, via: String): Socket? {
+    private fun openUpstream(host: String, port: Int, outs: OutputStream): Socket? {
         if (!tunnelAlive() && !directWhenDown()) {
             refuseHttp(outs)
             return null
@@ -368,7 +368,7 @@ class GatewayProxy(
             }
         }.getOrNull()
         if (sock == null) {
-            LogBuffer.d("Gateway", "upstream dial failed $host:$port ($via)")
+            LogBuffer.d("Gateway", "upstream dial failed $host:$port")
         } else if (SystemClock.elapsedRealtime() - t0 > 3_000) {
             LogBuffer.d("Gateway", "slow upstream $host:$port ${SystemClock.elapsedRealtime() - t0}ms")
         }

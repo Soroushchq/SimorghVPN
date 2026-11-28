@@ -199,7 +199,7 @@ private fun StatusChip(state: MaeServiceState?) {
         state.override == MaeRoute.PROXY -> R.string.mae_pinned_proxy to MaterialTheme.colorScheme.tertiaryContainer
         state.override == MaeRoute.DIRECT -> R.string.mae_pinned_direct to MaterialTheme.colorScheme.secondaryContainer
         state.directOk == true -> R.string.mae_direct_ok to MaterialTheme.colorScheme.secondaryContainer
-        state.directOk == false -> R.string.mae_blocked -> MaterialTheme.colorScheme.errorContainer
+        state.directOk == false -> R.string.mae_blocked to MaterialTheme.colorScheme.errorContainer
         else -> R.string.mae_unknown to MaterialTheme.colorScheme.surfaceVariant
     }
     Text(

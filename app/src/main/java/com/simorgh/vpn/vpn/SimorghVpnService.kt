@@ -36,6 +36,7 @@ import com.simorgh.vpn.core.flux.FluxPlanner
 import com.simorgh.vpn.core.flux.FluxStore
 import com.simorgh.vpn.core.mae.MaeLearner
 import com.simorgh.vpn.core.warp.WarpPlanner
+import com.simorgh.vpn.gateway.GatewayManager
 import com.simorgh.vpn.data.PerAppMode
 import com.simorgh.vpn.data.SettingsMirror
 import com.simorgh.vpn.data.SimorghSettings
@@ -64,6 +65,7 @@ class SimorghVpnService : VpnService() {
         const val ACTION_START = "com.simorgh.vpn.action.START"
         const val ACTION_STOP = "com.simorgh.vpn.action.STOP"
         const val ACTION_IPC = "com.simorgh.vpn.action.IPC"
+        const val ACTION_GATEWAY = "com.simorgh.vpn.action.GATEWAY"
         const val EXTRA_PROFILE_ID = "profileId"
         const val CHANNEL_ID = "simorgh_vpn_channel"
         const val NOTIFICATION_ID = 1001
@@ -84,6 +86,13 @@ class SimorghVpnService : VpnService() {
             ContextCompat.startForegroundService(context, i)
             DaemonIpc.bind(context)
         }
+
+        /** v0.4: bring the daemon up in gateway-only mode (VPN stays off). */
+        fun startGateway(context: Context) {
+            val i = Intent(context, SimorghVpnService::class.java).setAction(ACTION_GATEWAY)
+            ContextCompat.startForegroundService(context, i)
+            DaemonIpc.bind(context)
+        }
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -93,6 +102,7 @@ class SimorghVpnService : VpnService() {
     private var engine: VpnEngine? = null
     private var statsJob: Job? = null
     private var maeJob: Job? = null
+    private var gatewayWatchJob: Job? = null
     private var lastUp = 0L
     private var lastDown = 0L
     private var wasConnected = false
@@ -169,6 +179,38 @@ class SimorghVpnService : VpnService() {
         createChannel()
         VpnBus.onState = { broadcastState(it) }
         LogBuffer.onLine = { broadcastLog(it) }
+
+        // v0.4: gateway watch — picks up the mirror-file toggle within ~3s,
+        // keeps the sharing listeners alive even while the VPN is off
+        gatewayWatchJob = scope.launch {
+            var lastOn: Boolean? = null
+            while (true) {
+                delay(3000)
+                val s = runCatching { SettingsMirror.read(this@SimorghVpnService) }.getOrNull()
+                val on = s?.gatewayShare ?: false
+                if (on != lastOn) {
+                    lastOn = on
+                    if (on) {
+                        GatewayManager.start(
+                            this@SimorghVpnService,
+                            settings = { currentSettings() },
+                            tunnelAlive = {
+                                engine?.isRunning == true &&
+                                    VpnBus.state.value.status == VpnStatus.CONNECTED
+                            }
+                        )
+                    } else {
+                        GatewayManager.stop()
+                        // nothing left to do? release the service
+                        if (engine == null && !wasConnected) {
+                            stopForeground(STOP_FOREGROUND_REMOVE)
+                            stopSelf()
+                        }
+                    }
+                }
+                if (on) GatewayManager.maybeRebindEvery()
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -176,6 +218,10 @@ class SimorghVpnService : VpnService() {
             ACTION_STOP -> {
                 enterForeground(getString(R.string.notif_stopped), "")
                 scope.launch { opsMutex.withLock { stopVpnLocked() } }
+            }
+            ACTION_GATEWAY -> {
+                // v0.4: gateway-only mode — daemon stays foreground, VPN untouched
+                enterForeground(getString(R.string.notif_gateway), "")
             }
             else -> {
                 if (intent?.action == VpnService.SERVICE_INTERFACE) {
@@ -434,8 +480,14 @@ class SimorghVpnService : VpnService() {
         stopEngineLocked()
         VpnBus.reset(VpnStatus.DISCONNECTED)
         LogBuffer.i("Vpn", "disconnected")
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        if (GatewayManager.running) {
+            // v0.4: the gateway must survive the VPN (nova pattern) — clients
+            // get a clear 503 while down and heal the moment it returns
+            enterForeground(getString(R.string.notif_gateway), "")
+        } else {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
     }
 
     private suspend fun stopEngineLocked() {
@@ -584,6 +636,8 @@ class SimorghVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        gatewayWatchJob?.cancel()
+        GatewayManager.stop()
         VpnBus.onState = null
         LogBuffer.onLine = null
         engine?.stop()

@@ -103,6 +103,7 @@
     <string name="notif_connecting">Connecting…</string>
     <string name="notif_connected">Connected — tap to open</string>
     <string name="notif_stopped">Disconnected</string>
+    <string name="notif_gateway">Sharing gateway active</string>
     <string name="stop">Stop</string>
 
     <string name="copied">Copied</string>
@@ -176,4 +177,18 @@
     <string name="mae_pinned_proxy">Tunnel (pinned)</string>
     <string name="mae_pinned_direct">Direct (pinned)</string>
     <string name="mae_apply_note">Changes apply from the next connect; probes refresh in the background after every successful connect.</string>
+
+    <!-- v0.4: gateway (rootless tethering, nova pattern) -->
+    <string name="gateway_section">Share internet with other devices</string>
+    <string name="gateway_share">Sharing gateway (no root)</string>
+    <string name="gateway_share_desc">The phone becomes a VPN gateway for hotspot/USB clients; each client sets the proxy once</string>
+    <string name="gateway_no_iface">No sharing interface detected yet — turn on the hotspot or USB tethering</string>
+    <string name="gateway_proxy">Proxy (HTTP/SOCKS5)</string>
+    <string name="gateway_portal_fmt">Setup page: http://%1$s</string>
+    <string name="gateway_portal_hint">Open the setup page on the client device; it has the steps and the auto-proxy (PAC) link.</string>
+    <string name="gateway_credentials">Username / password</string>
+    <string name="gateway_no_auth">No password for hotspot clients</string>
+    <string name="gateway_no_auth_desc">For TVs and boxes with no credential fields — applies only on the hotspot\'s own network</string>
+    <string name="gateway_direct_when_down">Direct pass-through while VPN is down</string>
+    <string name="gateway_direct_when_down_desc">Off by default so nothing leaks without the tunnel; when on, clients fall back to the direct network during outages</string>
 </resources>

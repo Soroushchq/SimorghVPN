@@ -61,8 +61,11 @@ import com.simorgh.vpn.data.RoutingMode
 import com.simorgh.vpn.data.SettingsStore
 import com.simorgh.vpn.data.TunnelMode
 import com.simorgh.vpn.data.UpdateChecker
+import com.simorgh.vpn.gateway.GatewayAuth
+import com.simorgh.vpn.gateway.GatewayEndpoints
 import com.simorgh.vpn.ui.components.SectionCard
 import com.simorgh.vpn.util.ApkSharer
+import com.simorgh.vpn.vpn.SimorghVpnService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -76,6 +79,7 @@ fun SettingsScreen() {
 
     var showPerApp by remember { mutableStateOf(false) }
     var showMae by remember { mutableStateOf(false) }
+    var gatewayAddresses by remember { mutableStateOf<List<String>>(emptyList()) }
     var checkingUpdate by remember { mutableStateOf(false) }
     var updateInfo by remember { mutableStateOf<UpdateChecker.UpdateInfo?>(null) }
     var updateFailed by remember { mutableStateOf(false) }
@@ -109,6 +113,26 @@ fun SettingsScreen() {
                         context.getString(R.string.warp_register_failed, it.message ?: ""))
                 }
             warpRegistering = false
+        }
+    }
+
+    // v0.4: gateway sharing — detect hotspot interfaces from the UI process too
+    LaunchedEffect(settings.gatewayShare) {
+        if (settings.gatewayShare) {
+            gatewayAddresses = withContext(Dispatchers.IO) {
+                GatewayEndpoints.detect(context).flatMap { it.addresses }
+            }
+        }
+    }
+
+    fun enableGateway(on: Boolean) {
+        scope.launch {
+            if (on && settings.gatewayUser.isBlank()) {
+                val (u, p) = GatewayAuth.newCredentials()
+                SettingsStore.setGatewayCredentials(context, u, p)
+            }
+            SettingsStore.setGatewayShare(context, on)
+            if (on) SimorghVpnService.startGateway(context)
         }
     }
 
@@ -385,6 +409,63 @@ fun SettingsScreen() {
                 ) { scope.launch { SettingsStore.setMaeEnabled(context, it) } }
                 HorizontalDivider(Modifier.padding(vertical = 6.dp))
                 MaeRow(onClick = { showMae = true })
+            }
+
+            // v0.4: gateway — rootless tethering (nova pattern)
+            SectionCard(stringResource(R.string.gateway_section)) {
+                SwitchRow(
+                    title = stringResource(R.string.gateway_share),
+                    desc = stringResource(R.string.gateway_share_desc),
+                    checked = settings.gatewayShare
+                ) { enableGateway(it) }
+                if (settings.gatewayShare) {
+                    HorizontalDivider(Modifier.padding(vertical = 6.dp))
+                    if (gatewayAddresses.isEmpty()) {
+                        Text(
+                            stringResource(R.string.gateway_no_iface),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    } else {
+                        gatewayAddresses.forEach { addr ->
+                            RowLabelValue(
+                                stringResource(R.string.gateway_proxy),
+                                "$addr:${GatewayEndpoints.PROXY_PORT}"
+                            )
+                        }
+                        Text(
+                            stringResource(
+                                R.string.gateway_portal_fmt,
+                                gatewayAddresses.first()
+                            ) + ":${GatewayEndpoints.PORTAL_PORT}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    if (settings.gatewayUser.isNotBlank()) {
+                        RowLabelValue(
+                            stringResource(R.string.gateway_credentials),
+                            "${settings.gatewayUser} / ${settings.gatewayPass}"
+                        )
+                    }
+                    Text(
+                        stringResource(R.string.gateway_portal_hint),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    HorizontalDivider(Modifier.padding(vertical = 6.dp))
+                    SwitchRow(
+                        title = stringResource(R.string.gateway_no_auth),
+                        desc = stringResource(R.string.gateway_no_auth_desc),
+                        checked = settings.gatewayNoAuth
+                    ) { scope.launch { SettingsStore.setGatewayNoAuth(context, it) } }
+                    HorizontalDivider(Modifier.padding(vertical = 6.dp))
+                    SwitchRow(
+                        title = stringResource(R.string.gateway_direct_when_down),
+                        desc = stringResource(R.string.gateway_direct_when_down_desc),
+                        checked = settings.gatewayDirectWhenDown
+                    ) { scope.launch { SettingsStore.setGatewayDirectWhenDown(context, it) } }
+                }
             }
 
             // v0.3: anti-censorship (fragmentation, uTLS rotation, fallback chain)

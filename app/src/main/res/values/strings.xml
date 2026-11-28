@@ -157,6 +157,7 @@
     <string name="notif_connected">متصل — لمس برای باز کردن</string>
     <string name="notif_blocked">اتصال قطع شد — ترافیک مسدود است</string>
     <string name="notif_stopped">قطع شد</string>
+    <string name="notif_gateway">درگاه اشتراک فعال است</string>
     <string name="stop">توقف</string>
 
     <string name="copied">کپی شد</string>
@@ -230,4 +231,18 @@
     <string name="mae_pinned_proxy">تونل (دستی)</string>
     <string name="mae_pinned_direct">مستقیم (دستی)</string>
     <string name="mae_apply_note">تغییرات از اتصال بعدی اعمال می‌شوند؛ آزمایش‌ها هم پس از هر اتصال موفق در پس‌زمینه تازه می‌شوند.</string>
+
+    <!-- v0.4: gateway (rootless tethering, nova pattern) -->
+    <string name="gateway_section">اشتراک اینترنت با دستگاه‌های دیگر</string>
+    <string name="gateway_share">درگاه اشتراک (بدون روت)</string>
+    <string name="gateway_share_desc">گوشی به‌عنوان درگاه VPN برای دستگاه‌های متصل به هات‌اسپات/USB کار می‌کند؛ کلاینت فقط یک‌بار پروکسی را تنظیم می‌کند</string>
+    <string name="gateway_no_iface">هنوز اینترفیس اشتراکی دیده نمی‌شود — هات‌اسپات یا تترینگ USB را روشن کن</string>
+    <string name="gateway_proxy">پروکسی (HTTP/SOCKS5)</string>
+    <string name="gateway_portal_fmt">صفحه راهنما: http://%1$s</string>
+    <string name="gateway_portal_hint">در دستگاه کلاینت آدرس صفحه راهنما را باز کن؛ آن‌جا مراحل تنظیم و پروکسی خودکار (PAC) هست.</string>
+    <string name="gateway_credentials">نام کاربری / رمز</string>
+    <string name="gateway_no_auth">بدون رمز برای کلاینت‌های هات‌اسپات</string>
+    <string name="gateway_no_auth_desc">برای تلویزیون و دستگاه‌هایی که فیلد نام کاربری ندارند — فقط روی شبکه‌ی خود هات‌اسپات</string>
+    <string name="gateway_direct_when_down">عبور مستقیم وقتی VPN قطع است</string>
+    <string name="gateway_direct_when_down_desc">پیش‌فرض خاموش است تا چیزی بدون تونل نشت نکند؛ با روشن‌کردن، کلاینت‌ها هنگام قطعی از شبکه مستقیم بیرون می‌روند</string>
 </resources>

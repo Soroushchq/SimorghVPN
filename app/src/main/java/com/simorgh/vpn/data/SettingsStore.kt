@@ -82,7 +82,18 @@ data class SimorghSettings(
 
     // ------------------------------------------------ v0.4 MAE (per-service adaptive routing)
     /** Adaptive per-service routing: probe services directly, route the reachable ones direct. */
-    val maeEnabled: Boolean = false
+    val maeEnabled: Boolean = false,
+
+    // ------------------------------------------------ v0.4 gateway (rootless tethering)
+    /** Share the tunnel as an HTTP/SOCKS5 gateway for hotspot clients (nova pattern). */
+    val gatewayShare: Boolean = false,
+    /** Passwordless access ONLY for clients connecting through the sharing interface (TVs). */
+    val gatewayNoAuth: Boolean = false,
+    /** When the tunnel is down, let clients out directly instead of 503 (off = no silent leak). */
+    val gatewayDirectWhenDown: Boolean = false,
+    /** Gateway credentials (generated on first enable; shown in app + portal). */
+    val gatewayUser: String = "",
+    val gatewayPass: String = ""
 )
 
 object SettingsStore {
@@ -113,6 +124,11 @@ object SettingsStore {
         val FLUX_ENABLED = booleanPreferencesKey("flux_enabled")
         val FLUX_FAILOVER = booleanPreferencesKey("flux_failover")
         val MAE_ENABLED = booleanPreferencesKey("mae_enabled")
+        val GATEWAY_SHARE = booleanPreferencesKey("gateway_share")
+        val GATEWAY_NO_AUTH = booleanPreferencesKey("gateway_no_auth")
+        val GATEWAY_DIRECT_WHEN_DOWN = booleanPreferencesKey("gateway_direct_when_down")
+        val GATEWAY_USER = stringPreferencesKey("gateway_user")
+        val GATEWAY_PASS = stringPreferencesKey("gateway_pass")
     }
 
     fun flow(context: Context): Flow<SimorghSettings> {
@@ -144,7 +160,12 @@ object SettingsStore {
                 warpPortRotation = p[Keys.WARP_PORT_ROTATION] ?: true,
                 fluxEnabled = p[Keys.FLUX_ENABLED] ?: false,
                 fluxFailover = p[Keys.FLUX_FAILOVER] ?: true,
-                maeEnabled = p[Keys.MAE_ENABLED] ?: false
+                maeEnabled = p[Keys.MAE_ENABLED] ?: false,
+                gatewayShare = p[Keys.GATEWAY_SHARE] ?: false,
+                gatewayNoAuth = p[Keys.GATEWAY_NO_AUTH] ?: false,
+                gatewayDirectWhenDown = p[Keys.GATEWAY_DIRECT_WHEN_DOWN] ?: false,
+                gatewayUser = p[Keys.GATEWAY_USER] ?: "",
+                gatewayPass = p[Keys.GATEWAY_PASS] ?: ""
             )
         }
     }
@@ -195,4 +216,15 @@ object SettingsStore {
         edit(context) { it[Keys.FLUX_FAILOVER] = v }
     suspend fun setMaeEnabled(context: Context, v: Boolean) =
         edit(context) { it[Keys.MAE_ENABLED] = v }
+    suspend fun setGatewayShare(context: Context, v: Boolean) =
+        edit(context) { it[Keys.GATEWAY_SHARE] = v }
+    suspend fun setGatewayNoAuth(context: Context, v: Boolean) =
+        edit(context) { it[Keys.GATEWAY_NO_AUTH] = v }
+    suspend fun setGatewayDirectWhenDown(context: Context, v: Boolean) =
+        edit(context) { it[Keys.GATEWAY_DIRECT_WHEN_DOWN] = v }
+    suspend fun setGatewayCredentials(context: Context, user: String, pass: String) =
+        edit(context) {
+            it[Keys.GATEWAY_USER] = user
+            it[Keys.GATEWAY_PASS] = pass
+        }
 }
